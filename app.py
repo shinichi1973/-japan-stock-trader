@@ -8,6 +8,11 @@ try:
 except ImportError:
     yf = None
 
+
+# =========================================================
+# ページ設定
+# =========================================================
+
 st.set_page_config(
     page_title="日本株 自動バックテスト Ver.3.1",
     page_icon="📈",
@@ -15,11 +20,14 @@ st.set_page_config(
 )
 
 st.title("📈 日本株 自動バックテスト Ver.3.1")
-st.caption("過去5年の日足データで仮想売買を検証します。実注文は行いません。")
+st.caption(
+    "過去5年の日足データで仮想売買を検証します。実注文は行いません。"
+)
 
-# =========================
+
+# =========================================================
 # 設定
-# =========================
+# =========================================================
 
 st.sidebar.header("⚙️ 基本設定")
 
@@ -67,6 +75,11 @@ rsi_max = st.sidebar.slider(
     70
 )
 
+
+# =========================================================
+# 銘柄選定条件
+# =========================================================
+
 st.sidebar.header("🎯 銘柄選定条件")
 
 use_morning_star = st.sidebar.checkbox(
@@ -94,9 +107,10 @@ diagnostic_mode = st.sidebar.checkbox(
     value=True
 )
 
-# =========================
+
+# =========================================================
 # 銘柄
-# =========================
+# =========================================================
 
 st.subheader("📋 バックテスト銘柄")
 
@@ -112,6 +126,7 @@ ticker_input = st.text_input(
 st.info(
     "📅 実行時点から過去5年間の株価データを取得します。"
 )
+
 
 def normalize_tickers(text):
 
@@ -149,9 +164,10 @@ st.write(
     ", ".join(tickers)
 )
 
-# =========================
+
+# =========================================================
 # データ取得
-# =========================
+# =========================================================
 
 @st.cache_data(ttl=3600)
 def download_stock_data(tickers):
@@ -313,9 +329,9 @@ def download_stock_data(tickers):
     return result, errors
 
 
-# =========================
+# =========================================================
 # 指標
-# =========================
+# =========================================================
 
 def add_indicators(g):
 
@@ -370,7 +386,9 @@ def add_indicators(g):
         .mean()
     )
 
+    # -----------------------------------------------------
     # 明けの明星
+    # -----------------------------------------------------
 
     body = (
         g["close"]
@@ -432,9 +450,9 @@ def add_indicators(g):
     return g
 
 
-# =========================
+# =========================================================
 # 条件診断
-# =========================
+# =========================================================
 
 def diagnostic(df):
 
@@ -562,9 +580,9 @@ def diagnostic(df):
     )
 
 
-# =========================
+# =========================================================
 # バックテスト
-# =========================
+# =========================================================
 
 def run_backtest(df):
 
@@ -586,7 +604,7 @@ def run_backtest(df):
         return (
             pd.DataFrame(),
             pd.DataFrame(),
-            pd.DataFrame()
+            {}
         )
 
     df = pd.concat(
@@ -618,7 +636,9 @@ def run_backtest(df):
             current_date
         ]
 
+        # -------------------------------------------------
         # 決済
+        # -------------------------------------------------
 
         for ticker in list(
             positions.keys()
@@ -712,7 +732,9 @@ def run_backtest(df):
                     ticker
                 ]
 
+        # -------------------------------------------------
         # 購入
+        # -------------------------------------------------
 
         for _, r in day.iterrows():
 
@@ -852,7 +874,9 @@ def run_backtest(df):
                     0
             })
 
+        # -------------------------------------------------
         # 資産評価
+        # -------------------------------------------------
 
         market_value = 0
 
@@ -899,9 +923,11 @@ def run_backtest(df):
         trades
     )
 
+    # -----------------------------------------------------
     # 最終日の含み損益
+    # -----------------------------------------------------
 
-    if positions:
+    if positions and not eq.empty:
 
         last_date = eq.iloc[-1][
             "date"
@@ -934,7 +960,7 @@ def run_backtest(df):
                 p["entry_price"]
             ) * p["shares"]
 
-            trades = pd.concat(
+            tr = pd.concat(
                 [
                     tr,
                     pd.DataFrame([{
@@ -966,14 +992,14 @@ def run_backtest(df):
 
     return (
         eq,
-        trades,
+        tr,
         positions
     )
 
 
-# =========================
+# =========================================================
 # 実行
-# =========================
+# =========================================================
 
 st.divider()
 
@@ -986,6 +1012,7 @@ start_button = st.button(
     type="primary",
     use_container_width=True
 )
+
 
 if start_button:
 
@@ -1004,6 +1031,10 @@ if start_button:
         )
 
         st.stop()
+
+    # -----------------------------------------------------
+    # データ取得
+    # -----------------------------------------------------
 
     with st.spinner(
         "📥 過去5年分の株価データを取得中..."
@@ -1047,9 +1078,9 @@ if start_button:
         f"{stock_df['ticker'].nunique()}銘柄"
     )
 
-    # =====================
-    # 診断
-    # =====================
+    # -----------------------------------------------------
+    # 条件診断
+    # -----------------------------------------------------
 
     if diagnostic_mode:
 
@@ -1091,9 +1122,9 @@ if start_button:
                 f"🎯 全条件一致：{total:,}件"
             )
 
-    # =====================
+    # -----------------------------------------------------
     # バックテスト
-    # =====================
+    # -----------------------------------------------------
 
     with st.spinner(
         "📊 バックテスト計算中..."
@@ -1112,6 +1143,10 @@ if start_button:
         )
 
         st.stop()
+
+    # -----------------------------------------------------
+    # 結果計算
+    # -----------------------------------------------------
 
     final_asset = float(
         eq.iloc[-1]["equity"]
@@ -1145,6 +1180,10 @@ if start_button:
         drawdown.min()
     )
 
+    # -----------------------------------------------------
+    # バックテスト結果
+    # -----------------------------------------------------
+
     st.divider()
 
     st.header(
@@ -1174,59 +1213,93 @@ if start_button:
         f"{max_drawdown:.2%}"
     )
 
+    # -----------------------------------------------------
+    # 資産推移
+    # -----------------------------------------------------
+
     st.subheader(
         "📈 資産推移"
     )
 
-            )
-st.subheader(
-    "🧾 売買履歴"
-)
+    chart_df = eq.copy()
 
-if tr is None:
-    tr = pd.DataFrame()
-
-if not isinstance(tr, pd.DataFrame):
-    tr = pd.DataFrame(tr)
-
-if tr.empty:
-
-    st.warning(
-        "売買条件に一致した銘柄はありませんでした。"
+    chart_df["date"] = pd.to_datetime(
+        chart_df["date"],
+        errors="coerce"
     )
 
-else:
-
-    display_tr = tr.copy()
-
-    if "date" in display_tr.columns:
-        display_tr = (
-            display_tr
-            .sort_values(
-                "date",
-                ascending=False
-            )
-            .copy()
-        )
-
-        display_tr["date"] = pd.to_datetime(
-            display_tr["date"],
-            errors="coerce"
-        )
-
-    st.dataframe(
-        display_tr,
-        use_container_width=True
+    chart_df = chart_df.dropna(
+        subset=["date"]
     )
-            .dt.strftime(
-                "%Y-%m-%d"
-            )
+
+    if not chart_df.empty:
+
+        st.line_chart(
+            chart_df.set_index(
+                "date"
+            )["equity"]
         )
+
+    # -----------------------------------------------------
+    # 売買履歴
+    # -----------------------------------------------------
+
+    st.subheader(
+        "🧾 売買履歴"
+    )
+
+    if tr is None:
+
+        tr = pd.DataFrame()
+
+    if not isinstance(
+        tr,
+        pd.DataFrame
+    ):
+
+        tr = pd.DataFrame(tr)
+
+    if tr.empty:
+
+        st.warning(
+            "売買条件に一致した銘柄はありませんでした。"
+        )
+
+    else:
+
+        display_tr = tr.copy()
+
+        if "date" in display_tr.columns:
+
+            display_tr["date"] = pd.to_datetime(
+                display_tr["date"],
+                errors="coerce"
+            )
+
+            display_tr = (
+                display_tr
+                .sort_values(
+                    "date",
+                    ascending=False
+                )
+                .copy()
+            )
+
+            display_tr["date"] = (
+                display_tr["date"]
+                .dt.strftime(
+                    "%Y-%m-%d"
+                )
+            )
 
         st.dataframe(
             display_tr,
             use_container_width=True
         )
+
+        # -------------------------------------------------
+        # CSV保存
+        # -------------------------------------------------
 
         csv = (
             tr
@@ -1245,7 +1318,10 @@ else:
             mime="text/csv"
         )
 
-    # 未決済
+    # -----------------------------------------------------
+    # 未決済銘柄
+    # -----------------------------------------------------
+
     if positions:
 
         st.subheader(
@@ -1301,10 +1377,22 @@ else:
                     unrealized
             })
 
-        st.dataframe(
-            pd.DataFrame(rows),
-            use_container_width=True
-        )
+        if rows:
+
+            st.dataframe(
+                pd.DataFrame(rows),
+                use_container_width=True
+            )
+
+        else:
+
+            st.info(
+                "未決済銘柄の価格データがありません。"
+            )
+
+    # -----------------------------------------------------
+    # 取得データ確認
+    # -----------------------------------------------------
 
     with st.expander(
         "📋 取得データ確認"
@@ -1315,6 +1403,10 @@ else:
             use_container_width=True
         )
 
+
+# =========================================================
+# フッター
+# =========================================================
 
 st.divider()
 

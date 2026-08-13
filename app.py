@@ -1178,7 +1178,8 @@ if start_button:
         "📈 資産推移"
     )
 
-            )st.subheader(
+            )
+st.subheader(
     "🧾 売買履歴"
 )
 

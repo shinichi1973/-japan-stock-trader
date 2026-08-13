@@ -1178,26 +1178,29 @@ if start_button:
         "📈 資産推移"
     )
 
-    st.line_chart(
-        eq.set_index(
-            "date"
-        )["equity"]
+            )st.subheader(
+    "🧾 売買履歴"
+)
+
+if tr is None:
+    tr = pd.DataFrame()
+
+if not isinstance(tr, pd.DataFrame):
+    tr = pd.DataFrame(tr)
+
+if tr.empty:
+
+    st.warning(
+        "売買条件に一致した銘柄はありませんでした。"
     )
 
-    st.subheader(
-        "🧾 売買履歴"
-    )
+else:
 
-    if tr.empty:
+    display_tr = tr.copy()
 
-        st.warning(
-            "売買条件に一致した銘柄はありませんでした。"
-        )
-
-    else:
-
+    if "date" in display_tr.columns:
         display_tr = (
-            tr
+            display_tr
             .sort_values(
                 "date",
                 ascending=False
@@ -1205,10 +1208,15 @@ if start_button:
             .copy()
         )
 
-        display_tr["date"] = (
-            pd.to_datetime(
-                display_tr["date"]
-            )
+        display_tr["date"] = pd.to_datetime(
+            display_tr["date"],
+            errors="coerce"
+        )
+
+    st.dataframe(
+        display_tr,
+        use_container_width=True
+    )
             .dt.strftime(
                 "%Y-%m-%d"
             )

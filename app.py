@@ -3,11 +3,6 @@ import pandas as pd
 import numpy as np
 from datetime import date, timedelta
 
-
-# =========================================================
-# yfinance
-# =========================================================
-
 try:
     import yfinance as yf
 except ImportError:
@@ -138,7 +133,7 @@ volume_multiplier = st.sidebar.slider(
 
 
 # =========================================================
-# Ver.4.2 固定改善条件
+# Ver.4.2 改善条件
 # =========================================================
 
 st.sidebar.subheader("🧠 Ver.4.2 改善条件")
@@ -439,44 +434,19 @@ def calculate_buy_score(
 
     score = 0
 
-    # -----------------------------------------
     # 25日線 > 75日線
-    # 20点
-    # -----------------------------------------
-
-    if (
-        row["MA25"]
-        > row["MA75"]
-    ):
+    if row["MA25"] > row["MA75"]:
         score += 20
 
-    # -----------------------------------------
     # 株価 > 200日線
-    # 20点
-    # -----------------------------------------
-
-    if (
-        row["Close"]
-        > row["MA200"]
-    ):
+    if row["Close"] > row["MA200"]:
         score += 20
 
-    # -----------------------------------------
     # 株価 > 25日線
-    # 15点
-    # -----------------------------------------
-
-    if (
-        row["Close"]
-        > row["MA25"]
-    ):
+    if row["Close"] > row["MA25"]:
         score += 15
 
-    # -----------------------------------------
     # 出来高
-    # 15点
-    # -----------------------------------------
-
     if (
         row["Volume"]
         >= row["VOL20"]
@@ -484,11 +454,7 @@ def calculate_buy_score(
     ):
         score += 15
 
-    # -----------------------------------------
     # RSI
-    # 15点
-    # -----------------------------------------
-
     if (
         rsi_low
         <= row["RSI"]
@@ -496,26 +462,12 @@ def calculate_buy_score(
     ):
         score += 15
 
-    # -----------------------------------------
     # 25日線上向き
-    # 10点
-    # -----------------------------------------
-
-    if (
-        row["MA25_SLOPE"]
-        > 0
-    ):
+    if row["MA25_SLOPE"] > 0:
         score += 10
 
-    # -----------------------------------------
     # 75日線上向き
-    # 5点
-    # -----------------------------------------
-
-    if (
-        row["MA75_SLOPE"]
-        > 0
-    ):
+    if row["MA75_SLOPE"] > 0:
         score += 5
 
     return score
@@ -541,31 +493,19 @@ def buy_signal(
         volume_multiplier
     )
 
-    # -----------------------------------------
     # 株価2000円以上
-    # -----------------------------------------
-
     price_ok = (
         row["Close"] >= 2000
     )
 
-    # -----------------------------------------
     # RSI
-    # -----------------------------------------
-
     rsi_ok = (
         row["RSI"] >= rsi_low
         and
         row["RSI"] <= rsi_high
     )
 
-    # -----------------------------------------
     # 急騰追い買い防止
-    #
-    # 25日線から一定%以上離れていたら
-    # 高値追いと判断して見送る
-    # -----------------------------------------
-
     chase_ok = (
         row["MA25_DISTANCE"]
         <= chase_limit
@@ -611,22 +551,13 @@ def sell_signal(
         - 1
     ) * 100
 
-    # -----------------------------------------
     # 損切り
-    # -----------------------------------------
-
     if profit_pct <= -stop_loss:
 
         return True, "損切り"
 
-    # -----------------------------------------
     # 最高値更新
-    # -----------------------------------------
-
-    if (
-        current_price
-        > highest_price
-    ):
+    if current_price > highest_price:
 
         position["highest_price"] = (
             current_price
@@ -634,10 +565,7 @@ def sell_signal(
 
         highest_price = current_price
 
-    # -----------------------------------------
     # トレーリング利確
-    # -----------------------------------------
-
     if profit_pct >= take_profit:
 
         trailing_price = (
@@ -648,34 +576,19 @@ def sell_signal(
             )
         )
 
-        if (
-            current_price
-            <= trailing_price
-        ):
+        if current_price <= trailing_price:
 
             return True, "トレーリング利確"
 
-    # -----------------------------------------
     # 25日線割れ
-    # -----------------------------------------
-
-    if (
-        current_price
-        < row["MA25"]
-    ):
+    if current_price < row["MA25"]:
 
         if profit_pct > 5:
 
             return True, "25日線割れ利益確定"
 
-    # -----------------------------------------
     # 75日線割れ
-    # -----------------------------------------
-
-    if (
-        current_price
-        < row["MA75"]
-    ):
+    if current_price < row["MA75"]:
 
         return True, "75日線割れ"
 
@@ -712,17 +625,9 @@ def run_backtest(
 
     all_dates = set()
 
-    # -----------------------------------------
-    # 再エントリー禁止管理
-    # ticker -> 再購入可能日
-    # -----------------------------------------
-
     cooldown_until = {}
 
-    # -----------------------------------------
     # 全日付
-    # -----------------------------------------
-
     for ticker, df in ticker_data.items():
 
         if (
@@ -799,34 +704,31 @@ def run_backtest(
                     "Reason": reason
                 })
 
-                # ---------------------------------
-                # 損切りの場合は再購入禁止
-                # ---------------------------------
-
+                # 損切り後の再購入禁止
                 if reason == "損切り":
 
-                    try:
+                    future_dates = [
+                        d
+                        for d in all_dates
+                        if d > current_date
+                    ]
 
-                        future_dates = [
-                            d
-                            for d in all_dates
-                            if d > current_date
-                        ]
+                    if future_dates:
 
-                        if future_dates:
+                        if cooldown_days == 0:
+
+                            pass
+
+                        else:
 
                             index = min(
-                                cooldown_days,
+                                cooldown_days - 1,
                                 len(future_dates) - 1
                             )
 
                             cooldown_until[ticker] = (
                                 future_dates[index]
                             )
-
-                    except Exception:
-
-                        pass
 
                 del positions[ticker]
 
@@ -839,42 +741,30 @@ def run_backtest(
             if current_date not in df.index:
                 continue
 
-            # ---------------------------------
-            # すでに保有中
-            # ---------------------------------
-
+            # 保有中
             if ticker in positions:
                 continue
 
-            # ---------------------------------
             # 最大保有数
-            # ---------------------------------
-
             if (
                 len(positions)
                 >= max_positions
             ):
                 break
 
-            # ---------------------------------
             # クールダウン
-            # ---------------------------------
-
             if ticker in cooldown_until:
 
                 if (
                     current_date
-                    < cooldown_until[ticker]
+                    <= cooldown_until[ticker]
                 ):
 
                     continue
 
             row = df.loc[current_date]
 
-            # ---------------------------------
-            # 必要指標チェック
-            # ---------------------------------
-
+            # 必要指標
             required_values = [
                 row["MA25"],
                 row["MA75"],
@@ -893,10 +783,7 @@ def run_backtest(
 
                 continue
 
-            # ---------------------------------
             # BUY判定
-            # ---------------------------------
-
             signal, score = buy_signal(
                 row,
                 min_score,
@@ -913,12 +800,7 @@ def run_backtest(
                 row["Close"]
             )
 
-            # ---------------------------------
             # S株想定
-            #
-            # 1株から購入可能
-            # ---------------------------------
-
             shares = int(
                 max_per_position
                 // price
@@ -932,10 +814,7 @@ def run_backtest(
                 * shares
             )
 
-            # ---------------------------------
             # 現金不足
-            # ---------------------------------
-
             if amount > cash:
                 continue
 
@@ -1048,10 +927,7 @@ def run_backtest(
 
             del positions[ticker]
 
-        # -------------------------------------
-        # 最終決済後の正確な資産
-        # -------------------------------------
-
+        # 最終決済後の資産
         equity_curve.append({
             "Date": final_date,
             "Equity": cash,
@@ -1067,12 +943,7 @@ def run_backtest(
         equity_curve
     )
 
-    # -----------------------------------------
-    # 同日重複削除
-    # 最終決済で同じ日付が追加されるため
-    # 最後の値を残す
-    # -----------------------------------------
-
+    # 同じ日付が2つある場合は最後を残す
     if not equity_df.empty:
 
         equity_df = (
@@ -1085,6 +956,28 @@ def run_backtest(
             .reset_index(drop=True)
         )
 
+    # =========================================
+    # DDをここで確実に作成
+    # =========================================
+
+    if not equity_df.empty:
+
+        equity_df["Peak"] = (
+            equity_df["Equity"]
+            .cummax()
+        )
+
+        equity_df["Drawdown"] = (
+            equity_df["Equity"]
+            - equity_df["Peak"]
+        )
+
+        equity_df["DrawdownPct"] = (
+            equity_df["Drawdown"]
+            / equity_df["Peak"]
+            * 100
+        )
+
     return (
         trades_df,
         equity_df
@@ -1092,7 +985,7 @@ def run_backtest(
 
 
 # =========================================================
-# 結果計算
+# 統計計算
 # =========================================================
 
 def calculate_statistics(
@@ -1104,7 +997,6 @@ def calculate_statistics(
     result = {}
 
     if equity_df.empty:
-
         return result
 
     final_equity = float(
@@ -1121,28 +1013,7 @@ def calculate_statistics(
         / initial_cash
     ) * 100
 
-    # -----------------------------------------
     # 最大DD
-    # -----------------------------------------
-
-    equity_df = equity_df.copy()
-
-    equity_df["Peak"] = (
-        equity_df["Equity"]
-        .cummax()
-    )
-
-    equity_df["Drawdown"] = (
-        equity_df["Equity"]
-        - equity_df["Peak"]
-    )
-
-    equity_df["DrawdownPct"] = (
-        equity_df["Drawdown"]
-        / equity_df["Peak"]
-        * 100
-    )
-
     max_dd = float(
         equity_df["Drawdown"].min()
     )
@@ -1254,7 +1125,7 @@ def calculate_statistics(
 
 
 # =========================================================
-# データ取得
+# バックテスト開始
 # =========================================================
 
 st.subheader("📥 データ取得")
@@ -1366,18 +1237,6 @@ if st.button(
         initial_cash
     )
 
-    final_equity = stats[
-        "final_equity"
-    ]
-
-    profit = stats[
-        "profit"
-    ]
-
-    profit_pct = stats[
-        "profit_pct"
-    ]
-
     # =========================================
     # 基本結果
     # =========================================
@@ -1386,17 +1245,17 @@ if st.button(
 
     col1.metric(
         "最終資産",
-        f"¥{final_equity:,.0f}"
+        f"¥{stats['final_equity']:,.0f}"
     )
 
     col2.metric(
         "損益",
-        f"¥{profit:,.0f}"
+        f"¥{stats['profit']:,.0f}"
     )
 
     col3.metric(
         "損益率",
-        f"{profit_pct:.2f}%"
+        f"{stats['profit_pct']:.2f}%"
     )
 
     col4.metric(
@@ -1426,13 +1285,11 @@ if st.button(
 
     pf = stats["profit_factor"]
 
-    if np.isinf(pf):
-
-        pf_text = "∞"
-
-    else:
-
-        pf_text = f"{pf:.2f}"
+    pf_text = (
+        "∞"
+        if np.isinf(pf)
+        else f"{pf:.2f}"
+    )
 
     col3.metric(
         "Profit Factor",
@@ -1446,13 +1303,11 @@ if st.button(
 
     rr = stats["risk_reward"]
 
-    if np.isinf(rr):
-
-        rr_text = "∞"
-
-    else:
-
-        rr_text = f"{rr:.2f}倍"
+    rr_text = (
+        "∞"
+        if np.isinf(rr)
+        else f"{rr:.2f}倍"
+    )
 
     col5.metric(
         "平均利益/損失",
@@ -1460,7 +1315,7 @@ if st.button(
     )
 
     # =========================================
-    # DD率
+    # DD統計
     # =========================================
 
     col1, col2 = st.columns(2)
@@ -1497,7 +1352,8 @@ if st.button(
 
             chart_df = (
                 equity_df
-                .set_index("Date")["Equity"]
+                .set_index("Date")
+                ["Equity"]
             )
 
             st.line_chart(
@@ -1505,7 +1361,7 @@ if st.button(
             )
 
             # =====================================
-            # DD推移
+            # ドローダウン
             # =====================================
 
             st.subheader(
@@ -1582,7 +1438,7 @@ if st.button(
             )
 
             # =====================================
-            # 悪いトレード
+            # 改善対象
             # =====================================
 
             st.subheader(
@@ -1679,7 +1535,7 @@ if st.button(
 
 
 # =========================================================
-# Ver.4.2 条件説明
+# 条件説明
 # =========================================================
 
 st.divider()
@@ -1692,15 +1548,15 @@ st.markdown(
     """
 ## 🟢 BUY条件
 
-### 基本スコア：100点満点
+### 100点満点
 
-- 25日線 > 75日線 …… **20点**
-- 株価 > 200日線 …… **20点**
-- 株価 > 25日線 …… **15点**
-- 出来高条件 …… **15点**
-- RSI適正 …… **15点**
-- 25日線上向き …… **10点**
-- 75日線上向き …… **5点**
+- 25日線 > 75日線 …… 20点
+- 株価 > 200日線 …… 20点
+- 株価 > 25日線 …… 15点
+- 出来高条件 …… 15点
+- RSI適正 …… 15点
+- 25日線上向き …… 10点
+- 75日線上向き …… 5点
 
 ### BUY判定
 
@@ -1718,19 +1574,15 @@ st.markdown(
 
 ---
 
-## 🛡️ Ver.4.2のリスク管理
+## 🛡️ リスク管理
 
 ### 損切り
 
 **-7%**
 
-大きな損失になる前に撤退します。
-
-### 利益確定
+### 利確
 
 **+15%からトレーリング開始**
-
-利益が伸びた銘柄をできるだけ長く保有します。
 
 ### 25日線割れ
 
@@ -1740,35 +1592,31 @@ st.markdown(
 
 ### 75日線割れ
 
-トレンド悪化と判断して、
-
 **75日線割れ → 撤退**
 
-### 再エントリー制限
+### 損切り後の再エントリー
 
-損切りした銘柄は、
+標準では、
 
-**一定期間再購入しません。**
+**10営業日再購入禁止**
 
 ---
 
-## 🚫 使用しない条件
-
-### 明けの明星
+## 🚫 明けの明星
 
 **完全に使用しません。**
 
 Ver.4.2では明けの明星を
-銘柄選定条件・BUY条件・スコア条件の
+BUY条件・スコア条件の
 いずれにも使用していません。
 
 ---
 
 ## 🎯 Ver.4.2の目的
 
-単純に勝率を上げるのではなく、
+単純に勝率だけを上げるのではなく、
 
-**「悪い買いを減らす」**
+**「悪い買いを減らし、大きな利益を伸ばす」**
 
 ことを重視します。
 
@@ -1777,10 +1625,10 @@ Ver.4.2では明けの明星を
 - 最大DD
 - Profit Factor
 - 平均利益/平均損失
-- 損切り回数
-- 連続損失
+- 勝率
 - 銘柄別成績
+- 売却理由別成績
 
-を確認してVer.4.1と比較します。
+を確認します。
 """
 )

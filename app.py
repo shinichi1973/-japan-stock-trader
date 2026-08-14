@@ -11,17 +11,17 @@ except ImportError:
     yf = None
 
 # =========================================================
-# 日本株 自動バックテスト Ver.3.8.1
+# 日本株 自動バックテスト Ver.3.8.2
 # 日経225 / 明けの明星削除 / 高速条件探索 / リスク評価
 # =========================================================
 
 st.set_page_config(
-    page_title="日本株 自動バックテスト Ver.3.8.1",
+    page_title="日本株 自動バックテスト Ver.3.8.2",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 日本株 自動バックテスト Ver.3.8.1")
+st.title("📈 日本株 自動バックテスト Ver.3.8.2")
 st.caption(
     "日経225を中心に、利益だけでなくリスク・安定性も含めて"
     "強い売買条件を自動探索します。実注文は行いません。"
@@ -109,7 +109,7 @@ use_rsi = st.sidebar.checkbox(
 )
 
 st.sidebar.info(
-    "明けの明星はVer.3.8.1から完全削除しています。"
+    "明けの明星はVer.3.8.2から完全削除しています。"
 )
 
 # =========================================================
@@ -884,8 +884,7 @@ def make_search_grid(mode):
 
     rows = []
 
-    for ma, volume, price2000, rsi, sl, tp in product(
-        [False, True],
+    for ma, volume, rsi, sl, tp in product(
         [False, True],
         [False, True],
         rsi_values,
@@ -895,7 +894,6 @@ def make_search_grid(mode):
         rows.append({
             "MA": ma,
             "出来高": volume,
-            "2000円": price2000,
             "RSI": rsi,
             "SL": sl,
             "TP": tp
@@ -908,7 +906,6 @@ def quick_score_condition(
     df,
     use_ma,
     use_volume,
-    use_price2000,
     rsi_max
 ):
     """
@@ -920,7 +917,7 @@ def quick_score_condition(
         df,
         use_ma,
         use_volume,
-        use_price2000,
+        False,
         True,
         rsi_max
     )
@@ -995,7 +992,6 @@ def fast_two_stage_search(data, mode, top_n=30):
             data,
             p["MA"],
             p["出来高"],
-            p["2000円"],
             p["RSI"]
         )
 
@@ -1035,7 +1031,6 @@ def fast_two_stage_search(data, mode, top_n=30):
         results.append({
             "MA": "ON" if p["MA"] else "OFF",
             "出来高": "ON" if p["出来高"] else "OFF",
-            "2000円": "ON" if p["2000円"] else "OFF",
             "RSI": int(p["RSI"]),
             "SL": f"-{float(p['SL']):.0%}",
             "TP": f"+{float(p['TP']):.0%}",
@@ -1303,7 +1298,7 @@ if not data.empty:
             st.download_button(
                 "⬇️ 売買履歴CSVを保存",
                 data=csv,
-                file_name="backtest_trades_ver3_8_1.csv",
+                file_name="backtest_trades_ver3_8_2.csv",
                 mime="text/csv"
             )
 
@@ -1414,7 +1409,7 @@ if not data.empty:
         st.download_button(
             "⬇️ 条件探索ランキングCSV",
             data=csv,
-            file_name="ver3_8_1_condition_ranking.csv",
+            file_name="ver3_8_2_condition_ranking.csv",
             mime="text/csv"
         )
 
@@ -1440,12 +1435,12 @@ if not data.empty:
 
             candidate_ma = best["MA"] == "ON"
             candidate_volume = best["出来高"] == "ON"
-            candidate_price = best["2000円"] == "ON"
+            candidate_price = False
             candidate_rsi = int(best["RSI"])
         else:
             candidate_ma = use_ma
             candidate_volume = use_volume
-            candidate_price = use_price_2000
+            candidate_price = False
             candidate_rsi = default_rsi
 
         candidates = current_candidates(
@@ -1504,7 +1499,7 @@ if not data.empty:
     st.header("🔴 売却監視について")
 
     st.info(
-        "Ver.3.8.1では実注文を行いません。"
+        "Ver.3.8.2では実注文を行いません。"
         "今後、保有銘柄を登録して、損切り・利確・25日線割れを"
         "毎朝自動判定する機能へ発展させます。"
     )
@@ -1517,7 +1512,7 @@ else:
 st.divider()
 
 st.caption(
-    "Ver.3.8.1 / 仮想売買専用。証券会社への実注文は行いません。"
+    "Ver.3.8.2 / 仮想売買専用。証券会社への実注文は行いません。"
 )
 
 st.caption(

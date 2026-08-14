@@ -113,6 +113,7 @@ with st.sidebar:
     entries=st.text_area("取得単価（例：7203:1500）","")
 
 st.title("📈 日本株 AI投資アシスタント Ver.5.4")
+st.caption("BUILD: VER5.4-CLEAN-20260814")
 st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認")
 
 with st.spinner("🧠 裏側で5年間のAI分析・バックテストを実行中…"):
@@ -199,12 +200,26 @@ sell_df=pd.DataFrame(sell)
 sell_candidates=sell_df[sell_df["判定"].isin(["SELL","SELL注意"])] if not sell_df.empty else pd.DataFrame()
 
 # 統計
-final=float(equity_df.Total.iloc[-1]) if not equity_df.empty else initial
-profit=final-initial; ret=profit/initial*100
-if not equity_df.empty:
-    equity_df["最高資産"]=equity_df.Total.cummax(); equity_df["DD"]=equity_df.Total-equity_df["最高資産"]; equity_df["DD率"]=equity_df.DD/equity_df["最高資産"]*100
-    maxdd=float(equity_df.DD.min()); maxddrate=float(equity_df["DD率"].min())
-else:maxdd=maxddrate=0
+if not equity_df.empty and "総資産" in equity_df.columns:
+    equity_df["総資産"] = pd.to_numeric(equity_df["総資産"], errors="coerce").fillna(initial)
+    final = float(equity_df["総資産"].iloc[-1])
+    equity_df["最高資産"] = equity_df["総資産"].cummax()
+    equity_df["DD"] = equity_df["総資産"] - equity_df["最高資産"]
+    equity_df["DD率"] = np.where(
+        equity_df["最高資産"] != 0,
+        equity_df["DD"] / equity_df["最高資産"] * 100,
+        0.0
+    )
+    maxdd = float(equity_df["DD"].min())
+    maxddrate = float(equity_df["DD率"].min())
+else:
+    equity_df = pd.DataFrame(columns=["日付","現金","保有株評価額","総資産","保有銘柄数","連敗数","新規BUY停止中"])
+    final = float(initial)
+    maxdd = 0.0
+    maxddrate = 0.0
+
+profit = final - initial
+ret = profit / initial * 100 if initial else 0.0
 selltr=trades_df[trades_df["売買"]=="SELL"] if not trades_df.empty else pd.DataFrame()
 winrate=(selltr["損益"]>0).mean()*100 if not selltr.empty else 0
 gp=selltr.loc[selltr["損益"]>0,"損益"].sum() if not selltr.empty else 0

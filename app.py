@@ -12,9 +12,9 @@ except ImportError:
 
 
 # =========================================================
-# 日本株 10万円→100万円 AI投資アシスタント Ver.4.0
+# 日本株 10万円→100万円 AI投資アシスタント Ver.4.1
 # =========================================================
-# Ver.4.0の目的
+# Ver.4.1の目的
 # - 10万円スタートのS株向け仮想バックテスト
 # - 明けの明星は使用しない
 # - 株価・出来高・MA・RSIを中心にスコアリング
@@ -229,14 +229,10 @@ def prepare_all_data(raw_items):
 # =========================================================
 def score_row(row, settings):
     """
-    100点満点。
-    Ver.4.0ではテクニカル中心。
+    Ver.4.1 詳細スコアリング。
+    合計100点。各項目の点数を売買記録・候補一覧に残す。
     明けの明星は使用しない。
     """
-    score = 0
-    reasons = []
-    warnings = []
-
     close = safe_float(row.get("Close"))
     ma25 = safe_float(row.get("MA25"))
     ma75 = safe_float(row.get("MA75"))
@@ -248,87 +244,138 @@ def score_row(row, settings):
     from_high = safe_float(row.get("FROM_HIGH20"))
     volatility = safe_float(row.get("VOLATILITY20"))
 
-    # --- トレンド 30点 ---
+    trend_score = 0
+    volume_score = 0
+    rsi_score = 0
+    momentum_score = 0
+    pullback_score = 0
+    risk_score = 0
+
+    reasons = []
+    warnings = []
+
+    # -----------------------------
+    # ① トレンド 30点
+    # -----------------------------
     if ma25 > 0 and ma75 > 0 and ma25 > ma75:
-        score += 12
-        reasons.append("25日線 > 75日線")
+        trend_score += 12
+        reasons.append("25日線>75日線")
 
     if ma200 > 0 and close > ma200:
-        score += 8
-        reasons.append("株価 > 200日線")
+        trend_score += 8
+        reasons.append("株価>200日線")
 
     if ma25 > 0 and close > ma25:
-        score += 5
-        reasons.append("株価 > 25日線")
+        trend_score += 5
+        reasons.append("株価>25日線")
 
     if ret20 > 0:
-        score += 5
-        reasons.append("20日騰落率プラス")
-    else:
-        warnings.append("20日騰落率マイナス")
+        trend_score += 5
+        reasons.append("20日騰落率+")
 
-    # --- 出来高 15点 ---
+    # -----------------------------
+    # ② 出来高 15点
+    # -----------------------------
     if vol_ratio >= 1.5:
-        score += 10
+        volume_score += 10
         reasons.append(f"出来高{vol_ratio:.1f}倍")
     elif vol_ratio >= 1.2:
-        score += 7
+        volume_score += 7
         reasons.append(f"出来高{vol_ratio:.1f}倍")
     elif vol_ratio >= 1.0:
-        score += 4
-        reasons.append("出来高20日平均以上")
+        volume_score += 4
+        reasons.append("出来高平均以上")
+    else:
+        warnings.append("出来高弱い")
 
-    # --- RSI 20点 ---
-    if settings["use_rsi"]:
-        if 45 <= rsi <= 65:
-            score += 15
-            reasons.append(f"RSI適正({rsi:.1f})")
-        elif 35 <= rsi < 45:
-            score += 10
-            reasons.append(f"RSI押し目({rsi:.1f})")
-        elif 65 < rsi <= settings["rsi_max"]:
-            score += 8
-            reasons.append(f"RSIやや高め({rsi:.1f})")
-        elif rsi > settings["rsi_max"]:
-            warnings.append(f"RSI過熱({rsi:.1f})")
-        else:
-            warnings.append(f"RSI低迷({rsi:.1f})")
+    # -----------------------------
+    # ③ RSI 20点
+    # -----------------------------
+    if 45 <= rsi <= 65:
+        rsi_score += 15
+        reasons.append(f"RSI適正{rsi:.1f}")
+    elif 35 <= rsi < 45:
+        rsi_score += 10
+        reasons.append(f"RSI押し目{rsi:.1f}")
+    elif 65 < rsi <= settings["rsi_max"]:
+        rsi_score += 8
+        reasons.append(f"RSIやや高め{rsi:.1f}")
+    elif rsi > settings["rsi_max"]:
+        warnings.append(f"RSI過熱{rsi:.1f}")
+    else:
+        warnings.append(f"RSI低迷{rsi:.1f}")
 
-    # --- モメンタム 15点 ---
+    # -----------------------------
+    # ④ モメンタム 15点
+    # -----------------------------
     if ret5 >= 0.03:
-        score += 8
-        reasons.append("5日上昇モメンタム")
+        momentum_score += 8
+        reasons.append("5日上昇")
     elif ret5 >= 0:
-        score += 4
+        momentum_score += 4
 
     if 0.02 <= ret20 <= 0.20:
-        score += 7
-        reasons.append("20日上昇率が適正")
+        momentum_score += 7
+        reasons.append("20日上昇率適正")
     elif ret20 > 0.20:
-        warnings.append("短期間で上昇し過ぎの可能性")
+        warnings.append("短期上昇大")
 
-    # --- 押し目 10点 ---
+    # -----------------------------
+    # ⑤ 押し目 10点
+    # -----------------------------
     if -0.10 <= from_high <= -0.02 and close > ma75:
-        score += 10
-        reasons.append("高値からの健全な押し目")
+        pullback_score += 10
+        reasons.append("健全な押し目")
     elif -0.02 < from_high <= 0:
-        score += 5
+        pullback_score += 5
 
-    # 過度なボラティリティ
-    if volatility > 0.06:
-        score -= 5
-        warnings.append("値動きが大きい")
+    # -----------------------------
+    # ⑥ リスク 10点
+    # -----------------------------
+    if volatility <= 0.03:
+        risk_score += 10
+    elif volatility <= 0.05:
+        risk_score += 7
+    elif volatility <= 0.06:
+        risk_score += 4
+    else:
+        warnings.append("高ボラティリティ")
 
-    score = max(0, min(100, int(score)))
+    total = (
+        trend_score
+        + volume_score
+        + rsi_score
+        + momentum_score
+        + pullback_score
+        + risk_score
+    )
+    total = max(0, min(100, int(total)))
 
-    if score >= settings["buy_score"]:
+    if total >= settings["buy_score"]:
         decision = "🟢 買い候補"
-    elif score >= settings["watch_score"]:
+    elif total >= settings["watch_score"]:
         decision = "🟡 監視・押し目待ち"
     else:
         decision = "⚪ 見送り"
 
-    return score, decision, reasons, warnings
+    return {
+        "score": total,
+        "decision": decision,
+        "trend_score": trend_score,
+        "volume_score": volume_score,
+        "rsi_score": rsi_score,
+        "momentum_score": momentum_score,
+        "pullback_score": pullback_score,
+        "risk_score": risk_score,
+        "reasons": reasons,
+        "warnings": warnings,
+        "rsi": rsi,
+        "vol_ratio": vol_ratio,
+        "ret5": ret5,
+        "ret20": ret20,
+        "from_high": from_high,
+        "volatility": volatility,
+    }
 
 
 # =========================================================
@@ -490,7 +537,8 @@ def run_backtest(
             if max_price > 0 and current_close > max_price:
                 continue
 
-            score, decision, reasons, warnings = score_row(row, settings)
+            detail = score_row(row, settings)
+            score = detail["score"]
 
             if score >= buy_score:
                 candidates.append(
@@ -498,8 +546,7 @@ def run_backtest(
                         score,
                         ticker,
                         next_open,
-                        reasons,
-                        warnings,
+                        detail,
                     )
                 )
 
@@ -507,7 +554,7 @@ def run_backtest(
 
         available_slots = max(0, max_positions - len(positions))
 
-        for score, ticker, next_open, reasons, warnings in candidates[:available_slots]:
+        for score, ticker, next_open, detail in candidates[:available_slots]:
             if cash <= 0:
                 break
 
@@ -542,7 +589,20 @@ def run_backtest(
                     "Shares": int(shares),
                     "Amount": round(cost, 2),
                     "PnL": 0.0,
-                    "Reason": f"Score {score} / " + ", ".join(reasons[:3]),
+                    "Reason": (
+                        f"Score {score} / "
+                        + ", ".join(detail["reasons"][:4])
+                    ),
+                    "TrendScore": detail["trend_score"],
+                    "VolumeScore": detail["volume_score"],
+                    "RSIScore": detail["rsi_score"],
+                    "MomentumScore": detail["momentum_score"],
+                    "PullbackScore": detail["pullback_score"],
+                    "RiskScore": detail["risk_score"],
+                    "RSI": round(detail["rsi"], 1),
+                    "VolumeRatio": round(detail["vol_ratio"], 2),
+                    "Ret5D%": round(detail["ret5"] * 100, 2),
+                    "Ret20D%": round(detail["ret20"] * 100, 2),
                 }
             )
 
@@ -668,30 +728,34 @@ def latest_candidates(data_dict, buy_score, min_price, max_price, top_n=10):
             continue
 
         row = df.iloc[-1]
-
         close = safe_float(row.get("Close"))
+
         if close < min_price:
             continue
 
         if max_price > 0 and close > max_price:
             continue
 
-        score, decision, reasons, warnings = score_row(row, settings)
+        detail = score_row(row, settings)
 
         rows.append(
             {
                 "Ticker": ticker_display(ticker),
                 "Price": round(close, 2),
-                "Score": score,
-                "Decision": decision,
-                "RSI": round(safe_float(row.get("RSI14"), 50), 1),
-                "MA25": round(safe_float(row.get("MA25")), 2),
-                "MA75": round(safe_float(row.get("MA75")), 2),
-                "VolumeRatio": round(safe_float(row.get("VOL_RATIO"), 1), 2),
-                "5D": round(safe_float(row.get("RET_5D")) * 100, 2),
-                "20D": round(safe_float(row.get("RET_20D")) * 100, 2),
-                "Reasons": " / ".join(reasons[:5]),
-                "Warnings": " / ".join(warnings[:3]),
+                "Score": detail["score"],
+                "Decision": detail["decision"],
+                "Trend": detail["trend_score"],
+                "Volume": detail["volume_score"],
+                "RSI_Score": detail["rsi_score"],
+                "Momentum": detail["momentum_score"],
+                "Pullback": detail["pullback_score"],
+                "Risk": detail["risk_score"],
+                "RSI": round(detail["rsi"], 1),
+                "VolumeRatio": round(detail["vol_ratio"], 2),
+                "5D%": round(detail["ret5"] * 100, 2),
+                "20D%": round(detail["ret20"] * 100, 2),
+                "Reasons": " / ".join(detail["reasons"][:6]),
+                "Warnings": " / ".join(detail["warnings"][:4]),
             }
         )
 
@@ -709,10 +773,20 @@ def latest_candidates(data_dict, buy_score, min_price, max_price, top_n=10):
 # =========================================================
 # UI
 # =========================================================
-st.title("📈 日本株 10万円→100万円 AI投資アシスタント Ver.4.0")
+st.title("📈 日本株 10万円→100万円 AI投資アシスタント Ver.4.1")
 
 st.caption(
     "S株を想定した仮想バックテスト。明けの明星は使用しません。"
+)
+
+# iPhoneでも操作しやすいよう、メイン画面にも常時表示
+st.markdown("### 🚀 バックテスト")
+st.write("左側（☰）で条件を設定したあと、下のボタンを押してください。")
+main_run_button = st.button(
+    "🚀 バックテスト開始",
+    type="primary",
+    use_container_width=True,
+    key="main_run_button",
 )
 
 with st.sidebar:
@@ -825,10 +899,10 @@ with st.sidebar:
 
     st.divider()
 
-    run_button = st.button(
-        "🚀 バックテスト開始",
-        type="primary",
+    sidebar_run_button = st.button(
+        "🚀 バックテスト開始（サイドバー）",
         use_container_width=True,
+        key="sidebar_run_button",
     )
 
     clear_button = st.button(
@@ -880,6 +954,8 @@ st.info(
 # =========================================================
 end_date = date.today() + timedelta(days=1)
 start_date = date.today() - timedelta(days=365 * years + 250)
+
+run_button = main_run_button or sidebar_run_button
 
 if run_button:
     if yf is None:
@@ -1073,6 +1149,25 @@ else:
         hide_index=True,
     )
 
+    with st.expander("🔍 買い候補の判定理由を詳しく見る"):
+        st.write(
+            "Scoreは100点満点。Trend 30点、Volume 15点、RSI 20点、"
+            "Momentum 15点、Pullback 10点、Risk 10点です。"
+        )
+        st.dataframe(
+            latest_df[
+                [
+                    "Ticker", "Price", "Score", "Decision",
+                    "Trend", "Volume", "RSI_Score",
+                    "Momentum", "Pullback", "Risk",
+                    "RSI", "VolumeRatio", "5D%", "20D%",
+                    "Reasons", "Warnings"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
 
 # =========================================================
 # 資産曲線
@@ -1104,6 +1199,31 @@ else:
         hide_index=True,
     )
 
+
+# =========================================================
+# 売買分析
+# =========================================================
+st.subheader("🔬 売買分析")
+
+if not trades_df.empty and "Action" in trades_df.columns:
+    sells = trades_df[trades_df["Action"] == "SELL"].copy()
+
+    if not sells.empty:
+        a1, a2, a3 = st.columns(3)
+
+        avg_pnl = sells["PnL"].mean()
+        win_pnl = sells.loc[sells["PnL"] > 0, "PnL"].mean()
+        loss_pnl = sells.loc[sells["PnL"] <= 0, "PnL"].mean()
+
+        a1.metric("平均損益", f"{avg_pnl:+,.0f}円")
+        a2.metric("平均利益", f"{0 if pd.isna(win_pnl) else win_pnl:+,.0f}円")
+        a3.metric("平均損失", f"{0 if pd.isna(loss_pnl) else loss_pnl:+,.0f}円")
+
+        if "Reason" in sells.columns:
+            st.caption(
+                "Ver.4.1では、売買ごとのScore内訳を保存しています。"
+                "今後このデータを使って条件の重みを最適化します。"
+            )
 
 # =========================================================
 # 売買記録
@@ -1185,12 +1305,12 @@ with st.expander("⚠️ Ver.4.0の重要な注意"):
         - 実際のSBI証券への注文は行いません。
         - 「必ず上がる銘柄」を予測するものではありません。
         - 過去のバックテスト結果は将来の利益を保証しません。
-        - Ver.4.0ではニュース・企業業績・市況をまだ総合判定していません。
+        - Ver.4.1ではニュース・企業業績・市況をまだ総合判定していません。
         - S株の実際の約定は1日3回で、Ver.4.0は「翌営業日始値」の近似モデルです。
         - 株式分割・併合、上場廃止、データ欠損等については、今後のバージョンでさらに精度を上げます。
         """
     )
 
 st.caption(
-    "日本株 10万円→100万円 AI投資アシスタント Ver.4.0 / 仮想売買専用"
+    "日本株 10万円→100万円 AI投資アシスタント Ver.4.1 / 仮想売買専用"
 )

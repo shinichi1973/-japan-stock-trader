@@ -11,17 +11,17 @@ except ImportError:
     yf = None
 
 # =========================================================
-# 日本株 自動バックテスト Ver.3.8
+# 日本株 自動バックテスト Ver.3.8.1
 # 日経225 / 明けの明星削除 / 高速条件探索 / リスク評価
 # =========================================================
 
 st.set_page_config(
-    page_title="日本株 自動バックテスト Ver.3.8",
+    page_title="日本株 自動バックテスト Ver.3.8.1",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 日本株 自動バックテスト Ver.3.8")
+st.title("📈 日本株 自動バックテスト Ver.3.8.1")
 st.caption(
     "日経225を中心に、利益だけでなくリスク・安定性も含めて"
     "強い売買条件を自動探索します。実注文は行いません。"
@@ -109,7 +109,7 @@ use_rsi = st.sidebar.checkbox(
 )
 
 st.sidebar.info(
-    "明けの明星はVer.3.8から完全削除しています。"
+    "明けの明星はVer.3.8.1から完全削除しています。"
 )
 
 # =========================================================
@@ -869,8 +869,12 @@ def calculate_stats(eq, tr):
 # =========================================================
 
 def make_search_grid(mode):
+    """
+    高速探索用の候補条件。
+    まず軽量スクリーニングを行い、上位条件だけ本格バックテストする。
+    """
     if mode == "高速探索":
-        rsi_values = [55, 60, 65, 70]
+        rsi_values = [55, 60, 65]
         sl_values = [0.05, 0.07, 0.10]
         tp_values = [0.10, 0.15, 0.20]
     else:
@@ -898,6 +902,166 @@ def make_search_grid(mode):
         })
 
     return rows
+
+
+def quick_score_condition(
+    df,
+    use_ma,
+    use_volume,
+    use_price2000,
+    rsi_max
+):
+    """
+    本格売買シミュレーションをせず、
+    シグナル数・平均5日リターン・勝率・下振れを使って
+    有望条件を高速スクリーニングする。
+    """
+    signal = make_signal(
+        df,
+        use_ma,
+        use_volume,
+        use_price2000,
+        True,
+        rsi_max
+    )
+
+    x = df.loc[
+        signal,
+        ["ticker", "date", "close"]
+    ].copy()
+
+    if x.empty:
+        return {
+            "quick_score": -999,
+            "signals": 0,
+            "forward_win_rate": 0,
+            "avg_forward_return": 0
+        }
+
+    x = x.sort_values(
+        ["ticker", "date"]
+    )
+
+    x["future5"] = (
+        x.groupby("ticker")["close"]
+        .shift(-5) / x["close"] - 1
+    )
+
+    # 未来5日リターンが計算できるシグナルだけ利用
+    x = x.dropna(subset=["future5"])
+
+    if x.empty:
+        return {
+            "quick_score": -999,
+            "signals": 0,
+            "forward_win_rate": 0,
+            "avg_forward_return": 0
+        }
+
+    # 極端な外れ値の影響を抑える
+    clipped = x["future5"].clip(-0.20, 0.20)
+
+    avg_ret = float(clipped.mean())
+    win_rate = float((clipped > 0).mean())
+    signal_count = len(clipped)
+
+    # 未来データは「研究用スクリーニング」にのみ使用。
+    # 最終順位は本格バックテストで再検証する。
+    quick_score = (
+        avg_ret * 100
+        + win_rate * 5
+        + min(signal_count, 500) / 100
+    )
+
+    return {
+        "quick_score": quick_score,
+        "signals": signal_count,
+        "forward_win_rate": win_rate,
+        "avg_forward_return": avg_ret
+    }
+
+
+def fast_two_stage_search(data, mode, top_n=30):
+    """
+    Stage 1: 軽量スクリーニング
+    Stage 2: 上位条件のみ本格バックテスト
+    """
+    grid = make_search_grid(mode)
+
+    quick_rows = []
+
+    for p in grid:
+        q = quick_score_condition(
+            data,
+            p["MA"],
+            p["出来高"],
+            p["2000円"],
+            p["RSI"]
+        )
+
+        quick_rows.append({
+            **p,
+            **q
+        })
+
+    quick_df = pd.DataFrame(quick_rows)
+
+    quick_df = quick_df.sort_values(
+        "quick_score",
+        ascending=False
+    ).reset_index(drop=True)
+
+    finalists = quick_df.head(
+        min(top_n, len(quick_df))
+    )
+
+    results = []
+
+    for _, p in finalists.iterrows():
+        eq, tr, _ = run_backtest(
+            data,
+            bool(p["MA"]),
+            bool(p["出来高"]),
+            bool(p["2000円"]),
+            True,
+            int(p["RSI"]),
+            float(p["SL"]),
+            float(p["TP"]),
+            keep_trades=True
+        )
+
+        s = calculate_stats(eq, tr)
+
+        results.append({
+            "MA": "ON" if p["MA"] else "OFF",
+            "出来高": "ON" if p["出来高"] else "OFF",
+            "2000円": "ON" if p["2000円"] else "OFF",
+            "RSI": int(p["RSI"]),
+            "SL": f"-{float(p['SL']):.0%}",
+            "TP": f"+{float(p['TP']):.0%}",
+            "総損益": s["pnl"],
+            "収益率": s["return_rate"],
+            "CAGR": s["cagr"],
+            "最大DD": s["max_drawdown"],
+            "PF": s["profit_factor"],
+            "Sharpe": s["sharpe"],
+            "勝率": s["win_rate"],
+            "決済数": s["trades"],
+            "総合スコア": s["score"],
+            "事前スコア": float(p["quick_score"])
+        })
+
+    result_df = pd.DataFrame(results)
+
+    if result_df.empty:
+        return quick_df, result_df
+
+    result_df = result_df.sort_values(
+        "総合スコア",
+        ascending=False
+    ).reset_index(drop=True)
+
+    return quick_df, result_df
 
 # =========================================================
 # 買い候補・売り候補
@@ -1139,7 +1303,7 @@ if not data.empty:
             st.download_button(
                 "⬇️ 売買履歴CSVを保存",
                 data=csv,
-                file_name="backtest_trades_ver3_8.csv",
+                file_name="backtest_trades_ver3_8_1.csv",
                 mime="text/csv"
             )
 
@@ -1164,81 +1328,54 @@ if not data.empty:
     )
 
     if st.button(
-        "🔬 強い条件を自動探索",
+        "🔬 強い条件を高速自動探索",
         type="primary",
         use_container_width=True
     ):
-        results = []
-
-        progress = st.progress(0.0)
-        status = st.empty()
-
-        for i, p in enumerate(grid):
-
-            status.write(
-                f"探索中：{i + 1} / {len(grid)}"
-            )
-
-            eq, tr, _ = run_backtest(
+        with st.spinner(
+            "Stage 1：有望条件を高速スクリーニング中..."
+        ):
+            quick_df, result_df = fast_two_stage_search(
                 data,
-                p["MA"],
-                p["出来高"],
-                p["2000円"],
-                True,
-                p["RSI"],
-                p["SL"],
-                p["TP"],
-                keep_trades=True
+                search_mode,
+                top_n=30
             )
 
-            s = calculate_stats(
-                eq, tr
-            )
-
-            results.append({
-                "MA": "ON" if p["MA"] else "OFF",
-                "出来高": "ON" if p["出来高"] else "OFF",
-                "2000円": "ON" if p["2000円"] else "OFF",
-                "RSI": p["RSI"],
-                "SL": f"-{p['SL']:.0%}",
-                "TP": f"+{p['TP']:.0%}",
-                "総損益": s["pnl"],
-                "収益率": s["return_rate"],
-                "CAGR": s["cagr"],
-                "最大DD": s["max_drawdown"],
-                "PF": s["profit_factor"],
-                "Sharpe": s["sharpe"],
-                "勝率": s["win_rate"],
-                "決済数": s["trades"],
-                "総合スコア": s["score"]
-            })
-
-            progress.progress(
-                (i + 1) / len(grid)
-            )
-
-        status.empty()
-        progress.empty()
-
-        result_df = pd.DataFrame(
-            results
-        ).sort_values(
-            "総合スコア",
-            ascending=False
-        ).reset_index(drop=True)
+        st.session_state[
+            "v38_quick_results"
+        ] = quick_df
 
         st.session_state[
             "v38_search_results"
         ] = result_df
 
         st.success(
-            "✅ 自動探索が完了しました。"
+            "✅ 高速2段階探索が完了しました。"
         )
+
+        if not result_df.empty:
+            st.info(
+                "Stage 1で候補を絞り、上位30条件だけを"
+                "本格バックテストして最終順位を決定しています。"
+            )
 
     search_results = st.session_state.get(
         "v38_search_results",
         pd.DataFrame()
     )
+
+    quick_results = st.session_state.get(
+        "v38_quick_results",
+        pd.DataFrame()
+    )
+
+    if not quick_results.empty:
+        with st.expander("⚡ Stage 1 高速スクリーニング結果"):
+            st.dataframe(
+                quick_results.head(20),
+                use_container_width=True,
+                hide_index=True
+            )
 
     if not search_results.empty:
 
@@ -1277,7 +1414,7 @@ if not data.empty:
         st.download_button(
             "⬇️ 条件探索ランキングCSV",
             data=csv,
-            file_name="ver3_8_condition_ranking.csv",
+            file_name="ver3_8_1_condition_ranking.csv",
             mime="text/csv"
         )
 
@@ -1292,13 +1429,32 @@ if not data.empty:
         "🔎 買い候補を抽出",
         use_container_width=True
     ):
+        # 自動探索済みなら、その総合1位条件を優先して候補を絞る。
+        search_results = st.session_state.get(
+            "v38_search_results",
+            pd.DataFrame()
+        )
+
+        if not search_results.empty:
+            best = search_results.iloc[0]
+
+            candidate_ma = best["MA"] == "ON"
+            candidate_volume = best["出来高"] == "ON"
+            candidate_price = best["2000円"] == "ON"
+            candidate_rsi = int(best["RSI"])
+        else:
+            candidate_ma = use_ma
+            candidate_volume = use_volume
+            candidate_price = use_price_2000
+            candidate_rsi = default_rsi
+
         candidates = current_candidates(
             data,
-            use_ma,
-            use_volume,
-            use_price_2000,
-            use_rsi,
-            default_rsi
+            candidate_ma,
+            candidate_volume,
+            candidate_price,
+            True,
+            candidate_rsi
         )
 
         if candidates.empty:
@@ -1318,11 +1474,22 @@ if not data.empty:
                 }
             )
 
+            candidates = candidates.head(10)
+
             st.dataframe(
                 candidates,
                 use_container_width=True,
                 hide_index=True
             )
+
+            if not search_results.empty:
+                st.caption(
+                    "🏆 自動探索の総合1位条件を使って上位10銘柄に絞っています。"
+                )
+            else:
+                st.caption(
+                    "自動探索未実施のため、現在のサイドバー条件で上位10銘柄を表示しています。"
+                )
 
             st.info(
                 "これは前日の日足データを基準にした候補抽出です。"
@@ -1337,7 +1504,7 @@ if not data.empty:
     st.header("🔴 売却監視について")
 
     st.info(
-        "Ver.3.8では実注文を行いません。"
+        "Ver.3.8.1では実注文を行いません。"
         "今後、保有銘柄を登録して、損切り・利確・25日線割れを"
         "毎朝自動判定する機能へ発展させます。"
     )
@@ -1350,7 +1517,7 @@ else:
 st.divider()
 
 st.caption(
-    "Ver.3.8 / 仮想売買専用。証券会社への実注文は行いません。"
+    "Ver.3.8.1 / 仮想売買専用。証券会社への実注文は行いません。"
 )
 
 st.caption(

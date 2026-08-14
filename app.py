@@ -12,23 +12,23 @@ from zipfile import ZipFile
 # ページ設定
 # =========================================================
 st.set_page_config(
-    page_title="日本株 10万円→100万円 AI投資アシスタント Ver.4.8",
+    page_title="日本株 10万円→100万円 AI投資アシスタント Ver.4.9",
     page_icon="📈",
     layout="wide"
 )
 
 st.title(
-    "📈 日本株 10万円→100万円 AI投資アシスタント Ver.4.8"
+    "📈 日本株 10万円→100万円 AI投資アシスタント Ver.4.9"
 )
 
 st.caption(
     "S株を想定した仮想バックテスト｜"
     "AI BUYランキング｜市場環境フィルター｜"
-    "連続損失ブレーキ｜冷却期間｜全分析CSV"
+    "連続損失ブレーキ｜25日線2日確認｜全分析CSV"
 )
 
 st.info(
-    "Ver.4.8では「明けの明星」と「株価2,000円以上」を "
+    "Ver.4.9では「明けの明星」と「株価2,000円以上」を"
     "BUY選定条件から完全に除外しています。"
 )
 
@@ -128,6 +128,21 @@ cooldown_days = st.sidebar.number_input(
     step=1
 )
 
+# Ver.4.9
+ma_break_days = st.sidebar.number_input(
+    "25日線割れ確認日数",
+    min_value=2,
+    max_value=5,
+    value=2,
+    step=1
+)
+
+# 25日線が上向きなら売却をさらに1日待つ
+slope_grace = st.sidebar.checkbox(
+    "25日線上向きなら売却を1日猶予",
+    value=True
+)
+
 diagnostic_mode = st.sidebar.checkbox(
     "🔎 詳細診断モード",
     value=False
@@ -210,24 +225,19 @@ STOCK_NAMES = {
 
 
 # =========================================================
-# 銘柄名
+# 銘柄名取得
 # =========================================================
 @st.cache_data(ttl=86400)
 def get_stock_name(ticker):
 
-    code = ticker.replace(
-        ".T",
-        ""
-    )
+    code = ticker.replace(".T", "")
 
     if code in STOCK_NAMES:
         return STOCK_NAMES[code]
 
     try:
 
-        info = yf.Ticker(
-            ticker
-        ).info
+        info = yf.Ticker(ticker).info
 
         name = (
             info.get("shortName")
@@ -252,14 +262,8 @@ def calculate_indicators(df):
     if df.empty:
         return pd.DataFrame()
 
-    if isinstance(
-        df.columns,
-        pd.MultiIndex
-    ):
-        df.columns = (
-            df.columns
-            .get_level_values(0)
-        )
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
     required = [
         "Open",
@@ -275,11 +279,8 @@ def calculate_indicators(df):
     ):
         return pd.DataFrame()
 
-    df = df[
-        required
-    ].copy()
+    df = df[required].copy()
 
-    # 25日・75日・200日線
     df["MA25"] = (
         df["Close"]
         .rolling(25)
@@ -298,34 +299,28 @@ def calculate_indicators(df):
         .mean()
     )
 
-    # MA傾き
     df["MA25_Slope"] = (
         df["MA25"]
-        - df["MA25"].shift(5)
+        -
+        df["MA25"].shift(5)
     )
 
     df["MA75_Slope"] = (
         df["MA75"]
-        - df["MA75"].shift(5)
+        -
+        df["MA75"].shift(5)
     )
 
-    # 出来高
     df["VOL20"] = (
         df["Volume"]
         .rolling(20)
         .mean()
     )
 
-    # RSI
     delta = df["Close"].diff()
 
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = -delta.clip(
-        upper=0
-    )
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
     avg_gain = (
         gain
@@ -390,9 +385,7 @@ def download_stock_data(
             progress=False
         )
 
-        return calculate_indicators(
-            df
-        )
+        return calculate_indicators(df)
 
     except Exception:
 
@@ -439,9 +432,7 @@ def download_market_data(
                 .get_level_values(0)
             )
 
-        close = df[
-            "Close"
-        ].copy()
+        close = df["Close"].copy()
 
         result = pd.DataFrame(
             index=close.index
@@ -501,8 +492,7 @@ def get_market_condition(
         }
 
     available = market_df[
-        market_df.index
-        <= current_date
+        market_df.index <= current_date
     ]
 
     if available.empty:
@@ -519,25 +509,11 @@ def get_market_condition(
 
     row = available.iloc[-1]
 
-    price = float(
-        row["Close"]
-    )
-
-    ma25 = float(
-        row["MA25"]
-    )
-
-    ma75 = float(
-        row["MA75"]
-    )
-
-    ma200 = float(
-        row["MA200"]
-    )
-
-    slope = float(
-        row["MA25_Slope"]
-    )
+    price = float(row["Close"])
+    ma25 = float(row["MA25"])
+    ma75 = float(row["MA75"])
+    ma200 = float(row["MA200"])
+    slope = float(row["MA25_Slope"])
 
     points = 0
 
@@ -579,7 +555,6 @@ def get_market_condition(
         factor = 0.00
 
     return {
-
         "判定": judgement,
         "係数": factor,
         "価格": price,
@@ -593,117 +568,49 @@ def get_market_condition(
 # =========================================================
 # AIスコア
 # =========================================================
-def calculate_score(
-    row
-):
+def calculate_score(row):
 
     score = 0
-
     details = {}
 
-    c1 = (
-        row["MA25"]
-        >
-        row["MA75"]
-    )
+    c1 = row["MA25"] > row["MA75"]
 
-    details[
-        "25日線>75日線"
-    ] = 20 if c1 else 0
+    details["25日線>75日線"] = 20 if c1 else 0
+    score += details["25日線>75日線"]
 
-    score += details[
-        "25日線>75日線"
-    ]
+    c2 = row["Close"] > row["MA200"]
 
+    details["株価>200日線"] = 20 if c2 else 0
+    score += details["株価>200日線"]
 
-    c2 = (
-        row["Close"]
-        >
-        row["MA200"]
-    )
+    c3 = row["Close"] > row["MA25"]
 
-    details[
-        "株価>200日線"
-    ] = 20 if c2 else 0
+    details["株価>25日線"] = 15 if c3 else 0
+    score += details["株価>25日線"]
 
-    score += details[
-        "株価>200日線"
-    ]
+    c4 = row["Volume"] > row["VOL20"]
 
-
-    c3 = (
-        row["Close"]
-        >
-        row["MA25"]
-    )
-
-    details[
-        "株価>25日線"
-    ] = 15 if c3 else 0
-
-    score += details[
-        "株価>25日線"
-    ]
-
-
-    c4 = (
-        row["Volume"]
-        >
-        row["VOL20"]
-    )
-
-    details[
-        "出来高"
-    ] = 15 if c4 else 0
-
-    score += details[
-        "出来高"
-    ]
-
+    details["出来高"] = 15 if c4 else 0
+    score += details["出来高"]
 
     c5 = (
         rsi_low
-        <=
-        row["RSI"]
-        <=
-        rsi_high
+        <= row["RSI"]
+        <= rsi_high
     )
 
-    details[
-        "RSI適正"
-    ] = 15 if c5 else 0
+    details["RSI適正"] = 15 if c5 else 0
+    score += details["RSI適正"]
 
-    score += details[
-        "RSI適正"
-    ]
+    c6 = row["MA25_Slope"] > 0
 
+    details["25日線上向き"] = 10 if c6 else 0
+    score += details["25日線上向き"]
 
-    c6 = (
-        row["MA25_Slope"]
-        > 0
-    )
+    c7 = row["MA75_Slope"] > 0
 
-    details[
-        "25日線上向き"
-    ] = 10 if c6 else 0
-
-    score += details[
-        "25日線上向き"
-    ]
-
-
-    c7 = (
-        row["MA75_Slope"]
-        > 0
-    )
-
-    details[
-        "75日線上向き"
-    ] = 5 if c7 else 0
-
-    score += details[
-        "75日線上向き"
-    ]
+    details["75日線上向き"] = 5 if c7 else 0
+    score += details["75日線上向き"]
 
     return score, details
 
@@ -711,9 +618,7 @@ def calculate_score(
 # =========================================================
 # AI判定
 # =========================================================
-def score_judgement(
-    score
-):
+def score_judgement(score):
 
     if score >= 90:
         return "🔥 強BUY"
@@ -730,9 +635,7 @@ def score_judgement(
 # =========================================================
 # スコア資金係数
 # =========================================================
-def score_factor(
-    score
-):
+def score_factor(score):
 
     if score >= 90:
         return 1.00
@@ -750,7 +653,7 @@ def score_factor(
 
 
 # =========================================================
-# 連敗ブレーキ
+# 連敗係数
 # =========================================================
 def get_loss_factor(
     consecutive_losses
@@ -771,9 +674,7 @@ def get_loss_factor(
 # =========================================================
 # 過去成績係数
 # =========================================================
-def historical_factor(
-    stats
-):
+def historical_factor(stats):
 
     if stats is None:
         return 1.00
@@ -791,11 +692,7 @@ def historical_factor(
     if trades < 3:
         return 1.00
 
-    win_rate = (
-        wins
-        /
-        trades
-    )
+    win_rate = wins / trades
 
     if win_rate >= 0.65:
         return 1.10
@@ -846,9 +743,7 @@ def run_backtest(
     market_df
 ):
 
-    cash = float(
-        initial_cash
-    )
+    cash = float(initial_cash)
 
     positions = {}
 
@@ -860,26 +755,20 @@ def run_backtest(
 
     market_records = []
 
-    score_trade_records = []
-
-    stats = {}
-
     consecutive_losses = 0
 
     max_consecutive_losses = 0
 
     cooldown_until = None
 
-    last_loss_date = None
+    stats = {}
 
-
+    # 25日線割れ連続日数
     for ticker in data_dict:
-
         stats[ticker] = {
             "trades": 0,
             "wins": 0
         }
-
 
     all_dates = sorted(
         set(
@@ -888,7 +777,6 @@ def run_backtest(
             for date_value in df.index
         )
     )
-
 
     # =====================================================
     # 日付ループ
@@ -899,28 +787,21 @@ def run_backtest(
             current_date
         )
 
-
         # =================================================
-        # SELL
+        # SELL判定
         # =================================================
         for ticker in list(
             positions.keys()
         ):
 
-            df = data_dict[
-                ticker
-            ]
+            df = data_dict[ticker]
 
             if current_date not in df.index:
                 continue
 
-            row = df.loc[
-                current_date
-            ]
+            row = df.loc[current_date]
 
-            pos = positions[
-                ticker
-            ]
+            pos = positions[ticker]
 
             price = float(
                 row["Close"]
@@ -935,13 +816,8 @@ def run_backtest(
             ]
 
             profit_pct = (
-                price
-                /
-                entry_price
-                -
-                1
+                price / entry_price - 1
             ) * 100
-
 
             if price > pos[
                 "highest_price"
@@ -951,11 +827,9 @@ def run_backtest(
                     "highest_price"
                 ] = price
 
-
             highest_price = pos[
                 "highest_price"
             ]
-
 
             trailing_price = (
                 highest_price
@@ -963,44 +837,87 @@ def run_backtest(
                 (
                     1
                     -
-                    trailing_stop
-                    /
-                    100
+                    trailing_stop / 100
                 )
             )
 
+            # =================================================
+            # 25日線割れ日数をカウント
+            # =================================================
+            if price < row["MA25"]:
+
+                pos[
+                    "ma25_break_days"
+                ] += 1
+
+            else:
+
+                pos[
+                    "ma25_break_days"
+                ] = 0
+
+            ma25_break_days = pos[
+                "ma25_break_days"
+            ]
 
             reason = ""
 
-
+            # =================================================
+            # 損切り
+            # =================================================
             if profit_pct <= -stop_loss:
 
                 reason = "損切り"
 
+            # =================================================
+            # トレーリング
+            # =================================================
             elif (
-                profit_pct
-                >= profit_start
-                and price
-                <= trailing_price
+                profit_pct >= profit_start
+                and price <= trailing_price
             ):
 
                 reason = "トレーリング"
 
+            # =================================================
+            # 通常利確
+            # =================================================
             elif profit_pct >= take_profit:
 
                 reason = "利確"
 
-            elif price < row["MA25"]:
+            # =================================================
+            # Ver.4.9 25日線割れ
+            # =================================================
+            elif (
+                ma25_break_days
+                >= ma_break_days
+            ):
 
-                reason = "25日線割れ"
+                # 25日線が上向きなら
+                # さらに1営業日待つ
+                if (
+                    slope_grace
+                    and row["MA25_Slope"] > 0
+                    and ma25_break_days
+                    < ma_break_days + 1
+                ):
 
+                    reason = ""
 
+                else:
+
+                    reason = (
+                        f"25日線{ma25_break_days}日連続割れ"
+                    )
+
+            # =================================================
+            # SELL実行
+            # =================================================
             if reason:
 
                 sell_value = (
-                    price
-                    *
-                    shares
+                    price * shares
                 )
 
                 cash += sell_value
@@ -1011,12 +928,9 @@ def run_backtest(
                     entry_price
                 ) * shares
 
-
                 if pnl > 0:
 
-                    stats[
-                        ticker
-                    ]["wins"] += 1
+                    stats[ticker]["wins"] += 1
 
                     consecutive_losses = 0
 
@@ -1029,11 +943,6 @@ def run_backtest(
                         consecutive_losses
                     )
 
-                    last_loss_date = (
-                        current_ts
-                    )
-
-                    # 4連敗以上で冷却開始
                     if consecutive_losses >= 4:
 
                         cooldown_until = (
@@ -1043,22 +952,15 @@ def run_backtest(
                             )
                         )
 
-
-                stats[
-                    ticker
-                ]["trades"] += 1
-
+                stats[ticker]["trades"] += 1
 
                 holding_days = (
                     current_ts
                     -
                     pd.Timestamp(
-                        pos[
-                            "entry_date"
-                        ]
+                        pos["entry_date"]
                     )
                 ).days
-
 
                 trades.append({
 
@@ -1099,17 +1001,16 @@ def run_backtest(
                         pos["entry_date"],
 
                     "保有日数":
-                        holding_days
+                        holding_days,
+
+                    "25日線割れ日数":
+                        ma25_break_days
                 })
 
-
-                del positions[
-                    ticker
-                ]
-
+                del positions[ticker]
 
         # =================================================
-        # 冷却状態
+        # 冷却判定
         # =================================================
         if cooldown_until is not None:
 
@@ -1128,15 +1029,13 @@ def run_backtest(
 
             cooling = False
 
-
         # =================================================
-        # 市場環境
+        # 市場
         # =================================================
         market = get_market_condition(
             market_df,
             current_date
         )
-
 
         market_records.append({
 
@@ -1164,7 +1063,7 @@ def run_backtest(
             "市場BUY資金係数":
                 market["係数"],
 
-            "連敗数":
+            "連続損失":
                 consecutive_losses,
 
             "冷却中":
@@ -1174,29 +1073,21 @@ def run_backtest(
                 cooldown_until
         })
 
-
-        # =================================================
-        # 連敗係数
-        # =================================================
         loss_factor = get_loss_factor(
             consecutive_losses
         )
 
-
-        # =================================================
-        # 候補
-        # =================================================
         candidates = []
 
-
+        # =================================================
+        # AI判定
+        # =================================================
         for ticker, df in data_dict.items():
 
             if current_date not in df.index:
                 continue
 
-            row = df.loc[
-                current_date
-            ]
+            row = df.loc[current_date]
 
             code = ticker.replace(
                 ".T",
@@ -1211,38 +1102,25 @@ def run_backtest(
                 row["Close"]
             )
 
-
             score, details = (
-                calculate_score(
-                    row
-                )
+                calculate_score(row)
             )
-
 
             judgement = score_judgement(
                 score
             )
 
-
             sf = score_factor(
                 score
             )
 
-
             hf = historical_factor(
-                stats.get(
-                    ticker
-                )
+                stats.get(ticker)
             )
 
-
-            # =============================================
-            # 2,000円未満のみBUY候補
-            # =============================================
             price_ok = (
                 price < 2000
             )
-
 
             if not price_ok:
 
@@ -1266,14 +1144,12 @@ def run_backtest(
 
                 reason = (
                     f"AIスコア{score}点"
-                    f" < 最低{min_score}点"
+                    f"<最低{min_score}点"
                 )
 
             elif ticker in positions:
 
-                reason = (
-                    "保有中"
-                )
+                reason = "保有中"
 
             elif len(positions) >= max_positions:
 
@@ -1284,7 +1160,6 @@ def run_backtest(
             else:
 
                 reason = ""
-
 
             final_factor = (
                 sf
@@ -1301,7 +1176,6 @@ def run_backtest(
                 1.0
             )
 
-
             theoretical_budget = (
                 min(
                     max_per_position,
@@ -1311,10 +1185,6 @@ def run_backtest(
                 final_factor
             )
 
-
-            # =============================================
-            # BUY候補
-            # =============================================
             if (
                 price_ok
                 and not cooling
@@ -1349,10 +1219,6 @@ def run_backtest(
                         name
                 })
 
-
-            # =============================================
-            # AI全判定
-            # =============================================
             analysis_records.append({
 
                 "日付":
@@ -1398,14 +1264,10 @@ def run_backtest(
                     ),
 
                 "出来高倍率":
-                    (
-                        float(
-                            row["Volume"]
-                        )
+                    float(
+                        row["Volume"]
                         /
-                        float(
-                            row["VOL20"]
-                        )
+                        row["VOL20"]
                     ),
 
                 "25日線傾き":
@@ -1499,19 +1361,16 @@ def run_backtest(
                     reason
             })
 
-
         # =================================================
         # BUY
         # =================================================
         candidates.sort(
-            key=lambda x:
-                (
-                    x["score"],
-                    x["factor"]
-                ),
+            key=lambda x: (
+                x["score"],
+                x["factor"]
+            ),
             reverse=True
         )
-
 
         for candidate in candidates:
 
@@ -1521,60 +1380,37 @@ def run_backtest(
             if len(positions) >= max_positions:
                 break
 
-
-            ticker = candidate[
-                "ticker"
-            ]
-
+            ticker = candidate["ticker"]
 
             if ticker in positions:
                 continue
 
-
             price = float(
-                candidate[
-                    "row"
-                ]["Close"]
+                candidate["row"]["Close"]
             )
-
 
             budget = min(
                 candidate["budget"],
                 cash
             )
 
-
             shares = int(
                 budget / price
             )
 
-
             if shares <= 0:
                 continue
 
-
             cost = (
-                shares
-                *
-                price
+                shares * price
             )
-
 
             if cost > cash:
                 continue
 
-
             cash -= cost
 
-
-            name = candidate[
-                "name"
-            ]
-
-
-            positions[
-                ticker
-            ] = {
+            positions[ticker] = {
 
                 "entry_price":
                     price,
@@ -1586,49 +1422,40 @@ def run_backtest(
                     price,
 
                 "score":
-                    candidate[
-                        "score"
-                    ],
+                    candidate["score"],
 
                 "entry_date":
                     current_date,
 
                 "name":
-                    name
+                    candidate["name"],
+
+                "ma25_break_days":
+                    0
             }
 
-
-            # =============================================
-            # 分析履歴をBUY実行に更新
-            # =============================================
+            # AI判定履歴をBUYに更新
             for rec in reversed(
                 analysis_records
             ):
 
                 if (
                     rec["日付"]
-                    ==
-                    current_date
+                    == current_date
                     and rec["コード"]
-                    ==
-                    ticker.replace(
+                    == ticker.replace(
                         ".T",
                         ""
                     )
                 ):
 
-                    rec[
-                        "実際購入額"
-                    ] = cost
+                    rec["実際購入額"] = cost
 
-                    rec[
-                        "判定理由"
-                    ] = (
+                    rec["判定理由"] = (
                         "AI BUY実行"
                     )
 
                     break
-
 
             trades.append({
 
@@ -1642,7 +1469,7 @@ def run_backtest(
                     ),
 
                 "銘柄名":
-                    name,
+                    candidate["name"],
 
                 "売買":
                     "BUY",
@@ -1663,29 +1490,26 @@ def run_backtest(
                     "AI BUY",
 
                 "BUYスコア":
-                    candidate[
-                        "score"
-                    ],
+                    candidate["score"],
 
                 "BUY日":
                     current_date,
 
                 "保有日数":
+                    0,
+
+                "25日線割れ日数":
                     0
             })
-
 
         # =================================================
         # 資産評価
         # =================================================
         holdings_value = 0
 
-
         for ticker, pos in positions.items():
 
-            df = data_dict[
-                ticker
-            ]
+            df = data_dict[ticker]
 
             if current_date in df.index:
 
@@ -1701,13 +1525,11 @@ def run_backtest(
                     pos["shares"]
                 )
 
-
         total_asset = (
             cash
             +
             holdings_value
         )
-
 
         equity_records.append({
 
@@ -1733,10 +1555,6 @@ def run_backtest(
                 cooling
         })
 
-
-    # =====================================================
-    # DataFrame
-    # =====================================================
     trades_df = pd.DataFrame(
         trades
     )
@@ -1752,7 +1570,6 @@ def run_backtest(
     market_history_df = pd.DataFrame(
         market_records
     )
-
 
     return (
         trades_df,
@@ -1770,11 +1587,8 @@ st.subheader(
     "📥 データ取得"
 )
 
-
 data_dict = {}
-
 stock_names = {}
-
 
 if len(tickers) == 0:
 
@@ -1784,13 +1598,9 @@ if len(tickers) == 0:
 
     st.stop()
 
-
 progress = st.progress(0)
 
-
-for i, ticker in enumerate(
-    tickers
-):
+for i, ticker in enumerate(tickers):
 
     df = download_stock_data(
         ticker,
@@ -1799,21 +1609,15 @@ for i, ticker in enumerate(
 
     if not df.empty:
 
-        data_dict[
-            ticker
-        ] = df
+        data_dict[ticker] = df
 
-        stock_names[
-            ticker
-        ] = get_stock_name(
-            ticker
+        stock_names[ticker] = (
+            get_stock_name(ticker)
         )
 
     progress.progress(
         int(
-            (
-                i + 1
-            )
+            (i + 1)
             /
             len(tickers)
             *
@@ -1821,14 +1625,11 @@ for i, ticker in enumerate(
         )
     )
 
-
 progress.empty()
-
 
 st.write(
     f"**{len(data_dict)}銘柄のデータを取得しました。**"
 )
-
 
 if not data_dict:
 
@@ -1846,9 +1647,7 @@ st.subheader(
     "🏢 対象銘柄"
 )
 
-
 stock_list = []
-
 
 for ticker in data_dict:
 
@@ -1867,11 +1666,9 @@ for ticker in data_dict:
             )
     })
 
-
 stock_list_df = pd.DataFrame(
     stock_list
 )
-
 
 st.dataframe(
     stock_list_df,
@@ -1887,11 +1684,9 @@ st.subheader(
     "🌏 現在の市場環境"
 )
 
-
 market_df = download_market_data(
     lookback_years
 )
-
 
 if not market_df.empty:
 
@@ -1904,9 +1699,7 @@ if not market_df.empty:
         )
     )
 
-
     c1, c2, c3, c4, c5 = st.columns(5)
-
 
     c1.metric(
         "日経225",
@@ -1933,7 +1726,6 @@ if not market_df.empty:
         f"{current_market['係数']:.0%}"
     )
 
-
     st.success(
         f"市場判定：{current_market['判定']}"
     )
@@ -1946,9 +1738,7 @@ st.subheader(
     "🏆 AI BUYランキング"
 )
 
-
 ranking = []
-
 
 for ticker, df in data_dict.items():
 
@@ -1958,17 +1748,13 @@ for ticker, df in data_dict.items():
         row["Close"]
     )
 
-    # 2,000円以上はランキングからも除外
+    # 2,000円以上を完全除外
     if price >= 2000:
         continue
 
-
     score, details = (
-        calculate_score(
-            row
-        )
+        calculate_score(row)
     )
-
 
     ranking.append({
 
@@ -2041,11 +1827,9 @@ for ticker, df in data_dict.items():
             )
     })
 
-
 ranking_df = pd.DataFrame(
     ranking
 )
-
 
 if not ranking_df.empty:
 
@@ -2055,9 +1839,7 @@ if not ranking_df.empty:
             "AIスコア",
             ascending=False
         )
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
 
     ranking_df.insert(
@@ -2083,9 +1865,8 @@ else:
 # バックテスト
 # =========================================================
 st.subheader(
-    "📊 Ver.4.8 バックテスト結果"
+    "📊 Ver.4.9 バックテスト結果"
 )
-
 
 with st.spinner(
     "AIバックテストを実行中..."
@@ -2101,7 +1882,6 @@ with st.spinner(
         data_dict,
         market_df
     )
-
 
 if equity_df.empty:
 
@@ -2138,9 +1918,7 @@ return_rate = (
 # DD
 # =========================================================
 equity_series = (
-    equity_df[
-        "総資産"
-    ]
+    equity_df["総資産"]
 )
 
 running_max = (
@@ -2178,19 +1956,16 @@ if not trades_df.empty:
 
     sell_df = trades_df[
         trades_df["売買"]
-        ==
-        "SELL"
+        == "SELL"
     ].copy()
 
 else:
 
     sell_df = pd.DataFrame()
 
-
 trade_count = len(
     sell_df
 )
-
 
 if trade_count > 0:
 
@@ -2230,7 +2005,6 @@ if trade_count > 0:
 
         profit_factor = np.inf
 
-
     avg_profit = (
         wins["損益"].mean()
         if not wins.empty
@@ -2252,7 +2026,6 @@ else:
     avg_profit = 0
     avg_loss = 0
 
-
 if avg_loss > 0:
 
     avg_ratio = (
@@ -2267,10 +2040,9 @@ else:
 
 
 # =========================================================
-# 結果表示
+# 結果
 # =========================================================
 c1, c2, c3, c4 = st.columns(4)
-
 
 c1.metric(
     "最終資産",
@@ -2300,9 +2072,7 @@ st.subheader(
     "📐 トレード統計"
 )
 
-
 c1, c2, c3 = st.columns(3)
-
 
 c1.metric(
     "決済トレード数",
@@ -2325,9 +2095,7 @@ c3.metric(
     )
 )
 
-
 c1, c2, c3 = st.columns(3)
-
 
 c1.metric(
     "平均利益",
@@ -2344,7 +2112,6 @@ c3.metric(
     f"{avg_ratio:.2f}倍"
 )
 
-
 st.metric(
     "最大DD率",
     f"{max_dd_rate:.2f}%"
@@ -2358,33 +2125,24 @@ st.subheader(
     "📈 資産推移"
 )
 
-
 asset_chart = (
     equity_df[
-        [
-            "日付",
-            "総資産"
-        ]
+        ["日付", "総資産"]
     ]
     .copy()
 )
 
-
 asset_chart["日付"] = pd.to_datetime(
     asset_chart["日付"]
 )
-
 
 asset_chart = (
     asset_chart
     .set_index("日付")
 )
 
-
 st.line_chart(
-    asset_chart[
-        "総資産"
-    ]
+    asset_chart["総資産"]
 )
 
 
@@ -2395,19 +2153,14 @@ st.subheader(
     "📉 ドローダウン"
 )
 
-
 dd_chart = pd.DataFrame({
-
     "ドローダウン":
         drawdown.values
-
 })
-
 
 dd_chart.index = pd.to_datetime(
     equity_df["日付"]
 )
-
 
 st.area_chart(
     dd_chart
@@ -2420,7 +2173,6 @@ st.area_chart(
 st.subheader(
     "🎯 AIスコア別成績"
 )
-
 
 if not sell_df.empty:
 
@@ -2439,9 +2191,7 @@ if not sell_df.empty:
             勝ち=(
                 "損益",
                 lambda x:
-                    (
-                        x > 0
-                    ).sum()
+                    (x > 0).sum()
             ),
 
             損益=(
@@ -2467,17 +2217,13 @@ if not sell_df.empty:
         .reset_index()
     )
 
-
-    score_result[
-        "勝率"
-    ] = (
+    score_result["勝率"] = (
         score_result["勝ち"]
         /
         score_result["決済数"]
         *
         100
     )
-
 
     st.dataframe(
         score_result
@@ -2491,18 +2237,19 @@ if not sell_df.empty:
 
 else:
 
+    score_result = pd.DataFrame()
+
     st.info(
         "スコア別の決済データがありません。"
     )
 
 
 # =========================================================
-# 銘柄別成績
+# 銘柄別
 # =========================================================
 st.subheader(
     "🏆 銘柄別成績"
 )
-
 
 if not sell_df.empty:
 
@@ -2524,9 +2271,7 @@ if not sell_df.empty:
             勝ち=(
                 "損益",
                 lambda x:
-                    (
-                        x > 0
-                    ).sum()
+                    (x > 0).sum()
             ),
 
             損益=(
@@ -2542,17 +2287,13 @@ if not sell_df.empty:
         .reset_index()
     )
 
-
-    ticker_result[
-        "勝率"
-    ] = (
+    ticker_result["勝率"] = (
         ticker_result["勝ち"]
         /
         ticker_result["トレード数"]
         *
         100
     )
-
 
     st.dataframe(
         ticker_result
@@ -2564,6 +2305,10 @@ if not sell_df.empty:
         hide_index=True
     )
 
+else:
+
+    ticker_result = pd.DataFrame()
+
 
 # =========================================================
 # 売却理由
@@ -2571,7 +2316,6 @@ if not sell_df.empty:
 st.subheader(
     "🚦 売却理由別成績"
 )
-
 
 if not sell_df.empty:
 
@@ -2598,7 +2342,6 @@ if not sell_df.empty:
         .reset_index()
     )
 
-
     st.dataframe(
         reason_result
         .sort_values(
@@ -2609,6 +2352,86 @@ if not sell_df.empty:
         hide_index=True
     )
 
+else:
+
+    reason_result = pd.DataFrame()
+
+
+# =========================================================
+# 25日線売却診断
+# =========================================================
+st.subheader(
+    "📉 Ver.4.9 25日線売却診断"
+)
+
+st.write(
+    f"""
+現在の設定：
+
+**{ma_break_days}営業日連続で25日線を下回った場合に売却**
+
+さらに、
+
+**25日線上向きの場合は1日猶予：{"ON" if slope_grace else "OFF"}**
+
+です。
+"""
+)
+
+if not sell_df.empty:
+
+    ma25_sell_df = sell_df[
+        sell_df["理由"].astype(str).str.contains(
+            "25日線"
+        )
+    ].copy()
+
+    if not ma25_sell_df.empty:
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "25日線売却回数",
+            len(ma25_sell_df)
+        )
+
+        c2.metric(
+            "25日線売却損益",
+            f"¥{ma25_sell_df['損益'].sum():,.0f}"
+        )
+
+        c3.metric(
+            "平均損益",
+            f"¥{ma25_sell_df['損益'].mean():,.0f}"
+        )
+
+        st.dataframe(
+            ma25_sell_df[
+                [
+                    "日付",
+                    "コード",
+                    "銘柄名",
+                    "価格",
+                    "損益",
+                    "損益率",
+                    "BUYスコア",
+                    "25日線割れ日数"
+                ]
+            ]
+            .sort_values(
+                "日付",
+                ascending=False
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    else:
+
+        st.info(
+            "25日線割れによる売却はありません。"
+        )
+
 
 # =========================================================
 # 連敗ブレーキ
@@ -2617,23 +2440,21 @@ st.subheader(
     "🚦 連続損失ブレーキ"
 )
 
-
 st.metric(
     "最大連続損失",
     f"{max_consecutive_losses}回"
 )
 
-
 st.markdown(
     f"""
-### Ver.4.8
+### Ver.4.9
 
 - 0～1連敗 → **購入額100%**
 - 2連敗 → **購入額80%**
 - 3連敗 → **購入額50%**
 - 4連敗 → **新規BUY停止**
 - 4連敗後 → **{cooldown_days}営業日冷却**
-- 冷却終了 → **連敗カウンターをリセットしてBUY再開**
+- 冷却終了 → **BUY再開**
 """
 )
 
@@ -2644,7 +2465,6 @@ st.markdown(
 st.subheader(
     "📋 全売買記録"
 )
-
 
 if not trades_df.empty:
 
@@ -2667,9 +2487,6 @@ st.subheader(
 )
 
 
-# =========================================================
-# 概要
-# =========================================================
 summary_df = pd.DataFrame({
 
     "項目": [
@@ -2702,12 +2519,16 @@ summary_df = pd.DataFrame({
 
         "最大連続損失",
 
-        "冷却期間"
+        "冷却期間",
+
+        "25日線割れ確認日数",
+
+        "25日線上向き猶予"
     ],
 
     "結果": [
 
-        "4.8",
+        "4.9",
 
         initial_cash,
 
@@ -2735,7 +2556,11 @@ summary_df = pd.DataFrame({
 
         max_consecutive_losses,
 
-        cooldown_days
+        cooldown_days,
+
+        ma_break_days,
+
+        slope_grace
     ]
 })
 
@@ -2743,20 +2568,15 @@ summary_df = pd.DataFrame({
 # =========================================================
 # 資産CSV
 # =========================================================
-equity_export = (
-    equity_df.copy()
-)
-
+equity_export = equity_df.copy()
 
 equity_export[
     "最高資産"
 ] = running_max.values
 
-
 equity_export[
     "ドローダウン"
 ] = drawdown.values
-
 
 equity_export[
     "ドローダウン率"
@@ -2764,7 +2584,7 @@ equity_export[
 
 
 # =========================================================
-# CSV bytes
+# CSV変換
 # =========================================================
 def csv_bytes(df):
 
@@ -2780,7 +2600,6 @@ def csv_bytes(df):
 # =========================================================
 col1, col2 = st.columns(2)
 
-
 with col1:
 
     st.download_button(
@@ -2789,11 +2608,10 @@ with col1:
             analysis_df
         ),
         file_name=(
-            "ver4_8_AI_all_analysis.csv"
+            "ver4_9_AI_all_analysis.csv"
         ),
         mime="text/csv"
     )
-
 
 with col2:
 
@@ -2803,14 +2621,13 @@ with col2:
             trades_df
         ),
         file_name=(
-            "ver4_8_trade_history.csv"
+            "ver4_9_trade_history.csv"
         ),
         mime="text/csv"
     )
 
 
 col1, col2 = st.columns(2)
-
 
 with col1:
 
@@ -2820,11 +2637,10 @@ with col1:
             equity_export
         ),
         file_name=(
-            "ver4_8_equity_curve.csv"
+            "ver4_9_equity_curve.csv"
         ),
         mime="text/csv"
     )
-
 
 with col2:
 
@@ -2834,7 +2650,7 @@ with col2:
             market_history_df
         ),
         file_name=(
-            "ver4_8_market_history.csv"
+            "ver4_9_market_history.csv"
         ),
         mime="text/csv"
     )
@@ -2844,11 +2660,33 @@ st.download_button(
     "🎯 AIスコア別成績CSV",
     data=csv_bytes(
         score_result
-        if not sell_df.empty
-        else pd.DataFrame()
     ),
     file_name=(
-        "ver4_8_score_results.csv"
+        "ver4_9_score_results.csv"
+    ),
+    mime="text/csv"
+)
+
+
+st.download_button(
+    "🏆 銘柄別成績CSV",
+    data=csv_bytes(
+        ticker_result
+    ),
+    file_name=(
+        "ver4_9_stock_results.csv"
+    ),
+    mime="text/csv"
+)
+
+
+st.download_button(
+    "🚦 売却理由別成績CSV",
+    data=csv_bytes(
+        reason_result
+    ),
+    file_name=(
+        "ver4_9_sell_reason_results.csv"
     ),
     mime="text/csv"
 )
@@ -2860,7 +2698,7 @@ st.download_button(
         summary_df
     ),
     file_name=(
-        "ver4_8_summary.csv"
+        "ver4_9_summary.csv"
     ),
     mime="text/csv"
 )
@@ -2871,51 +2709,62 @@ st.download_button(
 # =========================================================
 zip_buffer = BytesIO()
 
-
 with ZipFile(
     zip_buffer,
     "w"
 ) as zip_file:
 
     zip_file.writestr(
-        "ver4_8_AI_all_analysis.csv",
+        "ver4_9_AI_all_analysis.csv",
         csv_bytes(
             analysis_df
         )
     )
 
     zip_file.writestr(
-        "ver4_8_trade_history.csv",
+        "ver4_9_trade_history.csv",
         csv_bytes(
             trades_df
         )
     )
 
     zip_file.writestr(
-        "ver4_8_equity_curve.csv",
+        "ver4_9_equity_curve.csv",
         csv_bytes(
             equity_export
         )
     )
 
     zip_file.writestr(
-        "ver4_8_market_history.csv",
+        "ver4_9_market_history.csv",
         csv_bytes(
             market_history_df
         )
     )
 
     zip_file.writestr(
-        "ver4_8_score_results.csv",
+        "ver4_9_score_results.csv",
         csv_bytes(
             score_result
-            if not sell_df.empty
-            else pd.DataFrame()
         )
     )
 
     zip_file.writestr(
-        "ver4_8_summary.csv",
+        "ver4_9_stock_results.csv",
+        csv_bytes(
+            ticker_result
+        )
+    )
+
+    zip_file.writestr(
+        "ver4_9_sell_reason_results.csv",
+        csv_bytes(
+            reason_result
+        )
+    )
+
+    zip_file.writestr(
+        "ver4_9_summary.csv",
         csv_bytes(
             summary_df
         )
@@ -2926,7 +2775,7 @@ st.download_button(
     "📦 全分析結果をZIPで一括ダウンロード",
     data=zip_buffer.getvalue(),
     file_name=(
-        "ver4_8_all_results.zip"
+        "ver4_9_all_results.zip"
     ),
     mime="application/zip"
 )
@@ -2941,18 +2790,12 @@ if diagnostic_mode:
         "🔎 詳細診断"
     )
 
-
     latest_analysis = (
         analysis_df
-        .sort_values(
-            "日付"
-        )
-        .groupby(
-            "コード"
-        )
+        .sort_values("日付")
+        .groupby("コード")
         .tail(1)
     )
-
 
     st.dataframe(
         latest_analysis,
@@ -2965,15 +2808,14 @@ if diagnostic_mode:
 # 売買思想
 # =========================================================
 st.subheader(
-    "🧠 Ver.4.8 売買思想"
+    "🧠 Ver.4.9 売買思想"
 )
-
 
 st.markdown(
     """
 ### 🎯 基本思想
 
-**「良い銘柄を選び、悪いBUYを減らし、連敗したら一度休む」**
+**「良い銘柄を選び、悪いBUYを減らし、無駄な売却を減らす」**
 
 ### 🟢 AI BUYスコア
 
@@ -2995,6 +2837,15 @@ st.markdown(
 - 75～84点 → 🟢 BUY
 - 75点未満 → ⚪ 見送り
 
+### 📉 Ver.4.9 25日線ルール
+
+**1日だけ25日線を割った場合は、原則として保有継続。**
+
+**2営業日連続で25日線を割った場合に売却。**
+
+さらに25日線が上向きの場合は、
+1営業日追加で確認します。
+
 ### ❌ 使用しない条件
 
 - 明けの明星
@@ -3005,20 +2856,23 @@ st.markdown(
 - 2連敗 → 80%
 - 3連敗 → 50%
 - 4連敗 → 新規BUY停止
-- 4連敗後 → 10営業日冷却
+- 冷却期間 → 10営業日
 - 冷却終了 → BUY再開
 
-### 📊 検証
+### 📊 Ver.4.9の検証ポイント
 
-Ver.4.8ではAIの全判定をCSVに保存します。
+Ver.4.8では、
 
-**AI判定 → BUY → SELL → 損益 → 連敗 → 冷却 → 再BUY**
+**25日線割れ：232回 / -¥7,575**
 
-まで追跡できます。
+でした。
+
+Ver.4.9では、
+この損失を減らせるかを検証します。
 """
 )
 
 
 st.success(
-    "🚀 Ver.4.8 バックテスト完了"
+    "🚀 Ver.4.9 バックテスト完了"
 )

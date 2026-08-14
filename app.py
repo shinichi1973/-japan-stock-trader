@@ -1,1520 +1,1196 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
 from datetime import date, timedelta
-from itertools import product
+import io
+import time
 
 try:
     import yfinance as yf
 except ImportError:
     yf = None
 
+
 # =========================================================
-# 日本株 自動バックテスト Ver.3.8.2
-# 日経225 / 明けの明星削除 / 高速条件探索 / リスク評価
+# 日本株 10万円→100万円 AI投資アシスタント Ver.4.0
 # =========================================================
+# Ver.4.0の目的
+# - 10万円スタートのS株向け仮想バックテスト
+# - 明けの明星は使用しない
+# - 株価・出来高・MA・RSIを中心にスコアリング
+# - Streamlit cacheで再取得・再計算を抑制
+# - S株の実際の約定ルールを完全再現するものではなく、
+#   「当日終値でシグナル→翌営業日始値で約定」の近似を採用
+#
+# Ver.4.1以降で追加予定:
+# - 業績
+# - 市況・セクター
+# - ニュース・材料
+# - より厳密なS株注文時刻シミュレーション
+# - 日本株全銘柄自動スキャン
+# =========================================================
+
 
 st.set_page_config(
-    page_title="日本株 自動バックテスト Ver.3.8.2",
+    page_title="日本株 10万円→100万円 Ver.4.0",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
 )
 
-st.title("📈 日本株 自動バックテスト Ver.3.8.2")
-st.caption(
-    "日経225を中心に、利益だけでなくリスク・安定性も含めて"
-    "強い売買条件を自動探索します。実注文は行いません。"
-)
 
 # =========================================================
-# サイドバー
+# 共通関数
 # =========================================================
-
-st.sidebar.header("⚙️ 基本設定")
-
-initial_cash = st.sidebar.number_input(
-    "初期資金（円）",
-    min_value=100000,
-    max_value=100000000,
-    value=1000000,
-    step=100000
-)
-
-max_positions = st.sidebar.number_input(
-    "最大保有銘柄数",
-    min_value=1,
-    max_value=50,
-    value=10
-)
-
-max_per_position = st.sidebar.number_input(
-    "1銘柄の最大購入額（円）",
-    min_value=10000,
-    max_value=10000000,
-    value=100000,
-    step=10000
-)
-
-years = st.sidebar.selectbox(
-    "バックテスト期間",
-    [1, 3, 5],
-    index=2
-)
-
-st.sidebar.header("🔬 自動探索")
-
-search_mode = st.sidebar.selectbox(
-    "探索モード",
-    ["高速探索", "標準探索"],
-    index=0
-)
-
-# 現時点の固定条件
-default_rsi = st.sidebar.slider(
-    "通常バックテスト RSI上限",
-    50, 70, 60
-)
-
-default_sl = st.sidebar.slider(
-    "通常バックテスト 損切り（%）",
-    3, 15, 7
-) / 100
-
-default_tp = st.sidebar.slider(
-    "通常バックテスト 利確（%）",
-    5, 30, 15
-) / 100
-
-st.sidebar.header("🎯 条件")
-
-use_price_2000 = st.sidebar.checkbox(
-    "株価2,000円以上",
-    value=False
-)
-
-use_ma = st.sidebar.checkbox(
-    "25日線 ＞ 75日線 ＆ 株価 ＞ 25日線",
-    value=False
-)
-
-use_volume = st.sidebar.checkbox(
-    "出来高 ＞ 20日平均",
-    value=False
-)
-
-use_rsi = st.sidebar.checkbox(
-    "RSI ＜ 上限",
-    value=True
-)
-
-st.sidebar.info(
-    "明けの明星はVer.3.8.2から完全削除しています。"
-)
-
-# =========================================================
-# 日経225取得
-# =========================================================
-
-NIKKEI_URL = (
-    "https://indexes.nikkei.co.jp/nkave/index/component?idx=nk225"
-)
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_nikkei225():
-    """
-    日経225公式構成銘柄ページから4桁/英数字コードを取得。
-    pandas.read_html()/lxmlには依存しません。
-    """
-    import urllib.request
-    from html.parser import HTMLParser
-
-    class NikkeiCodeParser(HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self.codes = []
-            self.in_td = False
-
-        def handle_starttag(self, tag, attrs):
-            if tag.lower() == "td":
-                self.in_td = True
-
-        def handle_endtag(self, tag):
-            if tag.lower() == "td":
-                self.in_td = False
-
-        def handle_data(self, data):
-            if not self.in_td:
-                return
-
-            text = data.strip().upper().replace("\xa0", "")
-            text = re.sub(r"\s+", "", text)
-
-            # 現在の日経225には4桁コードだけでなく
-            # 285Aのような英字入りコードも存在するため対応。
-            if re.fullmatch(r"\d{4}[A-Z]?", text):
-                if text not in self.codes:
-                    self.codes.append(text)
-
-    urls = [
-        "https://indexes.nikkei.co.jp/en/nkave/index/component?idx=nk225",
-        "https://indexes.nikkei.co.jp/nkave/index/component?idx=nk225"
-    ]
-
-    last_error = None
-
-    for url in urls:
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 Chrome/131 Safari/537.36"
-                    )
-                }
-            )
-
-            with urllib.request.urlopen(
-                req,
-                timeout=20
-            ) as response:
-                html = response.read().decode(
-                    "utf-8",
-                    errors="ignore"
-                )
-
-            parser = NikkeiCodeParser()
-            parser.feed(html)
-
-            codes = list(dict.fromkeys(parser.codes))
-
-            # 公式ページのNikkei 225は225銘柄。
-            # ページ構造変更等で余分なコードが拾われる可能性があるため、
-            # 225前後の取得を確認する。
-            if len(codes) >= 220:
-                return codes[:225]
-
-            last_error = (
-                f"公式ページから取得できたコードが"
-                f"{len(codes)}銘柄でした。"
-            )
-
-        except Exception as e:
-            last_error = str(e)
-
-    # -----------------------------------------------------
-    # 最終フォールバック
-    # -----------------------------------------------------
-    # 公式ページへのアクセスが一時的に拒否された場合でも、
-    # 日経225のバックテスト自体を止めないためのコード一覧。
-    # 構成銘柄は定期的に入れ替わるため、公式取得を最優先する。
-    fallback = [
-        "1332","1605","1721","1801","1802","1803","1808",
-        "1925","1928","1963","2002","2267","2269","2282",
-        "2413","2432","2502","2503","2531","2768","2801",
-        "2802","2871","2914","3086","3092","3099","3101",
-        "3103","3289","3382","3401","3402","3405","3407",
-        "3436","3659","3861","3863","4004","4005","4021",
-        "4042","4043","4061","4062","4063","4151","4183",
-        "4188","4202","4204","4205","4307","4324","4385",
-        "4452","4502","4503","4506","4507","4519","4523",
-        "4568","4578","4689","4704","4751","4755","4901",
-        "4902","4911","5019","5020","5101","5108","5201",
-        "5214","5232","5233","5301","5332","5333","5401",
-        "5406","5411","5631","5706","5711","5713","5714",
-        "5801","5802","5803","5831","6098","6103","6113",
-        "6146","6178","6301","6302","6305","6326","6361",
-        "6367","6471","6472","6473","6479","6501","6503",
-        "6504","6506","6526","6594","6645","6674","6701",
-        "6702","6723","6724","6752","6753","6758","6762",
-        "6770","6841","6857","6861","6902","6920","6954",
-        "6963","6971","6976","6981","7003","7004","7011",
-        "7012","7013","7186","7201","7202","7203","7211",
-        "7261","7267","7270","7272","7731","7733","7735",
-        "7741","7751","7752","7832","7911","7951","7974",
-        "8001","8002","8015","8031","8035","8058","8233",
-        "8252","8253","8267","8303","8304","8306","8308",
-        "8331","8354","8411","8591","8601","8630","8697",
-        "8725","8750","8766","8795","8801","8802","8830",
-        "9001","9005","9007","9008","9009","9020","9021",
-        "9022","9064","9101","9104","9107","9201","9432",
-        "9433","9434","9501","9502","9503","9531","9532",
-        "9602","9613","9681","9735","9766","9983","9984"
-    ]
-
-    if len(fallback) >= 200:
-        return list(dict.fromkeys(fallback))
-
-    raise RuntimeError(
-        "日経225公式ページから銘柄コードを取得できませんでした。"
-        f" {last_error or ''}"
+def normalize_tickers(text: str):
+    """7203,6758,9984 -> ['7203.T', ...]"""
+    raw = (
+        text.replace("、", ",")
+        .replace(" ", ",")
+        .replace("\n", ",")
+        .split(",")
     )
 
+    result = []
+    for x in raw:
+        x = x.strip().upper()
+        if not x:
+            continue
+
+        if x.endswith(".T"):
+            ticker = x
+        elif x.isdigit():
+            ticker = f"{x}.T"
+        else:
+            ticker = x
+
+        if ticker not in result:
+            result.append(ticker)
+
+    return result
 
 
-st.subheader("🇯🇵 バックテスト対象")
+def ticker_display(ticker: str):
+    return ticker.replace(".T", "")
 
-try:
-    nikkei_codes = get_nikkei225()
-    nikkei_ok = True
-except Exception as e:
-    nikkei_codes = []
-    nikkei_ok = False
-    nikkei_error = str(e)
 
-if nikkei_ok:
-    st.success(
-        f"✅ 日経225銘柄一覧を取得しました：{len(nikkei_codes)}銘柄"
-    )
-else:
-    st.warning(
-        "⚠️ 日経225銘柄一覧を自動取得できませんでした。"
-        "下の入力銘柄でバックテストします。"
-    )
-    st.caption(f"取得エラー: {nikkei_error}")
+def safe_float(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
 
-fallback_text = st.text_area(
-    "日経225取得失敗時・個別銘柄入力（カンマ区切り）",
-    "7203,6758,9984,8306,9432,6752,6861,8035,4063"
-)
-
-fallback_codes = []
-for x in fallback_text.replace("、", ",").replace(" ", ",").split(","):
-    x = x.strip().upper().replace(".T", "")
-    if x:
-        fallback_codes.append(x)
-fallback_codes = list(dict.fromkeys(fallback_codes))
-
-target_codes = nikkei_codes if nikkei_ok else fallback_codes
-
-st.write(
-    f"対象銘柄数：**{len(target_codes)}銘柄**"
-)
 
 # =========================================================
-# データ取得
+# テクニカル指標
 # =========================================================
+def calculate_rsi(series, period=14):
+    delta = series.diff()
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def download_data(codes, years):
-    if yf is None:
-        raise ImportError("yfinanceがインストールされていません。")
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    tickers = [f"{x}.T" for x in codes]
-    end = pd.Timestamp.today().normalize()
-    start = end - pd.DateOffset(years=years) - pd.Timedelta(days=100)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
-    raw = yf.download(
-        tickers=tickers,
-        start=start,
-        end=end + pd.Timedelta(days=1),
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-        group_by="ticker"
-    )
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
 
-    if raw is None or raw.empty:
+    return rsi.fillna(50)
+
+
+def add_indicators(df):
+    """OHLCV DataFrameに指標を追加"""
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    frames = []
+    out = df.copy()
 
-    # 複数銘柄取得
-    if isinstance(raw.columns, pd.MultiIndex):
-        level0 = set(raw.columns.get_level_values(0))
-        level1 = set(raw.columns.get_level_values(1))
+    # MultiIndex等を避けて標準化
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = out.columns.get_level_values(0)
 
-        # yfinanceのMultiIndex向きに両パターンへ対応
-        for code in codes:
-            tk = f"{code}.T"
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    for col in required:
+        if col not in out.columns:
+            out[col] = np.nan
 
+    for col in required:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out = out.dropna(subset=["Close"]).copy()
+
+    out["MA25"] = out["Close"].rolling(25).mean()
+    out["MA75"] = out["Close"].rolling(75).mean()
+    out["MA200"] = out["Close"].rolling(200).mean()
+
+    out["RSI14"] = calculate_rsi(out["Close"], 14)
+
+    out["VOL20"] = out["Volume"].rolling(20).mean()
+    out["VOL_RATIO"] = out["Volume"] / out["VOL20"].replace(0, np.nan)
+
+    out["RET_5D"] = out["Close"].pct_change(5)
+    out["RET_20D"] = out["Close"].pct_change(20)
+
+    # 20日高値・安値
+    out["HIGH20"] = out["High"].rolling(20).max()
+    out["LOW20"] = out["Low"].rolling(20).min()
+
+    # ボラティリティ
+    out["VOLATILITY20"] = out["Close"].pct_change().rolling(20).std()
+
+    # 直近高値からの下落率
+    out["FROM_HIGH20"] = out["Close"] / out["HIGH20"] - 1
+
+    # 前日終値比
+    out["DAY_CHANGE"] = out["Close"].pct_change()
+
+    return out
+
+
+# =========================================================
+# yfinanceデータ取得
+# =========================================================
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def download_data_cached(tickers_tuple, start_date, end_date):
+    """
+    yfinanceからまとめて取得。
+    同じ条件ならStreamlitがキャッシュを利用する。
+    """
+    if yf is None:
+        raise RuntimeError(
+            "yfinanceがインストールされていません。requirements.txtを確認してください。"
+        )
+
+    tickers = list(tickers_tuple)
+
+    if not tickers:
+        return {}
+
+    data = yf.download(
+        tickers=tickers,
+        start=start_date,
+        end=end_date,
+        auto_adjust=False,
+        progress=False,
+        group_by="column",
+        threads=True,
+    )
+
+    result = {}
+
+    if data is None or data.empty:
+        return result
+
+    # 複数銘柄
+    if isinstance(data.columns, pd.MultiIndex):
+        level0 = set(data.columns.get_level_values(0))
+
+        for ticker in tickers:
             try:
-                if tk in level0:
-                    d = raw[tk].copy()
-                elif tk in level1:
-                    d = raw.xs(tk, axis=1, level=1).copy()
+                # 通常のyfinance形式: Column -> Ticker
+                if ticker in data.columns.get_level_values(1):
+                    df = data.xs(ticker, axis=1, level=1, drop_level=True)
                 else:
-                    continue
-
-                d = d.reset_index()
-
-                rename = {}
-                for c in d.columns:
-                    s = str(c).lower()
-                    if s == "date":
-                        rename[c] = "date"
-                    elif s == "open":
-                        rename[c] = "open"
-                    elif s == "high":
-                        rename[c] = "high"
-                    elif s == "low":
-                        rename[c] = "low"
-                    elif s == "close":
-                        rename[c] = "close"
-                    elif s == "volume":
-                        rename[c] = "volume"
-
-                d = d.rename(columns=rename)
-
-                required = [
-                    "date", "open", "high",
-                    "low", "close", "volume"
-                ]
-
-                if not all(c in d.columns for c in required):
-                    continue
-
-                d = d[required].copy()
-                d["ticker"] = code
-                frames.append(d)
-
+                    df = pd.DataFrame()
             except Exception:
-                continue
+                df = pd.DataFrame()
+
+            if not df.empty:
+                result[ticker] = df.copy()
 
     else:
-        # 1銘柄時など
-        d = raw.reset_index()
-        rename = {}
-        for c in d.columns:
-            s = str(c).lower()
-            if s == "date":
-                rename[c] = "date"
-            elif s == "open":
-                rename[c] = "open"
-            elif s == "high":
-                rename[c] = "high"
-            elif s == "low":
-                rename[c] = "low"
-            elif s == "close":
-                rename[c] = "close"
-            elif s == "volume":
-                rename[c] = "volume"
+        # 1銘柄
+        result[tickers[0]] = data.copy()
 
-        d = d.rename(columns=rename)
-        required = [
-            "date", "open", "high",
-            "low", "close", "volume"
-        ]
+    return result
 
-        if all(c in d.columns for c in required):
-            d = d[required].copy()
-            d["ticker"] = codes[0]
-            frames.append(d)
 
-    if not frames:
-        return pd.DataFrame()
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def prepare_all_data(raw_items):
+    """
+    指標計算もキャッシュ。
+    raw_itemsは(tuple(ticker, dataframe))の形で渡す。
+    """
+    result = {}
 
-    df = pd.concat(frames, ignore_index=True)
+    for ticker, df in raw_items:
+        try:
+            result[ticker] = add_indicators(df)
+        except Exception:
+            result[ticker] = pd.DataFrame()
 
-    df["date"] = pd.to_datetime(
-        df["date"], errors="coerce"
-    ).dt.tz_localize(None)
+    return result
 
-    for c in [
-        "open", "high", "low",
-        "close", "volume"
-    ]:
-        df[c] = pd.to_numeric(
-            df[c], errors="coerce"
-        )
-
-    df = df.dropna(
-        subset=[
-            "date", "open", "high",
-            "low", "close"
-        ]
-    )
-
-    df = df.sort_values(
-        ["ticker", "date"]
-    ).reset_index(drop=True)
-
-    return df
 
 # =========================================================
-# 指標作成
+# スコアリング
 # =========================================================
+def score_row(row, settings):
+    """
+    100点満点。
+    Ver.4.0ではテクニカル中心。
+    明けの明星は使用しない。
+    """
+    score = 0
+    reasons = []
+    warnings = []
 
-@st.cache_data(show_spinner=False)
-def prepare_indicators(df):
-    parts = []
+    close = safe_float(row.get("Close"))
+    ma25 = safe_float(row.get("MA25"))
+    ma75 = safe_float(row.get("MA75"))
+    ma200 = safe_float(row.get("MA200"))
+    rsi = safe_float(row.get("RSI14"), 50)
+    vol_ratio = safe_float(row.get("VOL_RATIO"), 1)
+    ret5 = safe_float(row.get("RET_5D"))
+    ret20 = safe_float(row.get("RET_20D"))
+    from_high = safe_float(row.get("FROM_HIGH20"))
+    volatility = safe_float(row.get("VOLATILITY20"))
 
-    for ticker, g in df.groupby("ticker", sort=False):
-        g = g.sort_values("date").copy()
+    # --- トレンド 30点 ---
+    if ma25 > 0 and ma75 > 0 and ma25 > ma75:
+        score += 12
+        reasons.append("25日線 > 75日線")
 
-        g["ma25"] = g["close"].rolling(
-            25, min_periods=25
-        ).mean()
+    if ma200 > 0 and close > ma200:
+        score += 8
+        reasons.append("株価 > 200日線")
 
-        g["ma75"] = g["close"].rolling(
-            75, min_periods=75
-        ).mean()
+    if ma25 > 0 and close > ma25:
+        score += 5
+        reasons.append("株価 > 25日線")
 
-        delta = g["close"].diff()
+    if ret20 > 0:
+        score += 5
+        reasons.append("20日騰落率プラス")
+    else:
+        warnings.append("20日騰落率マイナス")
 
-        gain = delta.clip(lower=0).rolling(
-            14, min_periods=14
-        ).mean()
+    # --- 出来高 15点 ---
+    if vol_ratio >= 1.5:
+        score += 10
+        reasons.append(f"出来高{vol_ratio:.1f}倍")
+    elif vol_ratio >= 1.2:
+        score += 7
+        reasons.append(f"出来高{vol_ratio:.1f}倍")
+    elif vol_ratio >= 1.0:
+        score += 4
+        reasons.append("出来高20日平均以上")
 
-        loss = (-delta.clip(upper=0)).rolling(
-            14, min_periods=14
-        ).mean()
+    # --- RSI 20点 ---
+    if settings["use_rsi"]:
+        if 45 <= rsi <= 65:
+            score += 15
+            reasons.append(f"RSI適正({rsi:.1f})")
+        elif 35 <= rsi < 45:
+            score += 10
+            reasons.append(f"RSI押し目({rsi:.1f})")
+        elif 65 < rsi <= settings["rsi_max"]:
+            score += 8
+            reasons.append(f"RSIやや高め({rsi:.1f})")
+        elif rsi > settings["rsi_max"]:
+            warnings.append(f"RSI過熱({rsi:.1f})")
+        else:
+            warnings.append(f"RSI低迷({rsi:.1f})")
 
-        rs = gain / loss.replace(0, np.nan)
+    # --- モメンタム 15点 ---
+    if ret5 >= 0.03:
+        score += 8
+        reasons.append("5日上昇モメンタム")
+    elif ret5 >= 0:
+        score += 4
 
-        g["rsi"] = (
-            100 - 100 / (1 + rs)
-        )
+    if 0.02 <= ret20 <= 0.20:
+        score += 7
+        reasons.append("20日上昇率が適正")
+    elif ret20 > 0.20:
+        warnings.append("短期間で上昇し過ぎの可能性")
 
-        g["vol20"] = g["volume"].rolling(
-            20, min_periods=20
-        ).mean()
+    # --- 押し目 10点 ---
+    if -0.10 <= from_high <= -0.02 and close > ma75:
+        score += 10
+        reasons.append("高値からの健全な押し目")
+    elif -0.02 < from_high <= 0:
+        score += 5
 
-        g["ma_ok"] = (
-            (g["ma25"] > g["ma75"])
-            & (g["close"] > g["ma25"])
-        )
+    # 過度なボラティリティ
+    if volatility > 0.06:
+        score -= 5
+        warnings.append("値動きが大きい")
 
-        g["volume_ok"] = (
-            g["volume"] > g["vol20"]
-        )
+    score = max(0, min(100, int(score)))
 
-        g["price2000_ok"] = (
-            g["close"] >= 2000
-        )
+    if score >= settings["buy_score"]:
+        decision = "🟢 買い候補"
+    elif score >= settings["watch_score"]:
+        decision = "🟡 監視・押し目待ち"
+    else:
+        decision = "⚪ 見送り"
 
-        parts.append(g)
+    return score, decision, reasons, warnings
 
-    return pd.concat(
-        parts, ignore_index=True
-    ).sort_values(
-        ["date", "ticker"]
-    ).reset_index(drop=True)
-
-# =========================================================
-# 条件シグナル
-# =========================================================
-
-def make_signal(
-    df,
-    use_ma,
-    use_volume,
-    use_price2000,
-    use_rsi,
-    rsi_max
-):
-    s = pd.Series(
-        True, index=df.index
-    )
-
-    valid = (
-        df["ma25"].notna()
-        & df["ma75"].notna()
-        & df["rsi"].notna()
-        & df["vol20"].notna()
-    )
-
-    s &= valid
-
-    if use_ma:
-        s &= df["ma_ok"]
-
-    if use_volume:
-        s &= df["volume_ok"]
-
-    if use_price2000:
-        s &= df["price2000_ok"]
-
-    if use_rsi:
-        s &= df["rsi"] < rsi_max
-
-    return s.fillna(False)
 
 # =========================================================
 # バックテスト
 # =========================================================
-
 def run_backtest(
-    df,
-    use_ma,
-    use_volume,
-    use_price2000,
-    use_rsi,
-    rsi_max,
+    data_dict,
+    initial_cash,
+    max_positions,
+    max_per_position,
     stop_loss,
     take_profit,
-    keep_trades=False
+    buy_score,
+    min_price,
+    max_price,
 ):
-    cash = float(initial_cash)
-    positions = {}
-    trades = []
-    curve = []
+    """
+    簡易S株バックテスト。
 
-    df = df.copy()
+    重要:
+    当日終値でシグナルを確定し、
+    次の営業日の始値で約定する近似モデル。
+    実際のS株の1日3回の約定タイミングを完全再現するものではない。
+    """
+    if not data_dict:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    df["signal"] = make_signal(
-        df,
-        use_ma,
-        use_volume,
-        use_price2000,
-        use_rsi,
-        rsi_max
+    settings = {
+        "use_rsi": True,
+        "rsi_max": 70,
+        "buy_score": buy_score,
+        "watch_score": max(0, buy_score - 15),
+    }
+
+    # 全日付を取得
+    all_dates = sorted(
+        set(
+            d
+            for df in data_dict.values()
+            if df is not None and not df.empty
+            for d in df.index
+        )
     )
 
-    dates = df["date"].drop_duplicates().sort_values()
+    if len(all_dates) < 2:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    for current_date in dates:
-        day = df[df["date"] == current_date]
+    cash = float(initial_cash)
+    positions = {}
 
-        # -----------------------------
-        # 売却
-        # -----------------------------
+    trades = []
+    equity_rows = []
+
+    for i in range(len(all_dates) - 1):
+        current_date = all_dates[i]
+        next_date = all_dates[i + 1]
+
+        # ---------------------------------------------
+        # まず保有株を翌日始値で売却判定
+        # ---------------------------------------------
         for ticker in list(positions.keys()):
-            row = day[day["ticker"] == ticker]
+            pos = positions[ticker]
+            df = data_dict[ticker]
 
-            if row.empty:
+            if next_date not in df.index:
                 continue
 
-            r = row.iloc[0]
-            price = float(r["close"])
-            p = positions[ticker]
+            next_row = df.loc[next_date]
 
-            ret = (
-                price / p["entry_price"] - 1
-            )
+            open_price = safe_float(next_row.get("Open"))
+            low_price = safe_float(next_row.get("Low"))
+            high_price = safe_float(next_row.get("High"))
 
+            if open_price <= 0:
+                continue
+
+            sell_price = None
             reason = None
 
-            if ret <= -stop_loss:
-                reason = "損切り"
-            elif ret >= take_profit:
-                reason = "利確"
-            elif (
-                pd.notna(r["ma25"])
-                and price < r["ma25"]
-            ):
-                reason = "25日線割れ"
+            # 損切り/利確は翌日始値と当日高安を簡易利用
+            stop_price = pos["entry_price"] * (1 - stop_loss / 100)
+            take_price = pos["entry_price"] * (1 + take_profit / 100)
 
-            if reason:
-                proceeds = (
-                    p["shares"] * price
-                )
+            if open_price <= stop_price:
+                sell_price = open_price
+                reason = "損切り"
+            elif open_price >= take_price:
+                sell_price = open_price
+                reason = "利確"
+            elif low_price <= stop_price:
+                sell_price = stop_price
+                reason = "損切り"
+            elif high_price >= take_price:
+                sell_price = take_price
+                reason = "利確"
+            else:
+                # 現在のトレンド悪化
+                ma25 = safe_float(next_row.get("MA25"))
+                ma75 = safe_float(next_row.get("MA75"))
+                rsi = safe_float(next_row.get("RSI14"), 50)
+
+                if ma25 > 0 and ma75 > 0 and ma25 < ma75:
+                    sell_price = open_price
+                    reason = "トレンド悪化"
+                elif rsi > 80:
+                    sell_price = open_price
+                    reason = "RSI過熱"
+
+            if sell_price is not None and sell_price > 0:
+                shares = pos["shares"]
+                proceeds = shares * sell_price
                 cash += proceeds
 
-                pnl = (
-                    price - p["entry_price"]
-                ) * p["shares"]
+                pnl = (sell_price - pos["entry_price"]) * shares
 
-                if keep_trades:
-                    trades.append({
-                        "date": current_date,
-                        "ticker": ticker,
-                        "side": "SELL",
-                        "price": price,
-                        "shares": p["shares"],
-                        "reason": reason,
-                        "pnl": pnl
-                    })
+                trades.append(
+                    {
+                        "Date": pd.Timestamp(next_date),
+                        "Ticker": ticker_display(ticker),
+                        "Action": "SELL",
+                        "Price": round(sell_price, 2),
+                        "Shares": int(shares),
+                        "Amount": round(proceeds, 2),
+                        "PnL": round(pnl, 2),
+                        "Reason": reason,
+                    }
+                )
 
                 del positions[ticker]
 
-        # -----------------------------
-        # 買い
-        # -----------------------------
-        if len(positions) < max_positions:
-            candidates = day[day["signal"]].copy()
+        # ---------------------------------------------
+        # 次に買い候補を判定
+        # ---------------------------------------------
+        candidates = []
 
-            # RSIが低い順 → 条件に余裕のある銘柄を優先
-            if not candidates.empty:
-                candidates = candidates.sort_values(
-                    ["rsi", "volume"],
-                    ascending=[True, False]
+        for ticker, df in data_dict.items():
+            if df is None or df.empty:
+                continue
+
+            if current_date not in df.index or next_date not in df.index:
+                continue
+
+            if ticker in positions:
+                continue
+
+            row = df.loc[current_date]
+            next_row = df.loc[next_date]
+
+            current_close = safe_float(row.get("Close"))
+            next_open = safe_float(next_row.get("Open"))
+
+            if current_close <= 0 or next_open <= 0:
+                continue
+
+            # 株価範囲
+            if current_close < min_price:
+                continue
+
+            if max_price > 0 and current_close > max_price:
+                continue
+
+            score, decision, reasons, warnings = score_row(row, settings)
+
+            if score >= buy_score:
+                candidates.append(
+                    (
+                        score,
+                        ticker,
+                        next_open,
+                        reasons,
+                        warnings,
+                    )
                 )
 
-            for _, r in candidates.iterrows():
-                ticker = str(r["ticker"])
+        candidates.sort(reverse=True, key=lambda x: x[0])
 
-                if ticker in positions:
-                    continue
+        available_slots = max(0, max_positions - len(positions))
 
-                if len(positions) >= max_positions:
-                    break
+        for score, ticker, next_open, reasons, warnings in candidates[:available_slots]:
+            if cash <= 0:
+                break
 
-                price = float(r["close"])
+            budget = min(max_per_position, cash)
 
-                budget = min(
-                    float(max_per_position),
-                    cash
-                )
+            shares = int(budget // next_open)
 
-                shares = (
-                    int(
-                        budget / (price * 100)
-                    ) * 100
-                )
+            # S株なので1株からOK
+            if shares < 1:
+                continue
 
-                if shares <= 0:
-                    continue
+            cost = shares * next_open
 
-                cost = shares * price
+            if cost > cash:
+                continue
 
-                if cost > cash:
-                    continue
+            cash -= cost
 
-                cash -= cost
+            positions[ticker] = {
+                "shares": shares,
+                "entry_price": next_open,
+                "entry_date": next_date,
+                "score": score,
+            }
 
-                positions[ticker] = {
-                    "shares": shares,
-                    "entry_price": price
+            trades.append(
+                {
+                    "Date": pd.Timestamp(next_date),
+                    "Ticker": ticker_display(ticker),
+                    "Action": "BUY",
+                    "Price": round(next_open, 2),
+                    "Shares": int(shares),
+                    "Amount": round(cost, 2),
+                    "PnL": 0.0,
+                    "Reason": f"Score {score} / " + ", ".join(reasons[:3]),
                 }
-
-                if keep_trades:
-                    trades.append({
-                        "date": current_date,
-                        "ticker": ticker,
-                        "side": "BUY",
-                        "price": price,
-                        "shares": shares,
-                        "reason": "選定条件成立",
-                        "pnl": 0.0
-                    })
-
-        # -----------------------------
-        # 資産評価
-        # -----------------------------
-        market_value = 0.0
-
-        if positions:
-            held = day[
-                day["ticker"].isin(
-                    list(positions.keys())
-                )
-            ]
-
-            prices = dict(
-                zip(
-                    held["ticker"],
-                    held["close"]
-                )
             )
 
-            for ticker, p in positions.items():
-                if ticker in prices:
-                    market_value += (
-                        p["shares"]
-                        * float(prices[ticker])
-                    )
+        # ---------------------------------------------
+        # 当日終値で資産評価
+        # ---------------------------------------------
+        equity = cash
 
-        curve.append({
-            "date": current_date,
-            "equity": cash + market_value,
-            "cash": cash,
-            "positions": len(positions)
-        })
+        for ticker, pos in positions.items():
+            df = data_dict[ticker]
 
-    eq = pd.DataFrame(curve)
+            if current_date in df.index:
+                close = safe_float(df.loc[current_date].get("Close"))
+                equity += pos["shares"] * close
 
-    tr = pd.DataFrame(trades)
+        equity_rows.append(
+            {
+                "Date": pd.Timestamp(current_date),
+                "Cash": cash,
+                "Equity": equity,
+                "Positions": len(positions),
+            }
+        )
 
-    return eq, tr, positions
+    trades_df = pd.DataFrame(trades)
+    equity_df = pd.DataFrame(equity_rows)
+
+    # 保有中ポジション
+    positions_rows = []
+    for ticker, pos in positions.items():
+        df = data_dict[ticker]
+        if df.empty:
+            continue
+
+        last_row = df.iloc[-1]
+        last_price = safe_float(last_row.get("Close"))
+
+        market_value = pos["shares"] * last_price
+        pnl = (last_price - pos["entry_price"]) * pos["shares"]
+
+        positions_rows.append(
+            {
+                "Ticker": ticker_display(ticker),
+                "Shares": pos["shares"],
+                "EntryPrice": round(pos["entry_price"], 2),
+                "CurrentPrice": round(last_price, 2),
+                "MarketValue": round(market_value, 2),
+                "PnL": round(pnl, 2),
+                "PnL%": round(
+                    (last_price / pos["entry_price"] - 1) * 100, 2
+                )
+                if pos["entry_price"] > 0
+                else 0,
+                "EntryDate": pos["entry_date"],
+                "Score": pos["score"],
+            }
+        )
+
+    positions_df = pd.DataFrame(positions_rows)
+
+    return trades_df, equity_df, positions_df
+
 
 # =========================================================
-# 成績
+# 統計
 # =========================================================
-
-def calculate_stats(eq, tr):
-    if eq.empty:
+def calculate_statistics(trades_df, equity_df, initial_cash):
+    if equity_df.empty:
         return {
-            "final_asset": 0,
-            "pnl": 0,
-            "return_rate": 0,
-            "cagr": 0,
-            "max_drawdown": 0,
+            "final": initial_cash,
+            "profit": 0,
+            "return_pct": 0,
+            "max_dd": 0,
             "trades": 0,
-            "wins": 0,
-            "losses": 0,
             "win_rate": 0,
-            "profit_factor": 0,
-            "sharpe": 0,
-            "avg_win": 0,
-            "avg_loss": 0,
-            "score": -999
         }
 
-    final_asset = float(eq.iloc[-1]["equity"])
-    pnl = final_asset - float(initial_cash)
-    return_rate = pnl / float(initial_cash)
+    final_equity = safe_float(equity_df.iloc[-1]["Equity"], initial_cash)
+    profit = final_equity - initial_cash
+    return_pct = (final_equity / initial_cash - 1) * 100
 
-    days = max(
-        1,
-        (
-            pd.to_datetime(eq.iloc[-1]["date"])
-            - pd.to_datetime(eq.iloc[0]["date"])
-        ).days
-    )
+    equity = equity_df["Equity"].astype(float)
+    peak = equity.cummax()
+    drawdown = equity / peak - 1
+    max_dd = drawdown.min() * 100
 
-    years = days / 365.25
-
-    if years > 0 and final_asset > 0:
-        cagr = (
-            final_asset / float(initial_cash)
-        ) ** (1 / years) - 1
+    if trades_df.empty:
+        win_rate = 0
+        sell_count = 0
     else:
-        cagr = 0.0
-
-    rolling_max = eq["equity"].cummax()
-    dd = eq["equity"] / rolling_max - 1
-    max_dd = float(dd.min())
-
-    daily_ret = eq["equity"].pct_change().replace(
-        [np.inf, -np.inf], np.nan
-    ).dropna()
-
-    if (
-        len(daily_ret) >= 20
-        and daily_ret.std() > 0
-    ):
-        sharpe = (
-            daily_ret.mean()
-            / daily_ret.std()
-            * np.sqrt(252)
-        )
-    else:
-        sharpe = 0.0
-
-    if tr.empty or "side" not in tr.columns:
-        sells = pd.DataFrame()
-    else:
-        sells = tr[
-            tr["side"] == "SELL"
-        ].copy()
-
-    if sells.empty:
-        wins = pd.DataFrame()
-        losses = pd.DataFrame()
-    else:
-        wins = sells[sells["pnl"] > 0]
-        losses = sells[sells["pnl"] < 0]
-
-    win_count = len(wins)
-    loss_count = len(losses)
-    closed = win_count + loss_count
-
-    win_rate = (
-        win_count / closed
-        if closed > 0 else 0
-    )
-
-    gross_profit = (
-        float(wins["pnl"].sum())
-        if win_count else 0
-    )
-
-    gross_loss = abs(
-        float(losses["pnl"].sum())
-    ) if loss_count else 0
-
-    if gross_loss > 0:
-        pf = gross_profit / gross_loss
-    else:
-        pf = 0.0 if gross_profit <= 0 else 5.0
-
-    avg_win = (
-        float(wins["pnl"].mean())
-        if win_count else 0
-    )
-
-    avg_loss = (
-        float(losses["pnl"].mean())
-        if loss_count else 0
-    )
-
-    # -----------------------------------------------------
-    # 総合スコア
-    # 利益だけでなく、CAGR・DD・PF・Sharpeを重視
-    # -----------------------------------------------------
-    score = (
-        cagr * 100
-        + sharpe * 12
-        + max(-max_dd, 0) * -80
-        + min(pf, 3) * 5
-        + win_rate * 5
-    )
-
-    # 極端に取引が少ない結果を少し減点
-    if closed < 10:
-        score -= 5
+        sells = trades_df[trades_df["Action"] == "SELL"].copy()
+        sell_count = len(sells)
+        if sell_count > 0:
+            win_rate = (sells["PnL"] > 0).mean() * 100
+        else:
+            win_rate = 0
 
     return {
-        "final_asset": final_asset,
-        "pnl": pnl,
-        "return_rate": return_rate,
-        "cagr": cagr,
-        "max_drawdown": max_dd,
-        "trades": closed,
-        "wins": win_count,
-        "losses": loss_count,
+        "final": final_equity,
+        "profit": profit,
+        "return_pct": return_pct,
+        "max_dd": max_dd,
+        "trades": sell_count,
         "win_rate": win_rate,
-        "profit_factor": pf,
-        "sharpe": sharpe,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "score": score
     }
 
-# =========================================================
-# 自動探索
-# =========================================================
 
-def make_search_grid(mode):
-    """
-    高速探索用の候補条件。
-    まず軽量スクリーニングを行い、上位条件だけ本格バックテストする。
-    """
-    if mode == "高速探索":
-        rsi_values = [55, 60, 65]
-        sl_values = [0.05, 0.07, 0.10]
-        tp_values = [0.10, 0.15, 0.20]
-    else:
-        rsi_values = [50, 55, 60, 65, 70]
-        sl_values = [0.03, 0.05, 0.07, 0.10]
-        tp_values = [0.10, 0.15, 0.20, 0.25]
+# =========================================================
+# 最新スコア
+# =========================================================
+def latest_candidates(data_dict, buy_score, min_price, max_price, top_n=10):
+    settings = {
+        "use_rsi": True,
+        "rsi_max": 70,
+        "buy_score": buy_score,
+        "watch_score": max(0, buy_score - 15),
+    }
 
     rows = []
 
-    for ma, volume, rsi, sl, tp in product(
-        [False, True],
-        [False, True],
-        rsi_values,
-        sl_values,
-        tp_values
-    ):
-        rows.append({
-            "MA": ma,
-            "出来高": volume,
-            "RSI": rsi,
-            "SL": sl,
-            "TP": tp
-        })
+    for ticker, df in data_dict.items():
+        if df is None or df.empty:
+            continue
 
-    return rows
+        row = df.iloc[-1]
 
+        close = safe_float(row.get("Close"))
+        if close < min_price:
+            continue
 
-def quick_score_condition(
-    df,
-    use_ma,
-    use_volume,
-    rsi_max
-):
-    """
-    本格売買シミュレーションをせず、
-    シグナル数・平均5日リターン・勝率・下振れを使って
-    有望条件を高速スクリーニングする。
-    """
-    signal = make_signal(
-        df,
-        use_ma,
-        use_volume,
-        False,
-        True,
-        rsi_max
-    )
+        if max_price > 0 and close > max_price:
+            continue
 
-    x = df.loc[
-        signal,
-        ["ticker", "date", "close"]
-    ].copy()
+        score, decision, reasons, warnings = score_row(row, settings)
 
-    if x.empty:
-        return {
-            "quick_score": -999,
-            "signals": 0,
-            "forward_win_rate": 0,
-            "avg_forward_return": 0
-        }
-
-    x = x.sort_values(
-        ["ticker", "date"]
-    )
-
-    x["future5"] = (
-        x.groupby("ticker")["close"]
-        .shift(-5) / x["close"] - 1
-    )
-
-    # 未来5日リターンが計算できるシグナルだけ利用
-    x = x.dropna(subset=["future5"])
-
-    if x.empty:
-        return {
-            "quick_score": -999,
-            "signals": 0,
-            "forward_win_rate": 0,
-            "avg_forward_return": 0
-        }
-
-    # 極端な外れ値の影響を抑える
-    clipped = x["future5"].clip(-0.20, 0.20)
-
-    avg_ret = float(clipped.mean())
-    win_rate = float((clipped > 0).mean())
-    signal_count = len(clipped)
-
-    # 未来データは「研究用スクリーニング」にのみ使用。
-    # 最終順位は本格バックテストで再検証する。
-    quick_score = (
-        avg_ret * 100
-        + win_rate * 5
-        + min(signal_count, 500) / 100
-    )
-
-    return {
-        "quick_score": quick_score,
-        "signals": signal_count,
-        "forward_win_rate": win_rate,
-        "avg_forward_return": avg_ret
-    }
-
-
-def fast_two_stage_search(data, mode, top_n=30):
-    """
-    Stage 1: 軽量スクリーニング
-    Stage 2: 上位条件のみ本格バックテスト
-    """
-    grid = make_search_grid(mode)
-
-    quick_rows = []
-
-    for p in grid:
-        q = quick_score_condition(
-            data,
-            p["MA"],
-            p["出来高"],
-            p["RSI"]
+        rows.append(
+            {
+                "Ticker": ticker_display(ticker),
+                "Price": round(close, 2),
+                "Score": score,
+                "Decision": decision,
+                "RSI": round(safe_float(row.get("RSI14"), 50), 1),
+                "MA25": round(safe_float(row.get("MA25")), 2),
+                "MA75": round(safe_float(row.get("MA75")), 2),
+                "VolumeRatio": round(safe_float(row.get("VOL_RATIO"), 1), 2),
+                "5D": round(safe_float(row.get("RET_5D")) * 100, 2),
+                "20D": round(safe_float(row.get("RET_20D")) * 100, 2),
+                "Reasons": " / ".join(reasons[:5]),
+                "Warnings": " / ".join(warnings[:3]),
+            }
         )
 
-        quick_rows.append({
-            **p,
-            **q
-        })
+    result = pd.DataFrame(rows)
 
-    quick_df = pd.DataFrame(quick_rows)
+    if result.empty:
+        return result
 
-    quick_df = quick_df.sort_values(
-        "quick_score",
-        ascending=False
-    ).reset_index(drop=True)
+    return result.sort_values(
+        ["Score", "VolumeRatio"],
+        ascending=[False, False],
+    ).head(top_n)
 
-    finalists = quick_df.head(
-        min(top_n, len(quick_df))
+
+# =========================================================
+# UI
+# =========================================================
+st.title("📈 日本株 10万円→100万円 AI投資アシスタント Ver.4.0")
+
+st.caption(
+    "S株を想定した仮想バックテスト。明けの明星は使用しません。"
+)
+
+with st.sidebar:
+    st.header("⚙️ 基本設定")
+
+    initial_cash = st.number_input(
+        "初期資金（円）",
+        min_value=10_000,
+        max_value=100_000_000,
+        value=100_000,
+        step=10_000,
     )
 
-    results = []
-
-    for _, p in finalists.iterrows():
-        eq, tr, _ = run_backtest(
-            data,
-            bool(p["MA"]),
-            bool(p["出来高"]),
-            False,
-            True,
-            int(p["RSI"]),
-            float(p["SL"]),
-            float(p["TP"]),
-            keep_trades=True
-        )
-
-        s = calculate_stats(eq, tr)
-
-        results.append({
-            "MA": "ON" if p["MA"] else "OFF",
-            "出来高": "ON" if p["出来高"] else "OFF",
-            "RSI": int(p["RSI"]),
-            "SL": f"-{float(p['SL']):.0%}",
-            "TP": f"+{float(p['TP']):.0%}",
-            "総損益": s["pnl"],
-            "収益率": s["return_rate"],
-            "CAGR": s["cagr"],
-            "最大DD": s["max_drawdown"],
-            "PF": s["profit_factor"],
-            "Sharpe": s["sharpe"],
-            "勝率": s["win_rate"],
-            "決済数": s["trades"],
-            "総合スコア": s["score"],
-            "事前スコア": float(p["quick_score"])
-        })
-
-    result_df = pd.DataFrame(results)
-
-    if result_df.empty:
-        return quick_df, result_df
-
-    result_df = result_df.sort_values(
-        "総合スコア",
-        ascending=False
-    ).reset_index(drop=True)
-
-    return quick_df, result_df
-
-# =========================================================
-# 買い候補・売り候補
-# =========================================================
-
-def current_candidates(
-    data,
-    use_ma,
-    use_volume,
-    use_price2000,
-    use_rsi,
-    rsi_max
-):
-    if data.empty:
-        return pd.DataFrame()
-
-    last_date = data["date"].max()
-    day = data[
-        data["date"] == last_date
-    ].copy()
-
-    signal = make_signal(
-        day,
-        use_ma,
-        use_volume,
-        use_price2000,
-        use_rsi,
-        rsi_max
+    target_cash = st.number_input(
+        "目標資産（円）",
+        min_value=100_000,
+        max_value=100_000_000,
+        value=1_000_000,
+        step=100_000,
     )
 
-    day["買いシグナル"] = signal
-
-    buy = day[
-        day["買いシグナル"]
-    ].copy()
-
-    if buy.empty:
-        return pd.DataFrame()
-
-    buy["スコア"] = (
-        (70 - buy["rsi"].clip(upper=70))
-        + buy["volume"].div(
-            buy["vol20"].replace(0, np.nan)
-        ).clip(upper=3) * 10
+    max_positions = st.number_input(
+        "最大保有銘柄数",
+        min_value=1,
+        max_value=50,
+        value=5,
+        step=1,
     )
 
-    cols = [
-        "ticker",
-        "close",
-        "rsi",
-        "ma25",
-        "ma75",
-        "volume",
-        "vol20",
-        "スコア"
-    ]
+    max_per_position = st.number_input(
+        "1銘柄の最大購入額（円）",
+        min_value=1_000,
+        max_value=100_000_000,
+        value=20_000,
+        step=1_000,
+    )
 
-    return buy[
-        [c for c in cols if c in buy.columns]
-    ].sort_values(
-        "スコア",
-        ascending=False
-    ).reset_index(drop=True)
+    st.divider()
+
+    st.subheader("売買ルール")
+
+    stop_loss = st.slider(
+        "損切り（%）",
+        min_value=1.0,
+        max_value=30.0,
+        value=7.0,
+        step=0.5,
+    )
+
+    take_profit = st.slider(
+        "利確（%）",
+        min_value=2.0,
+        max_value=100.0,
+        value=15.0,
+        step=1.0,
+    )
+
+    buy_score = st.slider(
+        "買い判定スコア",
+        min_value=50,
+        max_value=100,
+        value=75,
+        step=1,
+    )
+
+    min_price = st.number_input(
+        "最低株価（円）",
+        min_value=0,
+        max_value=1_000_000,
+        value=500,
+        step=100,
+    )
+
+    max_price = st.number_input(
+        "最高株価（円）※0=制限なし",
+        min_value=0,
+        max_value=1_000_000,
+        value=0,
+        step=100,
+    )
+
+    st.divider()
+
+    st.subheader("バックテスト期間")
+
+    years = st.slider(
+        "過去何年分？",
+        min_value=1,
+        max_value=5,
+        value=5,
+        step=1,
+    )
+
+    st.divider()
+
+    st.subheader("対象銘柄")
+
+    ticker_text = st.text_area(
+        "銘柄コードを入力",
+        value="7203,6758,9984,8306,9432,8035,6861,6857,7011,6501",
+        height=120,
+        help="例：7203,6758,9984。東証銘柄は自動的に.Tを付けます。",
+    )
+
+    uploaded = st.file_uploader(
+        "銘柄コードCSV（任意）",
+        type=["csv"],
+        help="1列目に銘柄コードを入れたCSVを指定できます。",
+    )
+
+    st.divider()
+
+    run_button = st.button(
+        "🚀 バックテスト開始",
+        type="primary",
+        use_container_width=True,
+    )
+
+    clear_button = st.button(
+        "🧹 キャッシュをクリア",
+        use_container_width=True,
+    )
+
+if clear_button:
+    st.cache_data.clear()
+    st.success("キャッシュをクリアしました。")
+    st.stop()
+
 
 # =========================================================
-# 実行
+# 銘柄読み込み
 # =========================================================
+tickers = normalize_tickers(ticker_text)
 
-st.divider()
+if uploaded is not None:
+    try:
+        csv_df = pd.read_csv(uploaded)
 
-if st.button(
-    "📥 日経225の株価データを取得",
-    type="secondary",
-    use_container_width=True
-):
+        if not csv_df.empty:
+            first_col = csv_df.columns[0]
+            csv_tickers = normalize_tickers(
+                ",".join(csv_df[first_col].astype(str).tolist())
+            )
+
+            for ticker in csv_tickers:
+                if ticker not in tickers:
+                    tickers.append(ticker)
+
+    except Exception as e:
+        st.warning(f"CSVを読み込めませんでした: {e}")
+
+if not tickers:
+    st.warning("銘柄コードを1つ以上入力してください。")
+    st.stop()
+
+st.info(
+    f"対象銘柄：{len(tickers)}銘柄　|　"
+    f"初期資金：{initial_cash:,.0f}円　|　"
+    f"目標：{target_cash:,.0f}円"
+)
+
+
+# =========================================================
+# データ取得
+# =========================================================
+end_date = date.today() + timedelta(days=1)
+start_date = date.today() - timedelta(days=365 * years + 250)
+
+if run_button:
     if yf is None:
         st.error(
-            "yfinanceがありません。requirements.txtに yfinance を追加してください。"
+            "yfinanceが見つかりません。requirements.txtに"
+            "yfinance>=0.2.54 を入れてください。"
         )
         st.stop()
 
-    with st.spinner(
-        f"📥 {len(target_codes)}銘柄・過去{years}年の日足を取得中..."
-    ):
-        try:
-            raw_df = download_data(
-                tuple(target_codes),
-                years
-            )
+    progress = st.progress(0)
+    status = st.empty()
 
-            if raw_df.empty:
-                st.error(
-                    "株価データを取得できませんでした。"
-                )
-            else:
-                data = prepare_indicators(raw_df)
-                st.session_state["v38_data"] = data
+    status.write("📥 株価データを取得しています…")
 
-                st.success(
-                    f"✅ {len(data):,}行 / "
-                    f"{data['ticker'].nunique()}銘柄を取得しました。"
-                )
-        except Exception as e:
-            st.error(
-                f"データ取得エラー: {e}"
-            )
+    try:
+        raw = download_data_cached(
+            tuple(tickers),
+            start_date.isoformat(),
+            end_date.isoformat(),
+        )
+    except Exception as e:
+        st.error(f"データ取得エラー：{e}")
+        st.stop()
 
-data = st.session_state.get(
-    "v38_data",
-    pd.DataFrame()
+    progress.progress(45)
+
+    if not raw:
+        st.error(
+            "株価データを取得できませんでした。"
+            "銘柄コード、ネット接続、yfinanceの状態を確認してください。"
+        )
+        st.stop()
+
+    status.write("🧮 テクニカル指標を計算しています…")
+
+    raw_items = tuple(
+        (ticker, df)
+        for ticker, df in raw.items()
+        if df is not None and not df.empty
+    )
+
+    data_dict = prepare_all_data(raw_items)
+
+    progress.progress(70)
+
+    usable = {
+        ticker: df
+        for ticker, df in data_dict.items()
+        if df is not None and not df.empty
+    }
+
+    st.session_state["data_dict"] = usable
+    st.session_state["loaded_tickers"] = list(usable.keys())
+
+    status.write("📊 バックテストを実行しています…")
+
+    trades_df, equity_df, positions_df = run_backtest(
+        usable,
+        initial_cash=initial_cash,
+        max_positions=int(max_positions),
+        max_per_position=float(max_per_position),
+        stop_loss=float(stop_loss),
+        take_profit=float(take_profit),
+        buy_score=int(buy_score),
+        min_price=float(min_price),
+        max_price=float(max_price),
+    )
+
+    progress.progress(100)
+    status.write("✅ 完了しました。")
+
+    stats = calculate_statistics(
+        trades_df,
+        equity_df,
+        initial_cash,
+    )
+
+    st.session_state["trades_df"] = trades_df
+    st.session_state["equity_df"] = equity_df
+    st.session_state["positions_df"] = positions_df
+    st.session_state["stats"] = stats
+
+
+# =========================================================
+# 結果表示
+# =========================================================
+if "data_dict" not in st.session_state:
+    st.markdown(
+        """
+        ### 👋 Ver.4.0へようこそ
+
+        左側で銘柄と条件を設定して、**「🚀 バックテスト開始」**を押してください。
+
+        **最初のテストでは10～20銘柄程度がおすすめです。**
+
+        動作確認後に対象銘柄数を増やします。
+        """
+    )
+
+    st.info(
+        "このVer.4.0はまず「高速で安定した土台」を作る版です。"
+        "業績・ニュース・市況を使った総合AIスコアはVer.4.1以降で追加します。"
+    )
+
+    st.warning(
+        "注意：バックテストの売買価格は「シグナル確定日の翌営業日始値」を"
+        "使う近似モデルです。実際のS株の1日3回の約定タイミングを完全再現するものではありません。"
+    )
+
+    st.stop()
+
+
+data_dict = st.session_state["data_dict"]
+trades_df = st.session_state.get("trades_df", pd.DataFrame())
+equity_df = st.session_state.get("equity_df", pd.DataFrame())
+positions_df = st.session_state.get("positions_df", pd.DataFrame())
+stats = st.session_state.get("stats", calculate_statistics(
+    trades_df, equity_df, initial_cash
+))
+
+
+# =========================================================
+# KPI
+# =========================================================
+st.subheader("📊 バックテスト結果")
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+c1.metric(
+    "最終資産",
+    f"{stats['final']:,.0f}円",
+    f"{stats['profit']:+,.0f}円",
 )
 
-if not data.empty:
+c2.metric(
+    "収益率",
+    f"{stats['return_pct']:+.2f}%",
+)
 
-    st.write(
-        f"📅 {data['date'].min():%Y-%m-%d}"
-        f" ～ "
-        f"{data['date'].max():%Y-%m-%d}"
+c3.metric(
+    "最大DD",
+    f"{stats['max_dd']:.2f}%",
+)
+
+c4.metric(
+    "決済回数",
+    f"{stats['trades']}回",
+)
+
+c5.metric(
+    "勝率",
+    f"{stats['win_rate']:.1f}%",
+)
+
+
+# 目標達成率
+progress_value = min(
+    100,
+    max(
+        0,
+        stats["final"] / target_cash * 100,
+    ),
+)
+
+st.progress(progress_value / 100)
+
+st.caption(
+    f"目標1,000,000円に対する進捗：{progress_value:.2f}%"
+)
+
+
+# =========================================================
+# 最新の買い候補
+# =========================================================
+st.subheader("🔥 現在の買い候補")
+
+latest_df = latest_candidates(
+    data_dict,
+    buy_score=int(buy_score),
+    min_price=float(min_price),
+    max_price=float(max_price),
+    top_n=10,
+)
+
+if latest_df.empty:
+    st.warning("現在の条件では候補銘柄がありません。買いスコアや株価条件を調整してください。")
+else:
+    st.dataframe(
+        latest_df,
+        use_container_width=True,
+        hide_index=True,
     )
 
-    st.write(
-        f"📊 実際に取得できた銘柄："
-        f"**{data['ticker'].nunique()}銘柄**"
-    )
 
-    with st.expander("📋 取得データ確認"):
-        st.dataframe(
-            data.tail(100),
-            use_container_width=True,
-            hide_index=True
-        )
+# =========================================================
+# 資産曲線
+# =========================================================
+st.subheader("📈 資産推移")
 
-    # -----------------------------------------------------
-    # 通常バックテスト
-    # -----------------------------------------------------
-
-    st.divider()
-    st.header("📊 通常バックテスト")
-
-    if st.button(
-        "▶ 現在の設定でバックテスト",
-        type="primary",
-        use_container_width=True
-    ):
-        with st.spinner(
-            "バックテストを計算中..."
-        ):
-            eq, tr, positions = run_backtest(
-                data,
-                use_ma,
-                use_volume,
-                use_price_2000,
-                use_rsi,
-                default_rsi,
-                default_sl,
-                default_tp,
-                keep_trades=True
-            )
-
-        stats = calculate_stats(eq, tr)
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "最終資産",
-            f"¥{stats['final_asset']:,.0f}"
-        )
-
-        c2.metric(
-            "総損益",
-            f"¥{stats['pnl']:,.0f}",
-            f"{stats['return_rate']:.2%}"
-        )
-
-        c3.metric(
-            "CAGR",
-            f"{stats['cagr']:.2%}"
-        )
-
-        c4.metric(
-            "最大DD",
-            f"{stats['max_drawdown']:.2%}"
-        )
-
-        c5, c6, c7, c8 = st.columns(4)
-
-        c5.metric(
-            "勝率",
-            f"{stats['win_rate']:.1%}"
-        )
-
-        c6.metric(
-            "Profit Factor",
-            f"{stats['profit_factor']:.2f}"
-        )
-
-        c7.metric(
-            "Sharpe",
-            f"{stats['sharpe']:.2f}"
-        )
-
-        c8.metric(
-            "総合スコア",
-            f"{stats['score']:.2f}"
-        )
-
-        st.subheader("📈 資産推移")
-
-        if not eq.empty:
-            st.line_chart(
-                eq.set_index("date")["equity"]
-            )
-
-        st.subheader("🧾 売買履歴")
-
-        if tr.empty:
-            st.info(
-                "売買履歴はありません。"
-            )
-        else:
-            display = tr.copy()
-            display["date"] = pd.to_datetime(
-                display["date"]
-            ).dt.strftime("%Y-%m-%d")
-
-            st.dataframe(
-                display.sort_values(
-                    "date",
-                    ascending=False
-                ),
-                use_container_width=True,
-                hide_index=True
-            )
-
-            csv = tr.to_csv(
-                index=False
-            ).encode("utf-8-sig")
-
-            st.download_button(
-                "⬇️ 売買履歴CSVを保存",
-                data=csv,
-                file_name="backtest_trades_ver3_8_2.csv",
-                mime="text/csv"
-            )
-
-    # -----------------------------------------------------
-    # 自動条件探索
-    # -----------------------------------------------------
-
-    st.divider()
-    st.header("🔬 強い条件の自動探索")
+if not equity_df.empty:
+    chart_df = equity_df.set_index("Date")[["Equity"]]
+    st.line_chart(chart_df)
 
     st.caption(
-        "利益だけではなく、CAGR・最大DD・Profit Factor・"
-        "Sharpe・勝率を組み合わせて総合評価します。"
+        "資産曲線は各営業日の終値ベース。売買は翌営業日始値の近似モデルです。"
+    )
+else:
+    st.info("資産推移データがありません。")
+
+
+# =========================================================
+# 保有銘柄
+# =========================================================
+st.subheader("📦 バックテスト終了時の保有銘柄")
+
+if positions_df.empty:
+    st.info("バックテスト終了時に保有銘柄はありません。")
+else:
+    st.dataframe(
+        positions_df,
+        use_container_width=True,
+        hide_index=True,
     )
 
-    grid = make_search_grid(
-        search_mode
+
+# =========================================================
+# 売買記録
+# =========================================================
+st.subheader("📝 売買記録")
+
+if trades_df.empty:
+    st.info(
+        "売買がありません。買いスコアを下げる、対象銘柄を増やす、"
+        "株価条件を調整するなどして再実行してください。"
     )
+else:
+    st.dataframe(
+        trades_df.sort_values("Date", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    csv = trades_df.to_csv(
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    st.download_button(
+        "⬇️ 売買記録CSVをダウンロード",
+        data=csv,
+        file_name="ver4_0_trades.csv",
+        mime="text/csv",
+    )
+
+
+# =========================================================
+# データ状況
+# =========================================================
+with st.expander("🔎 データ取得状況"):
+    status_rows = []
+
+    for ticker, df in data_dict.items():
+        if df.empty:
+            continue
+
+        status_rows.append(
+            {
+                "Ticker": ticker_display(ticker),
+                "Start": str(df.index.min().date()),
+                "End": str(df.index.max().date()),
+                "Rows": len(df),
+                "LastPrice": round(
+                    safe_float(df.iloc[-1]["Close"]),
+                    2,
+                ),
+            }
+        )
+
+    if status_rows:
+        st.dataframe(
+            pd.DataFrame(status_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.write(
-        f"探索パターン：**{len(grid):,}通り**"
+        "取得成功：",
+        len(data_dict),
+        "/",
+        len(tickers),
+        "銘柄",
     )
 
-    if st.button(
-        "🔬 強い条件を高速自動探索",
-        type="primary",
-        use_container_width=True
-    ):
-        with st.spinner(
-            "Stage 1：有望条件を高速スクリーニング中..."
-        ):
-            quick_df, result_df = fast_two_stage_search(
-                data,
-                search_mode,
-                top_n=30
-            )
 
-        st.session_state[
-            "v38_quick_results"
-        ] = quick_df
+# =========================================================
+# 重要な注意事項
+# =========================================================
+with st.expander("⚠️ Ver.4.0の重要な注意"):
+    st.markdown(
+        """
+        **このシステムは投資判断の研究・仮想売買用です。**
 
-        st.session_state[
-            "v38_search_results"
-        ] = result_df
-
-        st.success(
-            "✅ 高速2段階探索が完了しました。"
-        )
-
-        if not result_df.empty:
-            st.info(
-                "Stage 1で候補を絞り、上位30条件だけを"
-                "本格バックテストして最終順位を決定しています。"
-            )
-
-    search_results = st.session_state.get(
-        "v38_search_results",
-        pd.DataFrame()
+        - 実際のSBI証券への注文は行いません。
+        - 「必ず上がる銘柄」を予測するものではありません。
+        - 過去のバックテスト結果は将来の利益を保証しません。
+        - Ver.4.0ではニュース・企業業績・市況をまだ総合判定していません。
+        - S株の実際の約定は1日3回で、Ver.4.0は「翌営業日始値」の近似モデルです。
+        - 株式分割・併合、上場廃止、データ欠損等については、今後のバージョンでさらに精度を上げます。
+        """
     )
-
-    quick_results = st.session_state.get(
-        "v38_quick_results",
-        pd.DataFrame()
-    )
-
-    if not quick_results.empty:
-        with st.expander("⚡ Stage 1 高速スクリーニング結果"):
-            st.dataframe(
-                quick_results.head(20),
-                use_container_width=True,
-                hide_index=True
-            )
-
-    if not search_results.empty:
-
-        st.subheader(
-            "🏆 リスクを考慮した総合ランキング"
-        )
-
-        st.dataframe(
-            search_results.head(20),
-            use_container_width=True,
-            hide_index=True
-        )
-
-        best = search_results.iloc[0]
-
-        st.success(
-            f"🏆 総合1位："
-            f"MA {best['MA']} / "
-            f"出来高 {best['出来高']} / "
-            f"RSI≤{best['RSI']} / "
-            f"SL {best['SL']} / "
-            f"TP {best['TP']}\n\n"
-            f"総損益：¥{best['総損益']:,.0f} / "
-            f"CAGR：{best['CAGR']:.2%} / "
-            f"最大DD：{best['最大DD']:.2%} / "
-            f"PF：{best['PF']:.2f} / "
-            f"Sharpe：{best['Sharpe']:.2f} / "
-            f"総合スコア：{best['総合スコア']:.2f}"
-        )
-
-        csv = search_results.to_csv(
-            index=False
-        ).encode("utf-8-sig")
-
-        st.download_button(
-            "⬇️ 条件探索ランキングCSV",
-            data=csv,
-            file_name="ver3_8_2_condition_ranking.csv",
-            mime="text/csv"
-        )
-
-    # -----------------------------------------------------
-    # 最新日の買い候補
-    # -----------------------------------------------------
-
-    st.divider()
-    st.header("🟢 最新日の買い候補")
-
-    if st.button(
-        "🔎 買い候補を抽出",
-        use_container_width=True
-    ):
-        # 自動探索済みなら、その総合1位条件を優先して候補を絞る。
-        search_results = st.session_state.get(
-            "v38_search_results",
-            pd.DataFrame()
-        )
-
-        if not search_results.empty:
-            best = search_results.iloc[0]
-
-            candidate_ma = best["MA"] == "ON"
-            candidate_volume = best["出来高"] == "ON"
-            candidate_price = False
-            candidate_rsi = int(best["RSI"])
-        else:
-            candidate_ma = use_ma
-            candidate_volume = use_volume
-            candidate_price = False
-            candidate_rsi = default_rsi
-
-        candidates = current_candidates(
-            data,
-            candidate_ma,
-            candidate_volume,
-            candidate_price,
-            True,
-            candidate_rsi
-        )
-
-        if candidates.empty:
-            st.warning(
-                "現在の条件では買い候補がありません。"
-            )
-        else:
-            candidates = candidates.rename(
-                columns={
-                    "ticker": "銘柄",
-                    "close": "終値",
-                    "rsi": "RSI",
-                    "ma25": "25日線",
-                    "ma75": "75日線",
-                    "volume": "出来高",
-                    "vol20": "出来高20日平均"
-                }
-            )
-
-            candidates = candidates.head(10)
-
-            st.dataframe(
-                candidates,
-                use_container_width=True,
-                hide_index=True
-            )
-
-            if not search_results.empty:
-                st.caption(
-                    "🏆 自動探索の総合1位条件を使って上位10銘柄に絞っています。"
-                )
-            else:
-                st.caption(
-                    "自動探索未実施のため、現在のサイドバー条件で上位10銘柄を表示しています。"
-                )
-
-            st.info(
-                "これは前日の日足データを基準にした候補抽出です。"
-                "実際の売買判断・発注は行いません。"
-            )
-
-    # -----------------------------------------------------
-    # 将来の売買監視用
-    # -----------------------------------------------------
-
-    st.divider()
-    st.header("🔴 売却監視について")
-
-    st.info(
-        "Ver.3.8.2では実注文を行いません。"
-        "今後、保有銘柄を登録して、損切り・利確・25日線割れを"
-        "毎朝自動判定する機能へ発展させます。"
-    )
-
-else:
-    st.info(
-        "まず「📥 日経225の株価データを取得」を押してください。"
-    )
-
-st.divider()
 
 st.caption(
-    "Ver.3.8.2 / 仮想売買専用。証券会社への実注文は行いません。"
-)
-
-st.caption(
-    "過去データによるシミュレーションであり、"
-    "将来の利益を保証するものではありません。"
+    "日本株 10万円→100万円 AI投資アシスタント Ver.4.0 / 仮想売買専用"
 )

@@ -1018,7 +1018,7 @@ def fast_two_stage_search(data, mode, top_n=30):
             data,
             bool(p["MA"]),
             bool(p["出来高"]),
-            bool(p["2000円"]),
+            False,
             True,
             int(p["RSI"]),
             float(p["SL"]),

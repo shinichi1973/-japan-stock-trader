@@ -1390,7 +1390,6 @@ if not data.empty:
             f"🏆 総合1位："
             f"MA {best['MA']} / "
             f"出来高 {best['出来高']} / "
-            f"2000円 {best['2000円']} / "
             f"RSI≤{best['RSI']} / "
             f"SL {best['SL']} / "
             f"TP {best['TP']}\n\n"

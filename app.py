@@ -122,44 +122,91 @@ NIKKEI_URL = (
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_nikkei225():
     """
-    日経平均プロフィルの構成銘柄ページからコードを取得。
-    取得できない場合は、ユーザー入力へフォールバックする。
+    日経225公式構成銘柄ページから4桁/英数字コードを取得。
+    pandas.read_html()/lxmlには依存しません。
     """
-    tables = pd.read_html(NIKKEI_URL)
+    import urllib.request
+    from html.parser import HTMLParser
 
-    found = []
+    class NikkeiCodeParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.codes = []
+            self.in_td = False
 
-    for table in tables:
-        cols = [str(c) for c in table.columns]
-        code_col = None
+        def handle_starttag(self, tag, attrs):
+            if tag.lower() == "td":
+                self.in_td = True
 
-        for c in cols:
-            if "コード" in c:
-                code_col = c
-                break
+        def handle_endtag(self, tag):
+            if tag.lower() == "td":
+                self.in_td = False
 
-        if code_col is None:
-            continue
+        def handle_data(self, data):
+            if not self.in_td:
+                return
 
-        for x in table[code_col].astype(str):
-            x = x.strip().upper()
-            if x.endswith(".0"):
-                x = x[:-2]
-            if x and x not in found:
-                found.append(x)
+            text = data.strip().upper().replace("\xa0", "")
+            text = re.sub(r"\s+", "", text)
 
-    # 日本株コードとして妥当なものを残す
-    found = [
-        x for x in found
-        if 2 <= len(x) <= 5 and x.replace("A", "").isdigit()
+            # 現在の日経225には4桁コードだけでなく
+            # 285Aのような英字入りコードも存在するため対応。
+            if re.fullmatch(r"\d{4}[A-Z]?", text):
+                if text not in self.codes:
+                    self.codes.append(text)
+
+    urls = [
+        "https://indexes.nikkei.co.jp/en/nkave/index/component",
+        "https://indexes.nikkei.co.jp/nkave/index/component"
     ]
 
-    if len(found) < 200:
-        raise ValueError(
-            f"日経225銘柄を十分に取得できませんでした（{len(found)}銘柄）"
-        )
+    last_error = None
 
-    return found[:225]
+    for url in urls:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+                    )
+                }
+            )
+
+            with urllib.request.urlopen(
+                req,
+                timeout=20
+            ) as response:
+                html = response.read().decode(
+                    "utf-8",
+                    errors="ignore"
+                )
+
+            parser = NikkeiCodeParser()
+            parser.feed(html)
+
+            codes = list(dict.fromkeys(parser.codes))
+
+            # 公式ページのNikkei 225は225銘柄。
+            # ページ構造変更等で余分なコードが拾われる可能性があるため、
+            # 225前後の取得を確認する。
+            if len(codes) >= 220:
+                return codes[:225]
+
+            last_error = (
+                f"公式ページから取得できたコードが"
+                f"{len(codes)}銘柄でした。"
+            )
+
+        except Exception as e:
+            last_error = str(e)
+
+    raise RuntimeError(
+        "日経225公式ページから銘柄コードを取得できませんでした。"
+        f" {last_error or ''}"
+    )
+
 
 
 st.subheader("🇯🇵 バックテスト対象")

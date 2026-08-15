@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from zipfile import ZipFile
 
-st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5 FINAL RC1", page_icon="📈", layout="wide")
+st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5 FINAL RC2", page_icon="📈", layout="wide")
 
 STOCK_NAMES = {
     "7203":"トヨタ自動車","6758":"ソニーグループ","9984":"ソフトバンクグループ",
@@ -99,6 +99,22 @@ def market_info(m,d):
     return [("🔴 弱気",0,0),("🟠 やや弱気",35,.35),("⚪ 中立",60,.60),
             ("🟡 やや強気",85,.85),("🟢 強気",100,1.0)][p]
 
+def next_trade_date(index, dt):
+    """Return the next trading date actually available for this ticker."""
+    idx = pd.DatetimeIndex(index)
+    pos = idx.searchsorted(pd.Timestamp(dt), side="right")
+    return idx[pos] if pos < len(idx) else None
+
+
+def risk_factor_from_losses(losses):
+    return 0.30 if losses >= 9 else 0.50 if losses >= 7 else 1.00
+
+
+def is_blocked(dt, block_until, severe_block_until):
+    return ((block_until is not None and dt <= block_until) or
+            (severe_block_until is not None and dt <= severe_block_until))
+
+
 def confidence(s):
     if s["trades"]<8:return 1.0
     wr=s["wins"]/s["trades"]; pf=s["gp"]/s["gl"] if s["gl"] else 9.99
@@ -133,15 +149,17 @@ with st.sidebar:
     cooldown=st.number_input("4連敗後の新規BUY停止日数",5,30,10)
     risk_cooldown=st.number_input("9連敗後の新規BUY停止日数",5,45,15)
     severe_cooldown=st.number_input("10連敗後の新規BUY停止日数",10,60,20)
+    max_gap=st.slider("翌営業日寄付ギャップ許容（%）",1.0,10.0,5.0,0.5)
     use_liq=st.checkbox("過去5年平均売買代金TOP50を使用",True)
     universe=st.text_area("分析対象銘柄コード",DEFAULT)
     held=st.text_area("現在保有している銘柄コード","")
     entries=st.text_area("取得単価（例：7203:1500）","")
 
-st.title("📈 日本株 AI投資アシスタント Ver.5.5 FINAL RC1")
-st.caption("BUILD: VER5.5-FINAL-RC1-20260815")
+st.title("📈 日本株 AI投資アシスタント Ver.5.5 FINAL RC2")
+st.caption("RC2: シグナル生成・注文待ち・約定・保有管理を分離し、銘柄別次回取引日、重複注文、寄付ギャップ、連敗リスクを整理。")
+st.caption("BUILD: VER5.5-FINAL-RC2-20260815")
 st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認")
-st.caption("🛡️ RC1: BUYシグナルは翌営業日の寄付で仮想約定し、同日終値での自己約定を避けます。")
+st.caption("🛡️ RC2: シグナルは当日終値で確定し、銘柄ごとの次回取引日の寄付で仮想約定。寄付ギャップ急騰・急落は見送ります。")
 
 with st.spinner("🧠 裏側で5年間のAI分析・バックテストを実行中…"):
     data={t:stock_data(t) for t in tickers(universe)}
@@ -158,7 +176,10 @@ cash=float(initial); pos={}
 stats={t:{"trades":0,"wins":0,"gp":0.0,"gl":0.0,"recent_losses":0} for t in data}
 trades=[]; analyses=[]; equity=[]; losses=0; maxloss=0
 block_until=None; severe_block_until=None
+# Orders are keyed by the actual next trading day of each ticker.
+# pending_tickers prevents repeated orders for the same stock while an order is pending.
 pending_buys={}
+pending_tickers=set()
 dates=sorted(set(x for d in data.values() for x in d.index))
 
 for dt in dates:
@@ -166,17 +187,23 @@ for dt in dates:
     due = pending_buys.pop(dt, [])
     for order in due:
         t=order["ticker"]
+        pending_tickers.discard(t)
         if t not in data or dt not in data[t].index or t in pos:
             continue
         r=data[t].loc[dt]
         p=float(r.Open)
+        signal_close=float(order["signal_close"])
+        gap_pct=(p/signal_close-1)*100 if signal_close > 0 else 999.0
         if not np.isfinite(p) or p <= 0 or p >= 2000:
             continue
-        blocked=((block_until is not None and dt<=block_until) or
-                 (severe_block_until is not None and dt<=severe_block_until))
+        # Avoid chasing abnormal overnight gaps. The signal remains valid only
+        # when the next-open price is within the configured execution tolerance.
+        if abs(gap_pct) > order["max_gap_pct"]:
+            continue
+        blocked=is_blocked(dt, block_until, severe_block_until)
         if blocked or len(pos)>=maxpos or order["market_factor"]<=0:
             continue
-        risk_factor=0.30 if losses>=9 else 0.50 if losses>=7 else 1.00
+        risk_factor=risk_factor_from_losses(losses)
         budget=min(maxbuy,cash)*factor(order["score"])*risk_factor
         shares=int(budget/p)
         if shares<=0:
@@ -189,13 +216,14 @@ for dt in dates:
         trades.append({
             "日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY",
             "価格":p,"株数":shares,"損益":0,"損益率":0,
-            "理由":"Ver.5.5 RC1 AI BUY（翌営業日寄付約定）",
+            "理由":"Ver.5.5 RC2 AI BUY（翌営業日寄付約定）",
             "シグナル日":order["signal_date"],
             "テクニカルスコア":order["ts"],
             "総合AIスコア":order["score"],
             "銘柄実績信頼度":order["hc"],"市場判定":order["market_state"],
             "購入資金係数":factor(order["score"]),
-            "連敗リスク係数":risk_factor,"未来情報使用":False
+            "連敗リスク係数":risk_factor,"シグナル終値":signal_close,
+            "寄付ギャップ率":gap_pct,"未来情報使用":False
         })
 
     # 2) Existing positions are evaluated using today's close.
@@ -270,7 +298,7 @@ for dt in dates:
             "銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,
             "総合AIスコア":score,"売買代金TOP50":c in liq_codes,
             "RSI":float(r.RSI),"新規BUY停止":blocked,
-            "連敗リスク係数":0.30 if losses>=9 else 0.50 if losses>=7 else 1.00,
+            "連敗リスク係数":risk_factor_from_losses(losses),
             "未来情報使用":False
         })
         if not blocked and mf>0:
@@ -278,17 +306,21 @@ for dt in dates:
 
     cand.sort(reverse=True)
 
-    # Schedule BUY for the next date available for each ticker.
-    date_pos={d:i for i,d in enumerate(dates)}
-    next_dt=dates[date_pos[dt]+1] if date_pos[dt]+1<len(dates) else None
-    if next_dt is not None:
-        for score,t,ts,hc,ms,mp in cand:
-            if t in pending_buys:
-                continue
-            pending_buys.setdefault(next_dt,[]).append({
-                "ticker":t,"score":score,"ts":ts,"hc":hc,
-                "market_state":ms,"market_factor":mp,"signal_date":dt
-            })
+    # Schedule BUY for the actual next trading day of each ticker.
+    # This avoids a global-calendar mismatch when a ticker has a missing session.
+    for score,t,ts,hc,ms,mp in cand:
+        if t in pending_tickers:
+            continue
+        next_dt=next_trade_date(data[t].index, dt)
+        if next_dt is None:
+            continue
+        pending_buys.setdefault(next_dt,[]).append({
+            "ticker":t,"score":score,"ts":ts,"hc":hc,
+            "market_state":ms,"market_factor":mp,"signal_date":dt,
+            "signal_close":float(data[t].loc[dt].Close),
+            "max_gap_pct":max_gap
+        })
+        pending_tickers.add(t)
 
     hv=sum(float(data[t].loc[dt].Close)*q["shares"]
            for t,q in pos.items() if dt in data[t].index)
@@ -298,7 +330,7 @@ for dt in dates:
         "日付":dt,"現金":cash,"保有株評価額":hv,"総資産":cash+hv,
         "保有銘柄数":len(pos),"連敗数":losses,
         "新規BUY停止中":day_blocked,
-        "連敗リスク係数":0.30 if losses>=9 else 0.50 if losses>=7 else 1.00
+        "連敗リスク係数":risk_factor_from_losses(losses)
     })
 
 trades_df=pd.DataFrame(trades); analysis_df=pd.DataFrame(analyses); equity_df=pd.DataFrame(equity)
@@ -350,10 +382,10 @@ for t,q in pos.items():
                                "現在価格":p,"株数":q["shares"],"含み損益":upnl,"含み損益率":upct})
 open_positions_df=pd.DataFrame(open_positions)
 
-st.header("🛡️ Ver.5.5 RC1 モデル健全性")
+st.header("🛡️ Ver.5.5 RC2 モデル健全性")
 st.info(
-    "BUYはシグナル当日終値で判定し、翌営業日の寄付で仮想約定。"
-    "株価2,000円以上は除外、明けの明星は不使用、連敗ブレーキを継続しています。"
+    "BUYはシグナル当日終値で判定し、各銘柄の次回取引日の寄付で仮想約定。"
+    "株価2,000円以上は除外、明けの明星は不使用、連敗ブレーキと寄付ギャップ制御を継続しています。"
 )
 
 st.header("🟢 BUY")
@@ -375,7 +407,7 @@ if not open_positions_df.empty:
     st.header("📦 バックテスト終了時の未決済ポジション")
     st.dataframe(open_positions_df, use_container_width=True)
 
-summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ"],"結果":["5.5 FINAL RC1",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階"]})
+summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御"],"結果":["5.5 FINAL RC2",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり"]})
 stock_results=selltr.groupby(["コード","銘柄名"]).agg(トレード数=("損益","count"),勝ち=("損益",lambda x:(x>0).sum()),損益=("損益","sum"),平均損益=("損益","mean")).reset_index() if not selltr.empty else pd.DataFrame()
 files={"00_summary.csv":summary,"01_today_buy.csv":latest_df,"02_today_sell.csv":sell_candidates,"03_all_ai_analysis.csv":analysis_df,"04_trade_history.csv":trades_df,"05_equity_curve.csv":equity_df,"06_stock_results.csv":stock_results,"07_liquidity_top50.csv":liq,"08_holdings_check.csv":sell_df,"09_open_positions.csv":open_positions_df}
 buf=BytesIO()
@@ -383,6 +415,6 @@ with ZipFile(buf,"w") as z:
     for fn,df in files.items(): z.writestr(fn,csv_bytes(df))
 buf.seek(0)
 st.divider()
-st.download_button("📦 Ver.5.5 FINAL RC1 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_FINAL_RC1_all_analysis.zip","application/zip",use_container_width=True)
-st.caption("裏側の全分析・バックテスト結果をCSVでまとめたZIPです。BUYは翌営業日寄付約定モデルです。")
+st.download_button("📦 Ver.5.5 FINAL RC2 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_FINAL_RC2_all_analysis.zip","application/zip",use_container_width=True)
+st.caption("裏側の全分析・バックテスト結果をCSVでまとめたZIPです。BUYは銘柄ごとの次回取引日寄付約定モデルです。")
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

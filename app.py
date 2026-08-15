@@ -182,7 +182,7 @@ with st.sidebar:
     tp=st.slider("利確（%）",8.0,40.0,15.0,1.0)
     rlo=st.slider("RSI下限",25,60,40); rhi=st.slider("RSI上限",60,80,70)
     mintech=st.slider("最低テクニカルスコア",60,90,75)
-    minbuy_score=st.slider("BUY最低AIスコア",70,90,78)
+    minbuy_score=st.slider("BUY最低AIスコア",70,90,80)
     st.caption("RC2.3ではBUY条件を変えず、採用BUYの成績をスコア帯・銘柄期待値・市場環境別に検証します。")
     cooldown=st.number_input("4連敗後の新規BUY停止日数",5,30,10)
     risk_cooldown=st.number_input("9連敗後の新規BUY停止日数",5,45,15)
@@ -332,7 +332,7 @@ for dt in dates:
         score=base_score*qfactor
         blocked=((block_until is not None and dt<=block_until) or
                  (severe_block_until is not None and dt<=severe_block_until))
-        buy_reject = qblock or score < minbuy_score
+        buy_reject = qblock or score < 80
 
         analyses.append({
             "日付":dt,"コード":c,"銘柄名":name(t),"株価":p,
@@ -393,7 +393,7 @@ for t,d in data.items():
     qfactor,qblock,qreason,wr_hist,pf_hist,avg_hist=stock_quality(stats[t])
     base_score=ts*.55+hp*.30+mp*.15
     score=base_score*qfactor
-    if qblock or score < minbuy_score or mf<=0: continue
+    if qblock or score < 80 or mf<=0: continue
     latest.append({"コード":c,"銘柄名":name(t),"株価":p,"総合AIスコア":score,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄期待値係数":qfactor,"過去勝率":wr_hist*100,"過去PF":pf_hist,"過去平均損益":avg_hist,"市場判定":ms,"購入資金係数":factor(score),"RSI":float(r.RSI)})
 latest_df=pd.DataFrame(latest).sort_values("総合AIスコア",ascending=False) if latest else pd.DataFrame()
 
@@ -459,7 +459,7 @@ if not open_positions_df.empty:
     st.header("📦 バックテスト終了時の未決済ポジション")
     st.dataframe(open_positions_df, use_container_width=True)
 
-summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御","悪いBUY除外","BUY最低AIスコア","RC2.3 BUY検証"],"結果":["5.5 RC2.3",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり","銘柄別期待値フィルター","{}".format(minbuy_score),"スコア帯・期待値係数・市場環境別の実績分析"]})
+summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御","悪いBUY除外","BUY最低AIスコア","RC2.3 80点固定検証"],"結果":["5.5 RC2.3",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり","銘柄別期待値フィルター","{}".format(minbuy_score),"スコア帯・期待値係数・市場環境別の実績分析"]})
 stock_results=selltr.groupby(["コード","銘柄名"]).agg(トレード数=("損益","count"),勝ち=("損益",lambda x:(x>0).sum()),損益=("損益","sum"),平均損益=("損益","mean")).reset_index() if not selltr.empty else pd.DataFrame()
 # RC2.3 diagnostic: pair each completed SELL with its originating BUY and evaluate which BUY characteristics worked.
 buy_rows=trades_df[trades_df["売買"]=="BUY"].copy() if not trades_df.empty else pd.DataFrame()

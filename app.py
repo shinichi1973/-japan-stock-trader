@@ -39,6 +39,10 @@ def parse_entries(s):
             except: pass
     return d
 
+def csv_bytes(df):
+    if df is None: df = pd.DataFrame()
+    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
 @st.cache_data(ttl=3600)
 def stock_data(t, years=5):
     end=datetime.now(); start=end-timedelta(days=365*years+300)
@@ -113,7 +117,7 @@ with st.sidebar:
     entries=st.text_area("取得単価（例：7203:1500）","")
 
 st.title("📈 日本株 AI投資アシスタント Ver.5.4")
-st.caption("BUILD: VER5.4-CLEAN-20260814")
+st.caption("BUILD: VER5.4-CLEAN2-20260815")
 st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認")
 
 with st.spinner("🧠 裏側で5年間のAI分析・バックテストを実行中…"):
@@ -138,126 +142,96 @@ for dt in dates:
         reason="損切り" if pct<=-sl else "利確" if pct>=tp else "25日線割れ" if p<r.MA25 else None
         if reason:
             cash+=p*q["shares"]; s=stats[t]; s["trades"]+=1
-            if pnl>0:s["wins"]+=1;s["gp"]+=pnl;losses=0
+            if pnl>0: s["wins"]+=1; s["gp"]+=pnl; losses=0
             else:
-                s["gl"]+=abs(pnl);losses+=1;maxloss=max(maxloss,losses)
+                s["gl"]+=abs(pnl); losses+=1; maxloss=max(maxloss,losses)
                 if losses>=4:block_until=dt+pd.tseries.offsets.BDay(cooldown)
             trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":p,"株数":q["shares"],"損益":pnl,"損益率":pct,"理由":reason,"未来情報使用":False,"連敗数":losses})
             del pos[t]
 
     cand=[]
     for t,d in data.items():
-        if dt not in d.index or t in pos:continue
+        if dt not in d.index or t in pos: continue
         r=d.loc[dt]; p=float(r.Close); c=code(t)
-        if p>=2000 or (use_liq and c not in liq_codes):continue
+        if p>=2000 or (use_liq and c not in liq_codes): continue
         ts=tech(r,rlo,rhi)
-        if ts<mintech:continue
-        hc=confidence(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,dt)
-        score=ts*.55+hp*.30+mp*.15
+        if ts<mintech: continue
+        hc=confidence(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,dt); score=ts*.55+hp*.30+mp*.15
         blocked=block_until is not None and dt<=block_until
         analyses.append({"日付":dt,"コード":c,"銘柄名":name(t),"株価":p,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,"総合AIスコア":score,"売買代金TOP50":c in liq_codes,"RSI":float(r.RSI),"新規BUY停止":blocked,"未来情報使用":False})
-        if not blocked and mf>0:cand.append((score,t,ts,hc,ms))
+        if not blocked and mf>0: cand.append((score,t,ts,hc,ms))
     cand.sort(reverse=True)
     for score,t,ts,hc,ms in cand:
-        if len(pos)>=maxpos:break
+        if len(pos)>=maxpos: break
         p=float(data[t].loc[dt].Close); budget=min(maxbuy,cash)*factor(score); shares=int(budget/p)
-        if shares<=0:continue
+        if shares<=0: continue
         cost=shares*p
-        if cost>cash:continue
-        cash-=cost;pos[t]={"entry":p,"shares":shares}
+        if cost>cash: continue
+        cash-=cost; pos[t]={"entry":p,"shares":shares}
         trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":p,"株数":shares,"損益":0,"損益率":0,"理由":"Ver.5.4 AI BUY","テクニカルスコア":ts,"総合AIスコア":score,"銘柄実績信頼度":hc,"市場判定":ms,"購入資金係数":factor(score),"未来情報使用":False})
     hv=sum(float(data[t].loc[dt].Close)*q["shares"] for t,q in pos.items() if dt in data[t].index)
     equity.append({"日付":dt,"現金":cash,"保有株評価額":hv,"総資産":cash+hv,"保有銘柄数":len(pos),"連敗数":losses,"新規BUY停止中":block_until is not None and dt<=block_until})
 
 trades_df=pd.DataFrame(trades); analysis_df=pd.DataFrame(analyses); equity_df=pd.DataFrame(equity)
 
-# 現在のBUY候補
 latest=[]
 for t,d in data.items():
     r=d.iloc[-1]; p=float(r.Close); c=code(t)
-    if p>=2000 or (use_liq and c not in liq_codes):continue
+    if p>=2000 or (use_liq and c not in liq_codes): continue
     ts=tech(r,rlo,rhi)
-    if ts<mintech:continue
-    hc=confidence(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,d.index[-1])
-    score=ts*.55+hp*.30+mp*.15
+    if ts<mintech: continue
+    hc=confidence(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,d.index[-1]); score=ts*.55+hp*.30+mp*.15
     latest.append({"コード":c,"銘柄名":name(t),"株価":p,"総合AIスコア":score,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"市場判定":ms,"購入資金係数":factor(score),"RSI":float(r.RSI)})
 latest_df=pd.DataFrame(latest).sort_values("総合AIスコア",ascending=False) if latest else pd.DataFrame()
 
-# 保有SELL
 ep=parse_entries(entries); sell=[]
 for c in parse_codes(held):
     t=c+".T"
-    if t not in data:continue
+    if t not in data: continue
     r=data[t].iloc[-1]; p=float(r.Close); alerts=[]
-    if p<r.MA25:alerts.append("25日線下")
-    if r.MA25<r.MA75:alerts.append("25日線<75日線")
-    if r.MA25_Slope<0:alerts.append("25日線下降")
-    if tech(r,rlo,rhi)<60:alerts.append("AIスコア低下")
-    if c in ep and (p/ep[c]-1)*100<=-sl:alerts.append("損切りライン")
+    if p<r.MA25: alerts.append("25日線下")
+    if r.MA25<r.MA75: alerts.append("25日線<75日線")
+    if r.MA25_Slope<0: alerts.append("25日線下降")
+    if tech(r,rlo,rhi)<60: alerts.append("AIスコア低下")
+    if c in ep and (p/ep[c]-1)*100<=-sl: alerts.append("損切りライン")
     sell.append({"コード":c,"銘柄名":name(t),"現在価格":p,"AIスコア":tech(r,rlo,rhi),"判定":"SELL" if len(alerts)>=3 else "SELL注意" if alerts else "保有継続","警戒理由":" / ".join(alerts)})
+sell_df=pd.DataFrame(sell); sell_candidates=sell_df[sell_df["判定"].isin(["SELL","SELL注意"])] if not sell_df.empty else pd.DataFrame()
 
-sell_df=pd.DataFrame(sell)
-sell_candidates=sell_df[sell_df["判定"].isin(["SELL","SELL注意"])] if not sell_df.empty else pd.DataFrame()
-
-# 統計
 if not equity_df.empty and "総資産" in equity_df.columns:
-    equity_df["総資産"] = pd.to_numeric(equity_df["総資産"], errors="coerce").fillna(initial)
-    final = float(equity_df["総資産"].iloc[-1])
-    equity_df["最高資産"] = equity_df["総資産"].cummax()
-    equity_df["DD"] = equity_df["総資産"] - equity_df["最高資産"]
-    equity_df["DD率"] = np.where(
-        equity_df["最高資産"] != 0,
-        equity_df["DD"] / equity_df["最高資産"] * 100,
-        0.0
-    )
-    maxdd = float(equity_df["DD"].min())
-    maxddrate = float(equity_df["DD率"].min())
+    equity_df["総資産"]=pd.to_numeric(equity_df["総資産"],errors="coerce").fillna(initial); final=float(equity_df["総資産"].iloc[-1]); equity_df["最高資産"]=equity_df["総資産"].cummax(); equity_df["DD"]=equity_df["総資産"]-equity_df["最高資産"]; equity_df["DD率"]=np.where(equity_df["最高資産"]!=0,equity_df["DD"]/equity_df["最高資産"]*100,0.0); maxdd=float(equity_df["DD"].min()); maxddrate=float(equity_df["DD率"].min())
 else:
-    equity_df = pd.DataFrame(columns=["日付","現金","保有株評価額","総資産","保有銘柄数","連敗数","新規BUY停止中"])
-    final = float(initial)
-    maxdd = 0.0
-    maxddrate = 0.0
+    equity_df=pd.DataFrame(columns=["日付","現金","保有株評価額","総資産","保有銘柄数","連敗数","新規BUY停止中"]); final=float(initial); maxdd=0.0; maxddrate=0.0
 
-profit = final - initial
-ret = profit / initial * 100 if initial else 0.0
+profit=final-initial; ret=profit/initial*100 if initial else 0.0
 selltr=trades_df[trades_df["売買"]=="SELL"] if not trades_df.empty else pd.DataFrame()
 winrate=(selltr["損益"]>0).mean()*100 if not selltr.empty else 0
 gp=selltr.loc[selltr["損益"]>0,"損益"].sum() if not selltr.empty else 0
 gl=abs(selltr.loc[selltr["損益"]<0,"損益"].sum()) if not selltr.empty else 0
 pf=gp/gl if gl else 0
 
-# 表側はシンプル
 st.header("🟢 BUY")
-if latest_df.empty:
-    st.info("💤 今日は買わない日です。")
+if latest_df.empty: st.info("💤 今日は買わない日です。")
 else:
     for i,(_,r) in enumerate(latest_df.head(3).iterrows()):
-        rank=["🥇","🥈","🥉"][i]
-        st.success(f"{rank} **{r['銘柄名']}（{r['コード']}）**　AI {r['総合AIスコア']:.0f}点　購入目安 ¥{maxbuy*r['購入資金係数']:,.0f}")
+        rank=["🥇","🥈","🥉"][i]; st.success(f"{rank} **{r['銘柄名']}（{r['コード']}）**　AI {r['総合AIスコア']:.0f}点　購入目安 ¥{maxbuy*r['購入資金係数']:,.0f}")
 
 st.header("🔴 SELL")
-if sell_candidates.empty:
-    st.success("🟢 現在、明確な売却候補はありません。")
+if sell_candidates.empty: st.success("🟢 現在、明確な売却候補はありません。")
 else:
-    for _,r in sell_candidates.iterrows():
-        st.error(f"🔴 **{r['銘柄名']}（{r['コード']}）** → {r['判定']}　{r['警戒理由']}")
+    for _,r in sell_candidates.iterrows(): st.error(f"🔴 **{r['銘柄名']}（{r['コード']}）** → {r['判定']}　{r['警戒理由']}")
 
 st.header("💤 今日の判断")
-if latest_df.empty or float(latest_df.iloc[0]["総合AIスコア"])<75:
-    st.info("今日は積極的なBUYを見送ります。")
-else:
-    st.success("BUY候補があります。無理のない金額で最終判断してください。")
+if latest_df.empty or float(latest_df.iloc[0]["総合AIスコア"])<75: st.info("今日は積極的なBUYを見送ります。")
+else: st.success("BUY候補があります。無理のない金額で最終判断してください。")
 
-# ZIP
 summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY"],"結果":["5.4",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外"]})
 stock_results=selltr.groupby(["コード","銘柄名"]).agg(トレード数=("損益","count"),勝ち=("損益",lambda x:(x>0).sum()),損益=("損益","sum"),平均損益=("損益","mean")).reset_index() if not selltr.empty else pd.DataFrame()
 files={"00_summary.csv":summary,"01_today_buy.csv":latest_df,"02_today_sell.csv":sell_candidates,"03_all_ai_analysis.csv":analysis_df,"04_trade_history.csv":trades_df,"05_equity_curve.csv":equity_df,"06_stock_results.csv":stock_results,"07_liquidity_top50.csv":liq,"08_holdings_check.csv":sell_df}
 buf=BytesIO()
 with ZipFile(buf,"w") as z:
-    for fn,df in files.items():z.writestr(fn,csv_bytes(df))
+    for fn,df in files.items(): z.writestr(fn,csv_bytes(df))
 buf.seek(0)
-
 st.divider()
-st.download_button("📦 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_4_all_analysis.zip","application/zip",use_container_width=True)
+st.download_button("📦 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_4_CLEAN2_all_analysis.zip","application/zip",use_container_width=True)
 st.caption("裏側の全分析・バックテスト結果をCSVでまとめたZIPです。")
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

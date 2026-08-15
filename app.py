@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from zipfile import ZipFile
 
-st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.4", page_icon="📈", layout="wide")
+st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5", page_icon="📈", layout="wide")
 
 STOCK_NAMES = {
     "7203":"トヨタ自動車","6758":"ソニーグループ","9984":"ソフトバンクグループ",
@@ -101,6 +101,16 @@ def confidence(s):
 def conf_points(c): return float(np.clip((c-.65)/.50*100,0,100))
 def factor(s): return 1.0 if s>=85 else .85 if s>=75 else .70 if s>=65 else .50 if s>=55 else 0
 
+def recent_loss_penalty(s):
+    # Only uses trades already completed up to the current backtest date.
+    # 3+ consecutive losses on the same stock lowers its confidence modestly.
+    losses = int(s.get("recent_losses", 0))
+    if losses >= 3: return 0.82
+    if losses == 2: return 0.90
+    if losses == 1: return 0.96
+    return 1.00
+
+
 with st.sidebar:
     st.header("⚙️ 詳細設定")
     initial=st.number_input("初期資金（円）",10000,10000000,100000,10000)
@@ -111,13 +121,14 @@ with st.sidebar:
     rlo=st.slider("RSI下限",25,60,40); rhi=st.slider("RSI上限",60,80,70)
     mintech=st.slider("最低テクニカルスコア",60,90,75)
     cooldown=st.number_input("4連敗後の新規BUY停止日数",5,30,10)
+    severe_cooldown=st.number_input("10連敗後の新規BUY停止日数",10,60,20)
     use_liq=st.checkbox("過去5年平均売買代金TOP50を使用",True)
     universe=st.text_area("分析対象銘柄コード",DEFAULT)
     held=st.text_area("現在保有している銘柄コード","")
     entries=st.text_area("取得単価（例：7203:1500）","")
 
-st.title("📈 日本株 AI投資アシスタント Ver.5.4")
-st.caption("BUILD: VER5.4-CLEAN2-20260815")
+st.title("📈 日本株 AI投資アシスタント Ver.5.5")
+st.caption("BUILD: VER5.5-TEST1-20260815")
 st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認")
 
 with st.spinner("🧠 裏側で5年間のAI分析・バックテストを実行中…"):
@@ -131,21 +142,26 @@ if not liq.empty:
     liq["売買代金順位"]=liq.index+1; liq["売買代金TOP50"]=liq["売買代金順位"]<=50
 liq_codes=set(liq.loc[liq["売買代金TOP50"],"コード"]) if not liq.empty else set()
 
-cash=float(initial); pos={}; stats={t:{"trades":0,"wins":0,"gp":0.0,"gl":0.0} for t in data}
-trades=[]; analyses=[]; equity=[]; losses=0; maxloss=0; block_until=None
+cash=float(initial); pos={}; stats={t:{"trades":0,"wins":0,"gp":0.0,"gl":0.0,"recent_losses":0} for t in data}
+trades=[]; analyses=[]; equity=[]; losses=0; maxloss=0; block_until=None; severe_block_until=None
 dates=sorted(set(x for d in data.values() for x in d.index))
 
 for dt in dates:
     for t in list(pos):
         if dt not in data[t].index: continue
         r=data[t].loc[dt]; p=float(r.Close); q=pos[t]; pnl=(p-q["entry"])*q["shares"]; pct=(p/q["entry"]-1)*100
-        reason="損切り" if pct<=-sl else "利確" if pct>=tp else "25日線割れ" if p<r.MA25 else None
+        # MA25 exit is now a confirmed exit: price below MA25 plus either
+        # a falling MA25 or a clearly weakened technical score.
+        ma25_confirm = (p < r.MA25) and ((r.MA25_Slope < 0) or (tech(r,rlo,rhi) < 60))
+        reason="損切り" if pct<=-sl else "利確" if pct>=tp else "25日線割れ確認" if ma25_confirm else None
         if reason:
             cash+=p*q["shares"]; s=stats[t]; s["trades"]+=1
-            if pnl>0: s["wins"]+=1; s["gp"]+=pnl; losses=0
+            if pnl>0:
+                s["wins"]+=1; s["gp"]+=pnl; s["recent_losses"]=0; losses=0
             else:
-                s["gl"]+=abs(pnl); losses+=1; maxloss=max(maxloss,losses)
+                s["gl"]+=abs(pnl); s["recent_losses"]+=1; losses+=1; maxloss=max(maxloss,losses)
                 if losses>=4:block_until=dt+pd.tseries.offsets.BDay(cooldown)
+                if losses>=10:severe_block_until=dt+pd.tseries.offsets.BDay(severe_cooldown)
             trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":p,"株数":q["shares"],"損益":pnl,"損益率":pct,"理由":reason,"未来情報使用":False,"連敗数":losses})
             del pos[t]
 
@@ -156,21 +172,21 @@ for dt in dates:
         if p>=2000 or (use_liq and c not in liq_codes): continue
         ts=tech(r,rlo,rhi)
         if ts<mintech: continue
-        hc=confidence(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,dt); score=ts*.55+hp*.30+mp*.15
-        blocked=block_until is not None and dt<=block_until
-        analyses.append({"日付":dt,"コード":c,"銘柄名":name(t),"株価":p,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,"総合AIスコア":score,"売買代金TOP50":c in liq_codes,"RSI":float(r.RSI),"新規BUY停止":blocked,"未来情報使用":False})
+        hc=confidence(stats[t]) * recent_loss_penalty(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,dt); score=ts*.55+hp*.30+mp*.15
+        blocked=(block_until is not None and dt<=block_until) or (severe_block_until is not None and dt<=severe_block_until)
+        analyses.append({"日付":dt,"コード":c,"銘柄名":name(t),"株価":p,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,"総合AIスコア":score,"売買代金TOP50":c in liq_codes,"RSI":float(r.RSI),"新規BUY停止":blocked,"連敗リスク係数":0.50 if losses>=7 else 1.00,"未来情報使用":False})
         if not blocked and mf>0: cand.append((score,t,ts,hc,ms))
     cand.sort(reverse=True)
     for score,t,ts,hc,ms in cand:
         if len(pos)>=maxpos: break
-        p=float(data[t].loc[dt].Close); budget=min(maxbuy,cash)*factor(score); shares=int(budget/p)
+        p=float(data[t].loc[dt].Close); risk_factor=0.50 if losses>=7 else 1.00; budget=min(maxbuy,cash)*factor(score)*risk_factor; shares=int(budget/p)
         if shares<=0: continue
         cost=shares*p
         if cost>cash: continue
         cash-=cost; pos[t]={"entry":p,"shares":shares}
-        trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":p,"株数":shares,"損益":0,"損益率":0,"理由":"Ver.5.4 AI BUY","テクニカルスコア":ts,"総合AIスコア":score,"銘柄実績信頼度":hc,"市場判定":ms,"購入資金係数":factor(score),"未来情報使用":False})
+        trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":p,"株数":shares,"損益":0,"損益率":0,"理由":"Ver.5.4 AI BUY","テクニカルスコア":ts,"総合AIスコア":score,"銘柄実績信頼度":hc,"市場判定":ms,"購入資金係数":factor(score),"連敗リスク係数":0.50 if losses>=7 else 1.00,"未来情報使用":False})
     hv=sum(float(data[t].loc[dt].Close)*q["shares"] for t,q in pos.items() if dt in data[t].index)
-    equity.append({"日付":dt,"現金":cash,"保有株評価額":hv,"総資産":cash+hv,"保有銘柄数":len(pos),"連敗数":losses,"新規BUY停止中":block_until is not None and dt<=block_until})
+    equity.append({"日付":dt,"現金":cash,"保有株評価額":hv,"総資産":cash+hv,"保有銘柄数":len(pos),"連敗数":losses,"新規BUY停止中":blocked if "blocked" in locals() else False,"連敗リスク係数":0.50 if losses>=7 else 1.00})
 
 trades_df=pd.DataFrame(trades); analysis_df=pd.DataFrame(analyses); equity_df=pd.DataFrame(equity)
 
@@ -180,7 +196,7 @@ for t,d in data.items():
     if p>=2000 or (use_liq and c not in liq_codes): continue
     ts=tech(r,rlo,rhi)
     if ts<mintech: continue
-    hc=confidence(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,d.index[-1]); score=ts*.55+hp*.30+mp*.15
+    hc=confidence(stats[t]) * recent_loss_penalty(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,d.index[-1]); score=ts*.55+hp*.30+mp*.15
     latest.append({"コード":c,"銘柄名":name(t),"株価":p,"総合AIスコア":score,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"市場判定":ms,"購入資金係数":factor(score),"RSI":float(r.RSI)})
 latest_df=pd.DataFrame(latest).sort_values("総合AIスコア",ascending=False) if latest else pd.DataFrame()
 
@@ -189,7 +205,7 @@ for c in parse_codes(held):
     t=c+".T"
     if t not in data: continue
     r=data[t].iloc[-1]; p=float(r.Close); alerts=[]
-    if p<r.MA25: alerts.append("25日線下")
+    if p<r.MA25 and (r.MA25_Slope<0 or tech(r,rlo,rhi)<60): alerts.append("25日線割れ確認")
     if r.MA25<r.MA75: alerts.append("25日線<75日線")
     if r.MA25_Slope<0: alerts.append("25日線下降")
     if tech(r,rlo,rhi)<60: alerts.append("AIスコア低下")
@@ -224,7 +240,7 @@ st.header("💤 今日の判断")
 if latest_df.empty or float(latest_df.iloc[0]["総合AIスコア"])<75: st.info("今日は積極的なBUYを見送ります。")
 else: st.success("BUY候補があります。無理のない金額で最終判断してください。")
 
-summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY"],"結果":["5.4",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外"]})
+summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ"],"結果":["5.5",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/10段階"]})
 stock_results=selltr.groupby(["コード","銘柄名"]).agg(トレード数=("損益","count"),勝ち=("損益",lambda x:(x>0).sum()),損益=("損益","sum"),平均損益=("損益","mean")).reset_index() if not selltr.empty else pd.DataFrame()
 files={"00_summary.csv":summary,"01_today_buy.csv":latest_df,"02_today_sell.csv":sell_candidates,"03_all_ai_analysis.csv":analysis_df,"04_trade_history.csv":trades_df,"05_equity_curve.csv":equity_df,"06_stock_results.csv":stock_results,"07_liquidity_top50.csv":liq,"08_holdings_check.csv":sell_df}
 buf=BytesIO()
@@ -232,6 +248,6 @@ with ZipFile(buf,"w") as z:
     for fn,df in files.items(): z.writestr(fn,csv_bytes(df))
 buf.seek(0)
 st.divider()
-st.download_button("📦 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_4_CLEAN2_all_analysis.zip","application/zip",use_container_width=True)
+st.download_button("📦 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_TEST1_all_analysis.zip","application/zip",use_container_width=True)
 st.caption("裏側の全分析・バックテスト結果をCSVでまとめたZIPです。")
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

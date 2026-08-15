@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from zipfile import ZipFile
 
-st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5", page_icon="📈", layout="wide")
+st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5 TEST2", page_icon="📈", layout="wide")
 
 STOCK_NAMES = {
     "7203":"トヨタ自動車","6758":"ソニーグループ","9984":"ソフトバンクグループ",
@@ -114,21 +114,22 @@ def recent_loss_penalty(s):
 with st.sidebar:
     st.header("⚙️ 詳細設定")
     initial=st.number_input("初期資金（円）",10000,10000000,100000,10000)
-    maxpos=st.number_input("最大保有銘柄数",1,50,10)
+    maxpos=st.number_input("最大保有銘柄数",1,50,7)
     maxbuy=st.number_input("1銘柄最大購入額（円）",1000,1000000,10000,1000)
     sl=st.slider("損切り（%）",3.0,12.0,6.0,.5)
     tp=st.slider("利確（%）",8.0,40.0,15.0,1.0)
     rlo=st.slider("RSI下限",25,60,40); rhi=st.slider("RSI上限",60,80,70)
     mintech=st.slider("最低テクニカルスコア",60,90,75)
     cooldown=st.number_input("4連敗後の新規BUY停止日数",5,30,10)
+    risk_cooldown=st.number_input("9連敗後の新規BUY停止日数",5,45,15)
     severe_cooldown=st.number_input("10連敗後の新規BUY停止日数",10,60,20)
     use_liq=st.checkbox("過去5年平均売買代金TOP50を使用",True)
     universe=st.text_area("分析対象銘柄コード",DEFAULT)
     held=st.text_area("現在保有している銘柄コード","")
     entries=st.text_area("取得単価（例：7203:1500）","")
 
-st.title("📈 日本株 AI投資アシスタント Ver.5.5")
-st.caption("BUILD: VER5.5-TEST1-20260815")
+st.title("📈 日本株 AI投資アシスタント Ver.5.5 TEST2")
+st.caption("BUILD: VER5.5-TEST2-20260815")
 st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認")
 
 with st.spinner("🧠 裏側で5年間のAI分析・バックテストを実行中…"):
@@ -161,6 +162,7 @@ for dt in dates:
             else:
                 s["gl"]+=abs(pnl); s["recent_losses"]+=1; losses+=1; maxloss=max(maxloss,losses)
                 if losses>=4:block_until=dt+pd.tseries.offsets.BDay(cooldown)
+                if losses>=9:block_until=dt+pd.tseries.offsets.BDay(risk_cooldown)
                 if losses>=10:severe_block_until=dt+pd.tseries.offsets.BDay(severe_cooldown)
             trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":p,"株数":q["shares"],"損益":pnl,"損益率":pct,"理由":reason,"未来情報使用":False,"連敗数":losses})
             del pos[t]
@@ -174,19 +176,19 @@ for dt in dates:
         if ts<mintech: continue
         hc=confidence(stats[t]) * recent_loss_penalty(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,dt); score=ts*.55+hp*.30+mp*.15
         blocked=(block_until is not None and dt<=block_until) or (severe_block_until is not None and dt<=severe_block_until)
-        analyses.append({"日付":dt,"コード":c,"銘柄名":name(t),"株価":p,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,"総合AIスコア":score,"売買代金TOP50":c in liq_codes,"RSI":float(r.RSI),"新規BUY停止":blocked,"連敗リスク係数":0.50 if losses>=7 else 1.00,"未来情報使用":False})
+        analyses.append({"日付":dt,"コード":c,"銘柄名":name(t),"株価":p,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,"総合AIスコア":score,"売買代金TOP50":c in liq_codes,"RSI":float(r.RSI),"新規BUY停止":blocked,"連敗リスク係数":0.30 if losses>=9 else 0.50 if losses>=7 else 1.00,"未来情報使用":False})
         if not blocked and mf>0: cand.append((score,t,ts,hc,ms))
     cand.sort(reverse=True)
     for score,t,ts,hc,ms in cand:
         if len(pos)>=maxpos: break
-        p=float(data[t].loc[dt].Close); risk_factor=0.50 if losses>=7 else 1.00; budget=min(maxbuy,cash)*factor(score)*risk_factor; shares=int(budget/p)
+        p=float(data[t].loc[dt].Close); risk_factor=0.30 if losses>=9 else 0.50 if losses>=7 else 1.00; budget=min(maxbuy,cash)*factor(score)*risk_factor; shares=int(budget/p)
         if shares<=0: continue
         cost=shares*p
         if cost>cash: continue
         cash-=cost; pos[t]={"entry":p,"shares":shares}
-        trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":p,"株数":shares,"損益":0,"損益率":0,"理由":"Ver.5.4 AI BUY","テクニカルスコア":ts,"総合AIスコア":score,"銘柄実績信頼度":hc,"市場判定":ms,"購入資金係数":factor(score),"連敗リスク係数":0.50 if losses>=7 else 1.00,"未来情報使用":False})
+        trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":p,"株数":shares,"損益":0,"損益率":0,"理由":"Ver.5.4 AI BUY","テクニカルスコア":ts,"総合AIスコア":score,"銘柄実績信頼度":hc,"市場判定":ms,"購入資金係数":factor(score),"連敗リスク係数":0.30 if losses>=9 else 0.50 if losses>=7 else 1.00,"未来情報使用":False})
     hv=sum(float(data[t].loc[dt].Close)*q["shares"] for t,q in pos.items() if dt in data[t].index)
-    equity.append({"日付":dt,"現金":cash,"保有株評価額":hv,"総資産":cash+hv,"保有銘柄数":len(pos),"連敗数":losses,"新規BUY停止中":blocked if "blocked" in locals() else False,"連敗リスク係数":0.50 if losses>=7 else 1.00})
+    equity.append({"日付":dt,"現金":cash,"保有株評価額":hv,"総資産":cash+hv,"保有銘柄数":len(pos),"連敗数":losses,"新規BUY停止中":blocked if "blocked" in locals() else False,"連敗リスク係数":0.30 if losses>=9 else 0.50 if losses>=7 else 1.00})
 
 trades_df=pd.DataFrame(trades); analysis_df=pd.DataFrame(analyses); equity_df=pd.DataFrame(equity)
 
@@ -240,7 +242,7 @@ st.header("💤 今日の判断")
 if latest_df.empty or float(latest_df.iloc[0]["総合AIスコア"])<75: st.info("今日は積極的なBUYを見送ります。")
 else: st.success("BUY候補があります。無理のない金額で最終判断してください。")
 
-summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ"],"結果":["5.5",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/10段階"]})
+summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ"],"結果":["5.5 TEST2",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階"]})
 stock_results=selltr.groupby(["コード","銘柄名"]).agg(トレード数=("損益","count"),勝ち=("損益",lambda x:(x>0).sum()),損益=("損益","sum"),平均損益=("損益","mean")).reset_index() if not selltr.empty else pd.DataFrame()
 files={"00_summary.csv":summary,"01_today_buy.csv":latest_df,"02_today_sell.csv":sell_candidates,"03_all_ai_analysis.csv":analysis_df,"04_trade_history.csv":trades_df,"05_equity_curve.csv":equity_df,"06_stock_results.csv":stock_results,"07_liquidity_top50.csv":liq,"08_holdings_check.csv":sell_df}
 buf=BytesIO()
@@ -248,6 +250,6 @@ with ZipFile(buf,"w") as z:
     for fn,df in files.items(): z.writestr(fn,csv_bytes(df))
 buf.seek(0)
 st.divider()
-st.download_button("📦 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_TEST1_all_analysis.zip","application/zip",use_container_width=True)
+st.download_button("📦 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_TEST2_all_analysis.zip","application/zip",use_container_width=True)
 st.caption("裏側の全分析・バックテスト結果をCSVでまとめたZIPです。")
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

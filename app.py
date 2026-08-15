@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from zipfile import ZipFile
 
-st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5 RC2.1", page_icon="📈", layout="wide")
+st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5 RC2.2", page_icon="📈", layout="wide")
 
 STOCK_NAMES = {
     "7203":"トヨタ自動車","6758":"ソニーグループ","9984":"ソフトバンクグループ",
@@ -183,6 +183,7 @@ with st.sidebar:
     rlo=st.slider("RSI下限",25,60,40); rhi=st.slider("RSI上限",60,80,70)
     mintech=st.slider("最低テクニカルスコア",60,90,75)
     minbuy_score=st.slider("BUY最低AIスコア",70,90,78)
+    st.caption("RC2.2ではBUY条件を変えず、採用BUYの成績をスコア帯・銘柄期待値・市場環境別に検証します。")
     cooldown=st.number_input("4連敗後の新規BUY停止日数",5,30,10)
     risk_cooldown=st.number_input("9連敗後の新規BUY停止日数",5,45,15)
     severe_cooldown=st.number_input("10連敗後の新規BUY停止日数",10,60,20)
@@ -192,9 +193,9 @@ with st.sidebar:
     held=st.text_area("現在保有している銘柄コード","")
     entries=st.text_area("取得単価（例：7203:1500）","")
 
-st.title("📈 日本株 AI投資アシスタント Ver.5.5 RC2.1")
-st.caption("RC2.1: 悪いBUYを削る期待値フィルターを追加。銘柄別の過去PF・勝率・平均損益・直近連敗をBUY判断に反映します。")
-st.caption("BUILD: VER5.5-RC2.1-20260815")
+st.title("📈 日本株 AI投資アシスタント Ver.5.5 RC2.2")
+st.caption("RC2.2: 悪いBUYを削る期待値フィルターを追加。銘柄別の過去PF・勝率・平均損益・直近連敗をBUY判断に反映します。")
+st.caption("BUILD: VER5.5-RC2.2-20260815")
 st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認")
 st.caption("🛡️ RC2: シグナルは当日終値で確定し、銘柄ごとの次回取引日の寄付で仮想約定。寄付ギャップ急騰・急落は見送ります。")
 
@@ -258,6 +259,7 @@ for dt in dates:
             "テクニカルスコア":order["ts"],
             "総合AIスコア":order["score"],
             "銘柄実績信頼度":order["hc"],"市場判定":order["market_state"],
+            "銘柄期待値係数":order.get("qfactor",1.0),"過去勝率":order.get("wr_hist",0)*100,"過去PF":order.get("pf_hist",0),"過去平均損益":order.get("avg_hist",0),
             "購入資金係数":factor(order["score"]),
             "連敗リスク係数":risk_factor,"シグナル終値":signal_close,
             "寄付ギャップ率":gap_pct,"未来情報使用":False
@@ -363,7 +365,8 @@ for dt in dates:
             "ticker":t,"score":score,"ts":ts,"hc":hc,
             "market_state":ms,"market_factor":mp,"signal_date":dt,
             "signal_close":float(data[t].loc[dt].Close),
-            "max_gap_pct":max_gap
+            "max_gap_pct":max_gap,
+            "qfactor":qfactor,"wr_hist":wr_hist,"pf_hist":pf_hist,"avg_hist":avg_hist
         })
         pending_tickers.add(t)
 
@@ -431,10 +434,10 @@ for t,q in pos.items():
                                "現在価格":p,"株数":q["shares"],"含み損益":upnl,"含み損益率":upct})
 open_positions_df=pd.DataFrame(open_positions)
 
-st.header("🛡️ Ver.5.5 RC2.1 モデル健全性")
+st.header("🛡️ Ver.5.5 RC2.2 モデル健全性")
 st.info(
     "BUYはシグナル当日終値で判定し、各銘柄の次回取引日の寄付で仮想約定。"
-    "株価2,000円以上は除外、明けの明星は不使用。RC2.1では過去PF・勝率・平均損益・直近連敗で悪いBUYを追加除外します。"
+    "株価2,000円以上は除外、明けの明星は不使用。RC2.2では過去PF・勝率・平均損益・直近連敗で悪いBUYを追加除外します。"
 )
 
 st.header("🟢 BUY")
@@ -456,14 +459,41 @@ if not open_positions_df.empty:
     st.header("📦 バックテスト終了時の未決済ポジション")
     st.dataframe(open_positions_df, use_container_width=True)
 
-summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御","悪いBUY除外","BUY最低AIスコア"],"結果":["5.5 RC2.1",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり","銘柄別期待値フィルター","{}".format(minbuy_score)]})
+summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御","悪いBUY除外","BUY最低AIスコア","RC2.2 BUY検証"],"結果":["5.5 RC2.2",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり","銘柄別期待値フィルター","{}".format(minbuy_score),"スコア帯・期待値係数・市場環境別の実績分析"]})
 stock_results=selltr.groupby(["コード","銘柄名"]).agg(トレード数=("損益","count"),勝ち=("損益",lambda x:(x>0).sum()),損益=("損益","sum"),平均損益=("損益","mean")).reset_index() if not selltr.empty else pd.DataFrame()
-files={"00_summary.csv":summary,"01_today_buy.csv":latest_df,"02_today_sell.csv":sell_candidates,"03_all_ai_analysis.csv":analysis_df,"04_trade_history.csv":trades_df,"05_equity_curve.csv":equity_df,"06_stock_results.csv":stock_results,"07_liquidity_top50.csv":liq,"08_holdings_check.csv":sell_df,"09_open_positions.csv":open_positions_df}
+# RC2.2 diagnostic: pair each completed SELL with its originating BUY and evaluate which BUY characteristics worked.
+buy_rows=trades_df[trades_df["売買"]=="BUY"].copy() if not trades_df.empty else pd.DataFrame()
+sell_rows=trades_df[trades_df["売買"]=="SELL"].copy() if not trades_df.empty else pd.DataFrame()
+paired=[]
+if not buy_rows.empty and not sell_rows.empty:
+    active={}
+    for _,row in trades_df.sort_values("日付").iterrows():
+        key=row.get("コード")
+        if row.get("売買")=="BUY": active[key]=row
+        elif row.get("売買")=="SELL" and key in active:
+            b=active.pop(key); paired.append({
+                "コード":key,"銘柄名":row.get("銘柄名"),"BUY日":b.get("日付"),"SELL日":row.get("日付"),
+                "損益":row.get("損益",0),"損益率":row.get("損益率",0),"AIスコア":b.get("総合AIスコア",np.nan),
+                "テクニカルスコア":b.get("テクニカルスコア",np.nan),"銘柄期待値係数":b.get("銘柄期待値係数",1.0),
+                "過去勝率":b.get("過去勝率",0),"過去PF":b.get("過去PF",0),"過去平均損益":b.get("過去平均損益",0),
+                "市場判定":b.get("市場判定",""),"寄付ギャップ率":b.get("寄付ギャップ率",np.nan)})
+paired_df=pd.DataFrame(paired)
+if not paired_df.empty:
+    bins=[-np.inf,75,78,80,82,85,90,np.inf]; labels=["<75","75-78","78-80","80-82","82-85","85-90","90+"]
+    paired_df["AIスコア帯"]=pd.cut(paired_df["AIスコア"],bins=bins,labels=labels,right=False)
+    score_band=paired_df.groupby("AIスコア帯",observed=False).agg(
+        トレード数=("損益","count"),勝率=("損益",lambda x:(x>0).mean()*100),損益=("損益","sum"),平均損益=("損益","mean"),
+        PF=("損益",lambda x:x[x>0].sum()/abs(x[x<0].sum()) if (x<0).any() else 0)).reset_index()
+    q_band=paired_df.groupby("銘柄期待値係数",observed=False).agg(トレード数=("損益","count"),勝率=("損益",lambda x:(x>0).mean()*100),損益=("損益","sum"),平均損益=("損益","mean")).reset_index()
+    market_band=paired_df.groupby("市場判定",observed=False).agg(トレード数=("損益","count"),勝率=("損益",lambda x:(x>0).mean()*100),損益=("損益","sum"),平均損益=("損益","mean")).reset_index()
+else:
+    score_band=pd.DataFrame(); q_band=pd.DataFrame(); market_band=pd.DataFrame()
+files={"00_summary.csv":summary,"01_today_buy.csv":latest_df,"02_today_sell.csv":sell_candidates,"03_all_ai_analysis.csv":analysis_df,"04_trade_history.csv":trades_df,"05_equity_curve.csv":equity_df,"06_stock_results.csv":stock_results,"07_liquidity_top50.csv":liq,"08_holdings_check.csv":sell_df,"09_open_positions.csv":open_positions_df,"10_paired_buy_sell.csv":paired_df,"11_score_band_analysis.csv":score_band,"12_quality_factor_analysis.csv":q_band,"13_market_analysis.csv":market_band}
 buf=BytesIO()
 with ZipFile(buf,"w") as z:
     for fn,df in files.items(): z.writestr(fn,csv_bytes(df))
 buf.seek(0)
 st.divider()
-st.download_button("📦 Ver.5.5 RC2.1 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_RC2_1_all_analysis.zip","application/zip",use_container_width=True)
+st.download_button("📦 Ver.5.5 RC2.2 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_RC2_1_all_analysis.zip","application/zip",use_container_width=True)
 st.caption("裏側の全分析・バックテスト結果をCSVでまとめたZIPです。BUYは銘柄ごとの次回取引日寄付約定モデルです。")
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

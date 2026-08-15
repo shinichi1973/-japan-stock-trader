@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from zipfile import ZipFile
 
-st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5 FINAL RC2", page_icon="📈", layout="wide")
+st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5 RC2.1", page_icon="📈", layout="wide")
 
 STOCK_NAMES = {
     "7203":"トヨタ自動車","6758":"ソニーグループ","9984":"ソフトバンクグループ",
@@ -129,12 +129,48 @@ def factor(s): return 1.0 if s>=85 else .85 if s>=75 else .70 if s>=65 else .50 
 
 def recent_loss_penalty(s):
     # Only uses trades already completed up to the current backtest date.
-    # 3+ consecutive losses on the same stock lowers its confidence modestly.
     losses = int(s.get("recent_losses", 0))
     if losses >= 3: return 0.82
     if losses == 2: return 0.90
     if losses == 1: return 0.96
     return 1.00
+
+
+def stock_quality(s):
+    """Reject or down-weight stocks whose completed history is persistently poor.
+    Only completed trades available up to the current backtest date are used.
+    """
+    n = int(s.get("trades", 0))
+    wins = int(s.get("wins", 0))
+    gp = float(s.get("gp", 0.0)); gl = float(s.get("gl", 0.0))
+    recent = int(s.get("recent_losses", 0))
+    wr = wins / n if n else 0.0
+    pf = gp / gl if gl > 0 else (9.99 if gp > 0 else 0.0)
+    avg = (gp - gl) / n if n else 0.0
+
+    # Not enough completed evidence: do not punish a stock merely for being new.
+    if n < 8:
+        return 1.00, False, "実績不足（中立）", wr, pf, avg
+
+    # Hard filters: enough evidence exists that repeated poor results should stop BUY.
+    if n >= 12 and pf < 0.85 and avg < 0:
+        return 0.00, True, "過去PF不良・期待値マイナス", wr, pf, avg
+    if n >= 20 and wr < 0.30 and avg < 0:
+        return 0.00, True, "過去勝率不良・期待値マイナス", wr, pf, avg
+
+    # Soft penalties: keep good candidates alive but make bad history hard to pass.
+    q = 1.00
+    reason = "実績許容"
+    if pf < 0.95 or avg < 0:
+        q *= 0.78; reason = "過去実績を減点"
+    elif pf >= 1.20 and avg > 0 and wr >= 0.40:
+        q *= 1.08; reason = "過去実績を加点"
+    elif pf >= 1.00 and avg >= 0:
+        q *= 1.03; reason = "過去実績はプラス"
+    if recent >= 3:
+        q *= 0.88
+        reason += "・直近連敗"
+    return float(np.clip(q, 0.0, 1.08)), False, reason, wr, pf, avg
 
 
 with st.sidebar:
@@ -146,6 +182,7 @@ with st.sidebar:
     tp=st.slider("利確（%）",8.0,40.0,15.0,1.0)
     rlo=st.slider("RSI下限",25,60,40); rhi=st.slider("RSI上限",60,80,70)
     mintech=st.slider("最低テクニカルスコア",60,90,75)
+    minbuy_score=st.slider("BUY最低AIスコア",70,90,78)
     cooldown=st.number_input("4連敗後の新規BUY停止日数",5,30,10)
     risk_cooldown=st.number_input("9連敗後の新規BUY停止日数",5,45,15)
     severe_cooldown=st.number_input("10連敗後の新規BUY停止日数",10,60,20)
@@ -155,9 +192,9 @@ with st.sidebar:
     held=st.text_area("現在保有している銘柄コード","")
     entries=st.text_area("取得単価（例：7203:1500）","")
 
-st.title("📈 日本株 AI投資アシスタント Ver.5.5 FINAL RC2")
-st.caption("RC2: シグナル生成・注文待ち・約定・保有管理を分離し、銘柄別次回取引日、重複注文、寄付ギャップ、連敗リスクを整理。")
-st.caption("BUILD: VER5.5-FINAL-RC2-20260815")
+st.title("📈 日本株 AI投資アシスタント Ver.5.5 RC2.1")
+st.caption("RC2.1: 悪いBUYを削る期待値フィルターを追加。銘柄別の過去PF・勝率・平均損益・直近連敗をBUY判断に反映します。")
+st.caption("BUILD: VER5.5-RC2.1-20260815")
 st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認")
 st.caption("🛡️ RC2: シグナルは当日終値で確定し、銘柄ごとの次回取引日の寄付で仮想約定。寄付ギャップ急騰・急落は見送ります。")
 
@@ -288,20 +325,28 @@ for dt in dates:
         hc=confidence(stats[t])*recent_loss_penalty(stats[t])
         hp=conf_points(hc)
         ms,mp,mf=market_info(market,dt)
-        score=ts*.55+hp*.30+mp*.15
+        qfactor,qblock,qreason,wr_hist,pf_hist,avg_hist=stock_quality(stats[t])
+        base_score=ts*.55+hp*.30+mp*.15
+        score=base_score*qfactor
         blocked=((block_until is not None and dt<=block_until) or
                  (severe_block_until is not None and dt<=severe_block_until))
+        buy_reject = qblock or score < minbuy_score
 
         analyses.append({
             "日付":dt,"コード":c,"銘柄名":name(t),"株価":p,
             "テクニカルスコア":ts,"銘柄実績信頼度":hc,
             "銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,
-            "総合AIスコア":score,"売買代金TOP50":c in liq_codes,
+            "総合AIスコア":score,"元AIスコア":base_score,
+            "銘柄期待値係数":qfactor,"銘柄BUY除外":qblock,
+            "銘柄BUY判定理由":qreason,"過去勝率":wr_hist*100,
+            "過去PF":pf_hist,"過去平均損益":avg_hist,
+            "売買代金TOP50":c in liq_codes,
             "RSI":float(r.RSI),"新規BUY停止":blocked,
+            "BUY最低スコア未達":score < minbuy_score,
             "連敗リスク係数":risk_factor_from_losses(losses),
             "未来情報使用":False
         })
-        if not blocked and mf>0:
+        if not blocked and mf>0 and not buy_reject:
             cand.append((score,t,ts,hc,ms,mp))
 
     cand.sort(reverse=True)
@@ -341,8 +386,12 @@ for t,d in data.items():
     if p>=2000 or (use_liq and c not in liq_codes): continue
     ts=tech(r,rlo,rhi)
     if ts<mintech: continue
-    hc=confidence(stats[t]) * recent_loss_penalty(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,d.index[-1]); score=ts*.55+hp*.30+mp*.15
-    latest.append({"コード":c,"銘柄名":name(t),"株価":p,"総合AIスコア":score,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"市場判定":ms,"購入資金係数":factor(score),"RSI":float(r.RSI)})
+    hc=confidence(stats[t]) * recent_loss_penalty(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,d.index[-1])
+    qfactor,qblock,qreason,wr_hist,pf_hist,avg_hist=stock_quality(stats[t])
+    base_score=ts*.55+hp*.30+mp*.15
+    score=base_score*qfactor
+    if qblock or score < minbuy_score or mf<=0: continue
+    latest.append({"コード":c,"銘柄名":name(t),"株価":p,"総合AIスコア":score,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄期待値係数":qfactor,"過去勝率":wr_hist*100,"過去PF":pf_hist,"過去平均損益":avg_hist,"市場判定":ms,"購入資金係数":factor(score),"RSI":float(r.RSI)})
 latest_df=pd.DataFrame(latest).sort_values("総合AIスコア",ascending=False) if latest else pd.DataFrame()
 
 ep=parse_entries(entries); sell=[]
@@ -382,10 +431,10 @@ for t,q in pos.items():
                                "現在価格":p,"株数":q["shares"],"含み損益":upnl,"含み損益率":upct})
 open_positions_df=pd.DataFrame(open_positions)
 
-st.header("🛡️ Ver.5.5 RC2 モデル健全性")
+st.header("🛡️ Ver.5.5 RC2.1 モデル健全性")
 st.info(
     "BUYはシグナル当日終値で判定し、各銘柄の次回取引日の寄付で仮想約定。"
-    "株価2,000円以上は除外、明けの明星は不使用、連敗ブレーキと寄付ギャップ制御を継続しています。"
+    "株価2,000円以上は除外、明けの明星は不使用。RC2.1では過去PF・勝率・平均損益・直近連敗で悪いBUYを追加除外します。"
 )
 
 st.header("🟢 BUY")
@@ -407,7 +456,7 @@ if not open_positions_df.empty:
     st.header("📦 バックテスト終了時の未決済ポジション")
     st.dataframe(open_positions_df, use_container_width=True)
 
-summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御"],"結果":["5.5 FINAL RC2",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり"]})
+summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御","悪いBUY除外","BUY最低AIスコア"],"結果":["5.5 RC2.1",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり","銘柄別期待値フィルター","{}".format(minbuy_score)]})
 stock_results=selltr.groupby(["コード","銘柄名"]).agg(トレード数=("損益","count"),勝ち=("損益",lambda x:(x>0).sum()),損益=("損益","sum"),平均損益=("損益","mean")).reset_index() if not selltr.empty else pd.DataFrame()
 files={"00_summary.csv":summary,"01_today_buy.csv":latest_df,"02_today_sell.csv":sell_candidates,"03_all_ai_analysis.csv":analysis_df,"04_trade_history.csv":trades_df,"05_equity_curve.csv":equity_df,"06_stock_results.csv":stock_results,"07_liquidity_top50.csv":liq,"08_holdings_check.csv":sell_df,"09_open_positions.csv":open_positions_df}
 buf=BytesIO()
@@ -415,6 +464,6 @@ with ZipFile(buf,"w") as z:
     for fn,df in files.items(): z.writestr(fn,csv_bytes(df))
 buf.seek(0)
 st.divider()
-st.download_button("📦 Ver.5.5 FINAL RC2 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_FINAL_RC2_all_analysis.zip","application/zip",use_container_width=True)
+st.download_button("📦 Ver.5.5 RC2.1 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_RC2_1_all_analysis.zip","application/zip",use_container_width=True)
 st.caption("裏側の全分析・バックテスト結果をCSVでまとめたZIPです。BUYは銘柄ごとの次回取引日寄付約定モデルです。")
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

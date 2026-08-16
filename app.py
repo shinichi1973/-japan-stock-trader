@@ -61,7 +61,6 @@ def stock_data(t, years=5):
         delta=df.Close.diff(); gain=delta.clip(lower=0).rolling(14).mean()
         loss=(-delta.clip(upper=0)).rolling(14).mean(); rs=gain/loss.replace(0,np.nan)
         df["RSI"]=100-(100/(1+rs))
-        df=add_chart_features(df)
         return df.dropna()
     except:return pd.DataFrame()
 
@@ -79,134 +78,65 @@ def market_data():
     except:return pd.DataFrame()
 
 
-def atr14(df):
-    prev = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev).abs(),
-        (df["Low"] - prev).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(14).mean()
+@st.cache_data(ttl=3600)
+def overseas_data():
+    end=datetime.now(); start=end-timedelta(days=365*5+300)
+    symbols={"S&P500":"^GSPC","NASDAQ":"^IXIC","NYダウ":"^DJI",
+             "SOX":"^SOX","USDJPY":"USDJPY=X","米10年金利":"^TNX"}
+    out={}
+    for label,symbol in symbols.items():
+        try:
+            df=yf.download(symbol,start=start,end=end+timedelta(days=1),
+                           auto_adjust=False,progress=False,threads=False)
+            if not df.empty:
+                if isinstance(df.columns,pd.MultiIndex): df.columns=df.columns.get_level_values(0)
+                out[label]=pd.to_numeric(df["Close"],errors="coerce")
+        except Exception:
+            pass
+    return pd.concat(out,axis=1).sort_index().ffill() if out else pd.DataFrame()
 
-def add_chart_features(df):
-    out = df.copy()
-    out["ATR14"] = atr14(out)
-    out["High20"] = out["High"].rolling(20).max().shift(1)
-    out["Low20"] = out["Low"].rolling(20).min().shift(1)
-    out["Breakout20"] = (out["Close"] > out["High20"]) & (out["Volume"] > out["VOL20"] * 1.15)
-    out["Breakdown20"] = (out["Close"] < out["Low20"]) & (out["Volume"] > out["VOL20"] * 1.15)
-    out["Pullback"] = (
-        (out["Close"] > out["MA25"]) &
-        (out["MA25_Slope"] > 0) &
-        (out["Close"] <= out["MA25"] + out["ATR14"] * 1.5)
-    )
-    out["HH_HL"] = (out["High"] > out["High"].shift(5)) & (out["Low"] > out["Low"].shift(5))
-    out["LH_LL"] = (out["High"] < out["High"].shift(5)) & (out["Low"] < out["Low"].shift(5))
+def overseas_snapshot(overseas, dt):
+    base={"海外為替判定":"⚪ 海外データなし","海外為替係数":0.60,
+          "S&P500_5d":np.nan,"NASDAQ_5d":np.nan,"SOX_5d":np.nan,
+          "USDJPY_5d":np.nan,"US10Y_5d":np.nan}
+    if overseas.empty: return base
+    x=overseas[overseas.index<=pd.Timestamp(dt)]
+    if x.empty: return base
+    def r5(col):
+        if col not in x.columns: return np.nan
+        s=x[col].dropna()
+        return float((s.iloc[-1]/s.iloc[-6]-1)*100) if len(s)>=6 else np.nan
+    sp,nq,sox,fx,rate=[r5(c) for c in ["S&P500","NASDAQ","SOX","USDJPY","米10年金利"]]
+    us=(1 if np.isfinite(sp) and sp>0 else 0)+(1 if np.isfinite(nq) and nq>0 else 0)
+    sox_s=1 if np.isfinite(sox) and sox>0 else (-1 if np.isfinite(sox) and sox<0 else 0)
+    fx_s=1 if np.isfinite(fx) and fx>0 else (-1 if np.isfinite(fx) and fx<0 else 0)
+    rate_s=-1 if np.isfinite(rate) and rate>3 else (1 if np.isfinite(rate) and rate<-3 else 0)
+    raw=us*.35+sox_s*.20+fx_s*.30+rate_s*.15
+    factor=float(np.clip(.75+raw*.25,.45,1.15))
+    state="🟢 海外・為替 良好" if factor>=1.03 else "🟡 海外・為替 やや良好" if factor>=.90 else "⚪ 海外・為替 中立" if factor>=.72 else "🔴 海外・為替 注意"
+    return {"海外為替判定":state,"海外為替係数":factor,"S&P500_5d":sp,"NASDAQ_5d":nq,
+            "SOX_5d":sox,"USDJPY_5d":fx,"US10Y_5d":rate,"sox_score":float(sox_s),"fx_score":float(fx_s)}
 
-    low10 = out["Low"].rolling(10).min()
-    low25 = out["Low"].rolling(25).min()
-    first_low = low25.shift(10)
-    lows_close = ((low10 - first_low).abs() / first_low.replace(0, np.nan)) <= 0.04
-    out["DoubleBottom"] = lows_close & (out["Close"] > out["MA25"])
-
-    ema12 = out["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = out["Close"].ewm(span=26, adjust=False).mean()
-    out["MACD"] = ema12 - ema26
-    out["MACDSignal"] = out["MACD"].ewm(span=9, adjust=False).mean()
-    out["MACDHist"] = out["MACD"] - out["MACDSignal"]
-    return out
-
-def chart_score(r):
-    return float(min(
-        25,
-        (7 if bool(r.get("Breakout20", False)) else 0) +
-        (5 if bool(r.get("Pullback", False)) else 0) +
-        (4 if bool(r.get("HH_HL", False)) else 0) +
-        (4 if bool(r.get("DoubleBottom", False)) else 0) +
-        (3 if float(r.get("MACDHist", 0)) > 0 else 0)
-    ))
-
-def bearish_chart_score(r):
-    return float(min(
-        25,
-        (8 if bool(r.get("Breakdown20", False)) else 0) +
-        (6 if bool(r.get("WeakTrend", False)) else 0) +
-        (4 if bool(r.get("LH_LL", False)) else 0) +
-        (4 if float(r.get("MACDHist", 0)) < 0 else 0) +
-        (3 if float(r.get("Close", 0)) < float(r.get("MA75", 0)) else 0)
-    ))
-
-def pattern_labels(r):
-    labels = []
-    if bool(r.get("Breakout20", False)): labels.append("高値ブレイク")
-    if bool(r.get("Pullback", False)): labels.append("押し目")
-    if bool(r.get("DoubleBottom", False)): labels.append("W底候補")
-    if bool(r.get("HH_HL", False)): labels.append("高値安値切上げ")
-    return "・".join(labels) if labels else "明確な形なし"
-
-def bearish_labels(r):
-    labels = []
-    if bool(r.get("Breakdown20", False)): labels.append("安値割れ")
-    if bool(r.get("WeakTrend", False)): labels.append("下降トレンド")
-    if bool(r.get("LH_LL", False)): labels.append("高値安値切下げ")
-    if float(r.get("MACDHist", 0)) < 0: labels.append("MACD弱化")
-    return "・".join(labels) if labels else "警戒材料なし"
-
-def holding_period_label(r):
-    close = float(r.get("Close", 0) or 0)
-    atr = float(r.get("ATR14", 0) or 0)
-    vol_pct = atr / close * 100 if close > 0 else 5
-    s = chart_score(r)
-    if s >= 18 and float(r.get("MA75_Slope", 0)) > 0 and vol_pct < 4:
-        return "中短期：1～3週間"
-    if s >= 12 and float(r.get("MA25_Slope", 0)) > 0:
-        return "短期：3～10営業日"
-    return "短期：2～7営業日"
-
-def sell_deadline_label(r, entry_price=None, sl=6.0, tp=15.0):
-    close = float(r.get("Close", 0) or 0)
-    if entry_price and entry_price > 0:
-        pct = (close / entry_price - 1) * 100
-        if pct <= -sl:
-            return "原則：次の取引日まで"
-        if pct >= tp:
-            return "原則：早めに利益確定"
-    if bool(r.get("Breakdown20", False)):
-        return "原則：1～3営業日以内"
-    if bool(r.get("WeakTrend", False)) and float(r.get("MA25_Slope", 0)) < 0:
-        return "目安：5営業日以内"
-    return "目安：1～2週間以内"
-
-def current_news_snapshot(ticker):
-    # 現在のニュースだけ。過去バックテストのスコアには絶対に混入しない。
-    try:
-        items = yf.Ticker(ticker).news or []
-        positive = ["増益","上方修正","増配","自社株買い","受注","好調","最高益","成長","強気"]
-        negative = ["減益","下方修正","減配","赤字","不正","訴訟","業績悪化","懸念"]
-        score, titles = 0, []
-        for item in items[:15]:
-            content = item.get("content", {}) if isinstance(item, dict) else {}
-            title = str(item.get("title") or content.get("title") or "")
-            if not title:
-                continue
-            titles.append(title[:80])
-            if any(k in title for k in positive): score += 1
-            if any(k in title for k in negative): score -= 1
-        return float(np.clip(score, -3, 3)), len(titles), " / ".join(titles[:3])
-    except Exception:
-        return 0.0, 0, ""
+def sector_overseas_bonus(ticker,snap):
+    c=code(ticker)
+    semiconductor={"8035","6857","6146","6920","4063","6981"}
+    exporters={"7203","7267","6501","6503","6758","6594","6367","7741"}
+    financials={"8306","8316","8411","8766"}
+    bonus=0.0
+    if c in semiconductor: bonus += 4*snap.get("sox_score",0) if "sox_score" in snap else 0
+    elif c in exporters: bonus += 4*(1 if snap.get("USDJPY_5d",0)>0 else -1 if snap.get("USDJPY_5d",0)<0 else 0)
+    elif c in financials: bonus += 1.5*(1 if snap.get("US10Y_5d",0)<0 else -1 if snap.get("US10Y_5d",0)>0 else 0)
+    return float(np.clip(bonus,-6,6))
 
 def tech_components(r, lo, hi):
     return {
-        "MA25>MA75": 15 * int(r.MA25 > r.MA75),
-        "Close>MA200": 10 * int(r.Close > r.MA200),
-        "Close>MA25": 10 * int(r.Close > r.MA25),
-        "Volume>VOL20": 10 * int(r.Volume > r.VOL20),
-        "RSI": 10 * int(lo <= r.RSI <= hi),
+        "MA25>MA75": 20 * int(r.MA25 > r.MA75),
+        "Close>MA200": 20 * int(r.Close > r.MA200),
+        "Close>MA25": 15 * int(r.Close > r.MA25),
+        "Volume>VOL20": 15 * int(r.Volume > r.VOL20),
+        "RSI": 15 * int(lo <= r.RSI <= hi),
         "MA25_Slope": 10 * int(r.MA25_Slope > 0),
         "MA75_Slope": 5 * int(r.MA75_Slope > 0),
-        "ChartPattern": chart_score(r),
-        "MACD": 5 * int(r.MACDHist > 0),
     }
 
 def tech(r, lo, hi):
@@ -304,7 +234,6 @@ with st.sidebar:
     rlo=st.slider("RSI下限",25,60,40); rhi=st.slider("RSI上限",60,80,70)
     mintech=st.slider("最低テクニカルスコア",60,90,75)
     minbuy_score=st.slider("BUY最低AIスコア",70,90,80)
-    min_chart_score=st.slider("最低チャートスコア",0,20,8)
     st.caption("RC3ではBUY条件を変えず、採用BUYの成績をスコア帯・銘柄期待値・市場環境別に検証します。")
     cooldown=st.number_input("4連敗後の新規BUY停止日数",5,30,10)
     risk_cooldown=st.number_input("9連敗後の新規BUY停止日数",5,45,15)
@@ -317,14 +246,15 @@ with st.sidebar:
 
 st.title("📈 日本株 AI投資アシスタント Ver.5.5 RC3")
 st.caption("RC3: 悪いBUYを削る期待値フィルターを追加。銘柄別の過去PF・勝率・平均損益・直近連敗をBUY判断に反映します。")
-st.caption("BUILD: VER5.5-RC3-20260816")
-st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認｜株価2,000円以上はBUY対象外｜明けの明星は不使用")
+st.caption("BUILD: VER5.5-RC3-20260815")
+st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認｜米国市場・為替を裏側で評価")
 st.caption("🛡️ RC2: シグナルは当日終値で確定し、銘柄ごとの次回取引日の寄付で仮想約定。寄付ギャップ急騰・急落は見送ります。")
 
 with st.spinner("🧠 裏側で5年間のAI分析・バックテストを実行中…"):
     data={t:stock_data(t) for t in tickers(universe)}
     data={t:d for t,d in data.items() if not d.empty}
     market=market_data()
+    overseas=overseas_data()
 
 liq=pd.DataFrame([{"コード":code(t),"銘柄名":name(t),"平均売買代金":d.Turnover.mean(),"平均出来高":d.Volume.mean()} for t,d in data.items()])
 if not liq.empty:
@@ -381,7 +311,7 @@ for dt in dates:
             "テクニカルスコア":order["ts"],
             "総合AIスコア":order["score"],
             "銘柄実績信頼度":order["hc"],"市場判定":order["market_state"],
-            "銘柄期待値係数":order.get("qfactor",1.0),"過去勝率":order.get("wr_hist",0)*100,"過去PF":order.get("pf_hist",0),"過去平均損益":order.get("avg_hist",0),
+            "銘柄期待値係数":order.get("qfactor",1.0),"海外為替判定":order.get("overseas_state",""),"海外為替係数":order.get("overseas_factor",1.0),"海外補正":order.get("overseas_bonus",0.0),"過去勝率":order.get("wr_hist",0)*100,"過去PF":order.get("pf_hist",0),"過去平均損益":order.get("avg_hist",0),
             "購入資金係数":factor(order["score"]),
             "連敗リスク係数":risk_factor,"シグナル終値":signal_close,
             "寄付ギャップ率":gap_pct,"未来情報使用":False
@@ -443,15 +373,17 @@ for dt in dates:
             continue
 
         ts=tech(r,rlo,rhi)
-        if ts<mintech or chart_score(r)<min_chart_score:
+        if ts<mintech:
             continue
 
         hc=confidence(stats[t])*recent_loss_penalty(stats[t])
         hp=conf_points(hc)
         ms,mp,mf=market_info(market,dt)
+        osnap=overseas_snapshot(overseas,dt)
+        obonus=sector_overseas_bonus(t,osnap)
         qfactor,qblock,qreason,wr_hist,pf_hist,avg_hist=stock_quality(stats[t])
         base_score=ts*.55+hp*.30+mp*.15
-        score=base_score*qfactor
+        score=float(np.clip(base_score*qfactor+obonus,0,100))
         blocked=((block_until is not None and dt<=block_until) or
                  (severe_block_until is not None and dt<=severe_block_until))
         buy_threshold = 85 if ms == "🟡 やや強気" else 80
@@ -460,13 +392,13 @@ for dt in dates:
         analyses.append({
             "日付":dt,"コード":c,"銘柄名":name(t),"株価":p,
             "テクニカルスコア":ts,"銘柄実績信頼度":hc,
-            "銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,
+            "銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,"海外為替判定":osnap["海外為替判定"],"海外為替係数":osnap["海外為替係数"],"海外補正":obonus,
             "総合AIスコア":score,"元AIスコア":base_score,
             "銘柄期待値係数":qfactor,"銘柄BUY除外":qblock,
             "銘柄BUY判定理由":qreason,"過去勝率":wr_hist*100,
             "過去PF":pf_hist,"過去平均損益":avg_hist,
             "売買代金TOP50":c in liq_codes,
-            "RSI":float(r.RSI),"チャートスコア":chart_score(r),"チャート形状":pattern_labels(r),"想定保有期間":holding_period_label(r),"新規BUY停止":blocked,
+            "RSI":float(r.RSI),"新規BUY停止":blocked,"海外為替判定":osnap["海外為替判定"],"海外為替係数":osnap["海外為替係数"],"海外補正":obonus,
             "BUY最低スコア未達":score < minbuy_score,
             "連敗リスク係数":risk_factor_from_losses(losses),
             "未来情報使用":False
@@ -486,7 +418,7 @@ for dt in dates:
             continue
         pending_buys.setdefault(next_dt,[]).append({
             "ticker":t,"score":score,"ts":ts,"hc":hc,
-            "market_state":ms,"market_factor":mp,"signal_date":dt,
+            "market_state":ms,"market_factor":mp,"overseas_state":osnap["海外為替判定"],"overseas_factor":osnap["海外為替係数"],"overseas_bonus":obonus,"signal_date":dt,
             "signal_close":float(data[t].loc[dt].Close),
             "max_gap_pct":max_gap,
             "qfactor":qfactor,"wr_hist":wr_hist,"pf_hist":pf_hist,"avg_hist":avg_hist
@@ -513,12 +445,13 @@ for t,d in data.items():
     ts=tech(r,rlo,rhi)
     if ts<mintech: continue
     hc=confidence(stats[t]) * recent_loss_penalty(stats[t]); hp=conf_points(hc); ms,mp,mf=market_info(market,d.index[-1])
+    osnap=overseas_snapshot(overseas,d.index[-1]); obonus=sector_overseas_bonus(t,osnap)
     qfactor,qblock,qreason,wr_hist,pf_hist,avg_hist=stock_quality(stats[t])
     base_score=ts*.55+hp*.30+mp*.15
-    score=base_score*qfactor
+    score=float(np.clip(base_score*qfactor+obonus,0,100))
     buy_threshold = 85 if ms == "🟡 やや強気" else 80
     if qblock or score < buy_threshold or mf<=0: continue
-    latest.append({"コード":c,"銘柄名":name(t),"株価":p,"総合AIスコア":score,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄期待値係数":qfactor,"過去勝率":wr_hist*100,"過去PF":pf_hist,"過去平均損益":avg_hist,"市場判定":ms,"購入資金係数":factor(score),"RSI":float(r.RSI)})
+    latest.append({"コード":c,"銘柄名":name(t),"株価":p,"総合AIスコア":score,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄期待値係数":qfactor,"過去勝率":wr_hist*100,"過去PF":pf_hist,"過去平均損益":avg_hist,"市場判定":ms,"海外為替判定":osnap["海外為替判定"],"海外為替係数":osnap["海外為替係数"],"海外補正":obonus,"購入資金係数":factor(score),"RSI":float(r.RSI)})
 latest_df=pd.DataFrame(latest).sort_values("総合AIスコア",ascending=False) if latest else pd.DataFrame()
 
 ep=parse_entries(entries); sell=[]
@@ -526,27 +459,15 @@ for c in parse_codes(held):
     t=c+".T"
     if t not in data: continue
     r=data[t].iloc[-1]; p=float(r.Close); alerts=[]
-    entry_price=ep.get(c)
-    if entry_price and entry_price > 0:
-        pct=(p/entry_price-1)*100
-        if pct<=-sl: alerts.append("損切りライン")
-        if pct>=tp: alerts.append("利確到達")
-    if bool(r.get("Breakdown20",False)): alerts.append("安値割れ")
-    if p<r.MA25 and ((r.MA25_Slope<0) or (tech(r,rlo,rhi)<60)): alerts.append("25日線割れ確認")
+    if p<r.MA25 and (r.MA25_Slope<0 or tech(r,rlo,rhi)<60): alerts.append("25日線割れ確認")
     if r.MA25<r.MA75: alerts.append("25日線<75日線")
     if r.MA25_Slope<0: alerts.append("25日線下降")
-    if r.get("MACDHist",0)<0: alerts.append("MACD弱化")
-    bscore=bearish_chart_score(r)
-    judgment="SELL" if len(alerts)>=3 or bscore>=16 else ("SELL注意" if len(alerts)>=1 or bscore>=8 else "保有継続")
-    sell.append({
-        "コード":c,"銘柄名":name(t),"現在価格":p,"AIスコア":tech(r,rlo,rhi),
-        "弱気チャートスコア":bscore,"チャート警戒":bearish_labels(r),
-        "判定":judgment,"警戒理由":" / ".join(alerts),
-        "売却期限目安":sell_deadline_label(r,entry_price,sl,tp),
-        "含み損益率":((p/entry_price-1)*100 if entry_price else np.nan)
-    })
-sell_df=pd.DataFrame(sell)
-sell_candidates=sell_df[sell_df["判定"].isin(["SELL","SELL注意"])] if not sell_df.empty else pd.DataFrame()
+    if tech(r,rlo,rhi)<60: alerts.append("AIスコア低下")
+    osnap=overseas_snapshot(overseas,d.index[-1])
+    if osnap["海外為替係数"]<0.60: alerts.append("海外・為替環境悪化")
+    if c in ep and (p/ep[c]-1)*100<=-sl: alerts.append("損切りライン")
+    sell.append({"コード":c,"銘柄名":name(t),"現在価格":p,"AIスコア":tech(r,rlo,rhi),"判定":"SELL" if len(alerts)>=3 else "SELL注意" if alerts else "保有継続","警戒理由":" / ".join(alerts),"海外為替判定":osnap["海外為替判定"],"売却期限目安":"原則：次の1～3営業日以内" if len(alerts)>=2 else "目安：1～2週間以内"})
+sell_df=pd.DataFrame(sell); sell_candidates=sell_df[sell_df["判定"].isin(["SELL","SELL注意"])] if not sell_df.empty else pd.DataFrame()
 
 if not equity_df.empty and "総資産" in equity_df.columns:
     equity_df["総資産"]=pd.to_numeric(equity_df["総資産"],errors="coerce").fillna(initial); final=float(equity_df["総資産"].iloc[-1]); equity_df["最高資産"]=equity_df["総資産"].cummax(); equity_df["DD"]=equity_df["総資産"]-equity_df["最高資産"]; equity_df["DD率"]=np.where(equity_df["最高資産"]!=0,equity_df["DD"]/equity_df["最高資産"]*100,0.0); maxdd=float(equity_df["DD"].min()); maxddrate=float(equity_df["DD率"].min())
@@ -582,7 +503,7 @@ st.header("① 🟢 今日の買い候補 TOP3")
 if latest_df.empty: st.info("💤 今日は買わない日です。")
 else:
     for i,(_,r) in enumerate(latest_df.head(3).iterrows()):
-        rank=["🥇","🥈","🥉"][i]; st.success(f"{rank} **{r['銘柄名']}（{r['コード']}）**　AI {r['総合AIスコア']:.0f}点　｜保有目安 **{r.get('想定保有期間','短期：3～10営業日')}**")
+        rank=["🥇","🥈","🥉"][i]; st.success(f"{rank} **{r['銘柄名']}（{r['コード']}）**　AI {r['総合AIスコア']:.0f}点　｜海外環境 **{r.get('海外為替判定','中立')}**")
 
 st.header("② 🔴 もし保有していたら 売却 TOP3")
 if sell_candidates.empty: st.success("🟢 現在、明確な売却候補はありません。")
@@ -593,16 +514,13 @@ st.header("③ 📊 ロジック・処理結果分析")
 if latest_df.empty or float(latest_df.iloc[0]["総合AIスコア"])<75: st.info("今日は積極的なBUYを見送ります。")
 else: st.success("BUY候補があります。無理のない金額で最終判断してください。")
 
+if not open_positions_df.empty:
+    st.header("📦 バックテスト終了時の未決済ポジション")
+    st.dataframe(open_positions_df, use_container_width=True)
 
-news_rows=[]
-for _, rr in (latest_df.head(3).iterrows() if not latest_df.empty else []):
-    ns,nc,nt=current_news_snapshot(str(rr["コード"])+".T")
-    news_rows.append({"コード":rr["コード"],"ニューススコア":ns,"直近ニュース件数":nc,"ニュース要約":nt})
-current_news_df=pd.DataFrame(news_rows)
-
-summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御","悪いBUY除外","BUY最低AIスコア","RC2.5 80点固定検証"],"結果":["5.5 RC2.5",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり","銘柄別期待値フィルター","{}".format(minbuy_score),"スコア帯・期待値係数・市場環境別の実績分析"]})
+summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御","悪いBUY除外","BUY最低AIスコア","RC3 80点固定検証"],"結果":["5.5 RC3",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり","銘柄別期待値フィルター","{}".format(minbuy_score),"スコア帯・期待値係数・市場環境別の実績分析"]})
 stock_results=selltr.groupby(["コード","銘柄名"]).agg(トレード数=("損益","count"),勝ち=("損益",lambda x:(x>0).sum()),損益=("損益","sum"),平均損益=("損益","mean")).reset_index() if not selltr.empty else pd.DataFrame()
-# RC2.5 diagnostic: pair each completed SELL with its originating BUY and evaluate which BUY characteristics worked.
+# RC3 diagnostic: pair each completed SELL with its originating BUY and evaluate which BUY characteristics worked.
 buy_rows=trades_df[trades_df["売買"]=="BUY"].copy() if not trades_df.empty else pd.DataFrame()
 sell_rows=trades_df[trades_df["売買"]=="SELL"].copy() if not trades_df.empty else pd.DataFrame()
 paired=[]
@@ -629,7 +547,7 @@ if not paired_df.empty:
     market_band=paired_df.groupby("市場判定",observed=False).agg(トレード数=("損益","count"),勝率=("損益",lambda x:(x>0).mean()*100),損益=("損益","sum"),平均損益=("損益","mean")).reset_index()
 else:
     score_band=pd.DataFrame(); q_band=pd.DataFrame(); market_band=pd.DataFrame()
-files={"00_summary.csv":summary,"01_today_buy.csv":latest_df,"02_today_sell.csv":sell_candidates,"03_all_ai_analysis.csv":analysis_df,"04_trade_history.csv":trades_df,"05_equity_curve.csv":equity_df,"06_stock_results.csv":stock_results,"07_liquidity_top50.csv":liq,"08_holdings_check.csv":sell_df,"09_open_positions.csv":open_positions_df,"10_paired_buy_sell.csv":paired_df,"11_score_band_analysis.csv":score_band,"12_quality_factor_analysis.csv":q_band,"13_market_analysis.csv":market_band,"14_current_news.csv":current_news_df}
+files={"00_summary.csv":summary,"01_today_buy.csv":latest_df,"02_today_sell.csv":sell_candidates,"03_all_ai_analysis.csv":analysis_df,"04_trade_history.csv":trades_df,"05_equity_curve.csv":equity_df,"06_stock_results.csv":stock_results,"07_liquidity_top50.csv":liq,"08_holdings_check.csv":sell_df,"09_open_positions.csv":open_positions_df,"10_paired_buy_sell.csv":paired_df,"11_score_band_analysis.csv":score_band,"12_quality_factor_analysis.csv":q_band,"13_market_analysis.csv":market_band,"14_overseas_fx_analysis.csv":analysis_df}
 buf=BytesIO()
 with ZipFile(buf,"w") as z:
     for fn,df in files.items(): z.writestr(fn,csv_bytes(df))

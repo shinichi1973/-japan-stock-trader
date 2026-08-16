@@ -399,11 +399,14 @@ for dt in dates:
         obonus=sector_overseas_bonus(t,osnap)
         qfactor,qblock,qreason,wr_hist,pf_hist,avg_hist=stock_quality(stats[t])
         base_score=ts*.55+hp*.30+mp*.15
-        score=float(np.clip(base_score*qfactor+obonus,0,100))
+        raw_score=float(np.clip(base_score*qfactor+obonus,0,100))
+        score_band,score_conf=score_band_policy(raw_score,ms,osnap["海外為替係数"])
+        score=float(np.clip(raw_score*score_conf,0,100))
         blocked=((block_until is not None and dt<=block_until) or
                  (severe_block_until is not None and dt<=severe_block_until))
-        buy_threshold = 85 if ms == "🟡 やや強気" else 80
-        buy_reject = qblock or score < buy_threshold
+        buy_threshold = 86 if ms in ["⚪ 中立","🔴 やや弱気"] else (82 if ms == "🟡 やや強気" else 80)
+        overseas_block = osnap["海外為替係数"] < 0.50 and score < 86
+        buy_reject = qblock or score < buy_threshold or overseas_block
 
         analyses.append({
             "日付":dt,"コード":c,"銘柄名":name(t),"株価":p,
@@ -420,13 +423,13 @@ for dt in dates:
             "未来情報使用":False
         })
         if not blocked and mf>0 and not buy_reject:
-            cand.append((score,t,ts,hc,ms,mp))
+            cand.append((score,t,ts,hc,ms,mp,osnap["海外為替判定"],osnap["海外為替係数"],obonus,qfactor,wr_hist,pf_hist,avg_hist))
 
     cand.sort(reverse=True)
 
     # Schedule BUY for the actual next trading day of each ticker.
     # This avoids a global-calendar mismatch when a ticker has a missing session.
-    for score,t,ts,hc,ms,mp in cand:
+    for score,t,ts,hc,ms,mp,os_state,os_factor,os_bonus,qfactor,wr_hist,pf_hist,avg_hist in cand:
         if t in pending_tickers:
             continue
         next_dt=next_trade_date(data[t].index, dt)
@@ -434,7 +437,7 @@ for dt in dates:
             continue
         pending_buys.setdefault(next_dt,[]).append({
             "ticker":t,"score":score,"ts":ts,"hc":hc,
-            "market_state":ms,"market_factor":mp,"overseas_state":osnap["海外為替判定"],"overseas_factor":osnap["海外為替係数"],"overseas_bonus":obonus,"signal_date":dt,
+            "market_state":ms,"market_factor":mp,"overseas_state":os_state,"overseas_factor":os_factor,"overseas_bonus":os_bonus,"signal_date":dt,
             "signal_close":float(data[t].loc[dt].Close),
             "max_gap_pct":max_gap,
             "qfactor":qfactor,"wr_hist":wr_hist,"pf_hist":pf_hist,"avg_hist":avg_hist
@@ -481,7 +484,7 @@ for c in parse_codes(held):
     if r.MA25<r.MA75: alerts.append("25日線<75日線")
     if r.MA25_Slope<0: alerts.append("25日線下降")
     if tech(r,rlo,rhi)<60: alerts.append("AIスコア低下")
-    osnap=overseas_snapshot(overseas,d.index[-1])
+    osnap=overseas_snapshot(overseas,r.name)
     if osnap["海外為替係数"]<0.50: alerts.append("海外・為替環境悪化")
     if c in ep and (p/ep[c]-1)*100<=-sl: alerts.append("損切りライン")
     sell.append({"コード":c,"銘柄名":name(t),"現在価格":p,"AIスコア":tech(r,rlo,rhi),"判定":"SELL" if len(alerts)>=3 else "SELL注意" if alerts else "保有継続","警戒理由":" / ".join(alerts),"海外為替判定":osnap["海外為替判定"],"売却期限目安":"原則：次の1～3営業日以内" if len(alerts)>=2 else "目安：1～2週間以内"})

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from zipfile import ZipFile
 
-st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5 RC3", page_icon="📈", layout="wide")
+st.set_page_config(page_title="日本株 AI投資アシスタント Ver.5.5 RC3.1", page_icon="📈", layout="wide")
 
 STOCK_NAMES = {
     "7203":"トヨタ自動車","6758":"ソニーグループ","9984":"ソフトバンクグループ",
@@ -117,15 +117,31 @@ def overseas_snapshot(overseas, dt):
     return {"海外為替判定":state,"海外為替係数":factor,"S&P500_5d":sp,"NASDAQ_5d":nq,
             "SOX_5d":sox,"USDJPY_5d":fx,"US10Y_5d":rate,"sox_score":float(sox_s),"fx_score":float(fx_s)}
 
+def score_band_policy(score, market_state, overseas_factor):
+    if 82 <= score < 85:
+        band="82-85"
+    elif 80 <= score < 82:
+        band="80-82"
+    elif 85 <= score < 90:
+        band="85-90"
+    elif score >= 90:
+        band="90+"
+    else:
+        band="<80"
+    conf={"82-85":1.02,"85-90":0.98,"90+":0.99}.get(band,1.0)
+    if overseas_factor < 0.50:
+        conf *= 0.92
+    return band,float(conf)
+
 def sector_overseas_bonus(ticker,snap):
     c=code(ticker)
     semiconductor={"8035","6857","6146","6920","4063","6981"}
     exporters={"7203","7267","6501","6503","6758","6594","6367","7741"}
     financials={"8306","8316","8411","8766"}
     bonus=0.0
-    if c in semiconductor: bonus += 4*snap.get("sox_score",0) if "sox_score" in snap else 0
-    elif c in exporters: bonus += 4*(1 if snap.get("USDJPY_5d",0)>0 else -1 if snap.get("USDJPY_5d",0)<0 else 0)
-    elif c in financials: bonus += 1.5*(1 if snap.get("US10Y_5d",0)<0 else -1 if snap.get("US10Y_5d",0)>0 else 0)
+    if c in semiconductor: bonus += 1.5*snap.get("sox_score",0) if "sox_score" in snap else 0
+    elif c in exporters: bonus += 1.5*(1 if snap.get("USDJPY_5d",0)>0 else -1 if snap.get("USDJPY_5d",0)<0 else 0)
+    elif c in financials: bonus += 0.75*(1 if snap.get("US10Y_5d",0)<0 else -1 if snap.get("US10Y_5d",0)>0 else 0)
     return float(np.clip(bonus,-6,6))
 
 def tech_components(r, lo, hi):
@@ -244,10 +260,10 @@ with st.sidebar:
     held=st.text_area("現在保有している銘柄コード","")
     entries=st.text_area("取得単価（例：7203:1500）","")
 
-st.title("📈 日本株 AI投資アシスタント Ver.5.5 RC3")
+st.title("📈 日本株 AI投資アシスタント Ver.5.5 RC3.1")
 st.caption("RC3: 悪いBUYを削る期待値フィルターを追加。銘柄別の過去PF・勝率・平均損益・直近連敗をBUY判断に反映します。")
 st.caption("BUILD: VER5.5-RC3-20260815")
-st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認｜米国市場・為替を裏側で評価")
+st.caption("🌅 朝イチは「買う・売る・何もしない」だけを確認｜米国市場・為替を裏側で評価｜条件不足なら無理にBUYしません")
 st.caption("🛡️ RC2: シグナルは当日終値で確定し、銘柄ごとの次回取引日の寄付で仮想約定。寄付ギャップ急騰・急落は見送ります。")
 
 with st.spinner("🧠 裏側で5年間のAI分析・バックテストを実行中…"):
@@ -392,13 +408,13 @@ for dt in dates:
         analyses.append({
             "日付":dt,"コード":c,"銘柄名":name(t),"株価":p,
             "テクニカルスコア":ts,"銘柄実績信頼度":hc,
-            "銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,"海外為替判定":osnap["海外為替判定"],"海外為替係数":osnap["海外為替係数"],"海外補正":obonus,
+            "銘柄実績ポイント":hp,"市場判定":ms,"市場ポイント":mp,"海外為替判定":osnap["海外為替判定"],"海外為替係数":osnap["海外為替係数"],"海外補正":obonus,"AIスコア帯":score_band,"スコア信頼補正":score_conf,
             "総合AIスコア":score,"元AIスコア":base_score,
             "銘柄期待値係数":qfactor,"銘柄BUY除外":qblock,
             "銘柄BUY判定理由":qreason,"過去勝率":wr_hist*100,
             "過去PF":pf_hist,"過去平均損益":avg_hist,
             "売買代金TOP50":c in liq_codes,
-            "RSI":float(r.RSI),"新規BUY停止":blocked,"海外為替判定":osnap["海外為替判定"],"海外為替係数":osnap["海外為替係数"],"海外補正":obonus,
+            "RSI":float(r.RSI),"新規BUY停止":blocked,"海外為替判定":osnap["海外為替判定"],"海外為替係数":osnap["海外為替係数"],"海外補正":obonus,"AIスコア帯":score_band,"スコア信頼補正":score_conf,
             "BUY最低スコア未達":score < minbuy_score,
             "連敗リスク係数":risk_factor_from_losses(losses),
             "未来情報使用":False
@@ -448,10 +464,12 @@ for t,d in data.items():
     osnap=overseas_snapshot(overseas,d.index[-1]); obonus=sector_overseas_bonus(t,osnap)
     qfactor,qblock,qreason,wr_hist,pf_hist,avg_hist=stock_quality(stats[t])
     base_score=ts*.55+hp*.30+mp*.15
-    score=float(np.clip(base_score*qfactor+obonus,0,100))
-    buy_threshold = 85 if ms == "🟡 やや強気" else 80
+    raw_score=float(np.clip(base_score*qfactor+obonus,0,100))
+    score_band,score_conf=score_band_policy(raw_score,ms,osnap["海外為替係数"])
+    score=float(np.clip(raw_score*score_conf,0,100))
+    buy_threshold = 86 if ms in ["⚪ 中立","🔴 やや弱気"] else (82 if ms == "🟡 やや強気" else 80)
     if qblock or score < buy_threshold or mf<=0: continue
-    latest.append({"コード":c,"銘柄名":name(t),"株価":p,"総合AIスコア":score,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄期待値係数":qfactor,"過去勝率":wr_hist*100,"過去PF":pf_hist,"過去平均損益":avg_hist,"市場判定":ms,"海外為替判定":osnap["海外為替判定"],"海外為替係数":osnap["海外為替係数"],"海外補正":obonus,"購入資金係数":factor(score),"RSI":float(r.RSI)})
+    latest.append({"コード":c,"銘柄名":name(t),"株価":p,"総合AIスコア":score,"テクニカルスコア":ts,"銘柄実績信頼度":hc,"銘柄期待値係数":qfactor,"過去勝率":wr_hist*100,"過去PF":pf_hist,"過去平均損益":avg_hist,"市場判定":ms,"海外為替判定":osnap["海外為替判定"],"海外為替係数":osnap["海外為替係数"],"海外補正":obonus,"AIスコア帯":score_band,"スコア信頼補正":score_conf,"購入資金係数":factor(score),"RSI":float(r.RSI)})
 latest_df=pd.DataFrame(latest).sort_values("総合AIスコア",ascending=False) if latest else pd.DataFrame()
 
 ep=parse_entries(entries); sell=[]
@@ -464,7 +482,7 @@ for c in parse_codes(held):
     if r.MA25_Slope<0: alerts.append("25日線下降")
     if tech(r,rlo,rhi)<60: alerts.append("AIスコア低下")
     osnap=overseas_snapshot(overseas,d.index[-1])
-    if osnap["海外為替係数"]<0.60: alerts.append("海外・為替環境悪化")
+    if osnap["海外為替係数"]<0.50: alerts.append("海外・為替環境悪化")
     if c in ep and (p/ep[c]-1)*100<=-sl: alerts.append("損切りライン")
     sell.append({"コード":c,"銘柄名":name(t),"現在価格":p,"AIスコア":tech(r,rlo,rhi),"判定":"SELL" if len(alerts)>=3 else "SELL注意" if alerts else "保有継続","警戒理由":" / ".join(alerts),"海外為替判定":osnap["海外為替判定"],"売却期限目安":"原則：次の1～3営業日以内" if len(alerts)>=2 else "目安：1～2週間以内"})
 sell_df=pd.DataFrame(sell); sell_candidates=sell_df[sell_df["判定"].isin(["SELL","SELL注意"])] if not sell_df.empty else pd.DataFrame()
@@ -493,7 +511,7 @@ for t,q in pos.items():
                                "現在価格":p,"株数":q["shares"],"含み損益":upnl,"含み損益率":upct})
 open_positions_df=pd.DataFrame(open_positions)
 
-st.header("🛡️ Ver.5.5 RC3 モデル健全性")
+st.header("🛡️ Ver.5.5 RC3.1 モデル健全性")
 st.info(
     "BUYはシグナル当日終値で判定し、各銘柄の次回取引日の寄付で仮想約定。"
     "株価2,000円以上は除外、明けの明星は不使用。RC3では過去PF・勝率・平均損益・直近連敗で悪いBUYを追加除外します。"
@@ -553,6 +571,6 @@ with ZipFile(buf,"w") as z:
     for fn,df in files.items(): z.writestr(fn,csv_bytes(df))
 buf.seek(0)
 st.divider()
-st.download_button("📦 Ver.5.5 RC3 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_RC2_1_all_analysis.zip","application/zip",use_container_width=True)
+st.download_button("📦 Ver.5.5 RC3.1 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_RC2_1_all_analysis.zip","application/zip",use_container_width=True)
 st.caption("裏側の全分析・バックテスト結果をCSVでまとめたZIPです。BUYは銘柄ごとの次回取引日寄付約定モデルです。")
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

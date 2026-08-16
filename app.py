@@ -436,31 +436,6 @@ for t,q in pos.items():
                                "現在価格":p,"株数":q["shares"],"含み損益":upnl,"含み損益率":upct})
 open_positions_df=pd.DataFrame(open_positions)
 
-st.header("🛡️ Ver.5.5 RC2.5 モデル健全性")
-st.info(
-    "BUYはシグナル当日終値で判定し、各銘柄の次回取引日の寄付で仮想約定。"
-    "株価2,000円以上は除外、明けの明星は不使用。RC2.5では過去PF・勝率・平均損益・直近連敗で悪いBUYを追加除外します。"
-)
-
-st.header("🟢 BUY")
-if latest_df.empty: st.info("💤 今日は買わない日です。")
-else:
-    for i,(_,r) in enumerate(latest_df.head(3).iterrows()):
-        rank=["🥇","🥈","🥉"][i]; st.success(f"{rank} **{r['銘柄名']}（{r['コード']}）**　AI {r['総合AIスコア']:.0f}点　購入目安 ¥{maxbuy*r['購入資金係数']:,.0f}")
-
-st.header("🔴 SELL")
-if sell_candidates.empty: st.success("🟢 現在、明確な売却候補はありません。")
-else:
-    for _,r in sell_candidates.iterrows(): st.error(f"🔴 **{r['銘柄名']}（{r['コード']}）** → {r['判定']}　{r['警戒理由']}")
-
-st.header("💤 今日の判断")
-if latest_df.empty or float(latest_df.iloc[0]["総合AIスコア"])<75: st.info("今日は積極的なBUYを見送ります。")
-else: st.success("BUY候補があります。無理のない金額で最終判断してください。")
-
-if not open_positions_df.empty:
-    st.header("📦 バックテスト終了時の未決済ポジション")
-    st.dataframe(open_positions_df, use_container_width=True)
-
 summary=pd.DataFrame({"項目":["Ver","初期資金","最終資産","損益","損益率","決済トレード数","勝率","Profit Factor","最大DD","最大DD率","最大連続損失","明けの明星","株価2,000円以上BUY","25日線SELL","連敗ブレーキ","寄付ギャップ制御","悪いBUY除外","BUY最低AIスコア","RC2.5 80点固定検証"],"結果":["5.5 RC2.5",initial,final,profit,ret,len(selltr),winrate,pf,maxdd,maxddrate,maxloss,"不使用","除外","確認型","4/7/9/10段階","あり","銘柄別期待値フィルター","{}".format(minbuy_score),"スコア帯・期待値係数・市場環境別の実績分析"]})
 stock_results=selltr.groupby(["コード","銘柄名"]).agg(トレード数=("損益","count"),勝ち=("損益",lambda x:(x>0).sum()),損益=("損益","sum"),平均損益=("損益","mean")).reset_index() if not selltr.empty else pd.DataFrame()
 # RC2.5 diagnostic: pair each completed SELL with its originating BUY and evaluate which BUY characteristics worked.
@@ -495,7 +470,50 @@ buf=BytesIO()
 with ZipFile(buf,"w") as z:
     for fn,df in files.items(): z.writestr(fn,csv_bytes(df))
 buf.seek(0)
-st.divider()
-st.download_button("📦 Ver.5.5 RC2.5 全処理データをZIPでダウンロード",buf.getvalue(),"ver5_5_RC2_1_all_analysis.zip","application/zip",use_container_width=True)
-st.caption("裏側の全分析・バックテスト結果をCSVでまとめたZIPです。BUYは銘柄ごとの次回取引日寄付約定モデルです。")
+
+# ============================================================
+# 今日の表示画面：投資判断に必要な情報だけを3項目に限定
+# ============================================================
+
+# ① 今日の買い候補TOP3
+st.header("① 🟢 今日の買い候補 TOP3")
+if latest_df.empty:
+    st.info("本日は買い候補なし")
+else:
+    buy_top3 = latest_df.sort_values("総合AIスコア", ascending=False).head(3).reset_index(drop=True)
+    for i, r in buy_top3.iterrows():
+        rank = ["🥇", "🥈", "🥉"][i]
+        st.success(
+            f"{rank} **{r['銘柄名']}（{r['コード']}）**　AIスコア **{r['総合AIスコア']:.0f}点**"
+        )
+
+# ② もし保有していたら売却TOP3
+st.header("② 🔴 もし保有していたら 売却 TOP3")
+if sell_candidates.empty:
+    st.success("現在、売却候補なし")
+else:
+    sell_top3 = sell_candidates.copy()
+    sell_top3["_警戒数"] = sell_top3["警戒理由"].fillna("").apply(
+        lambda x: len([v for v in str(x).split(" / ") if v])
+    )
+    sell_top3 = sell_top3.sort_values(
+        ["_警戒数", "AIスコア"], ascending=[False, True]
+    ).head(3).reset_index(drop=True)
+    for i, r in sell_top3.iterrows():
+        rank = ["🥇", "🥈", "🥉"][i]
+        st.error(
+            f"{rank} **{r['銘柄名']}（{r['コード']}）**　{r['判定']}　AIスコア **{r['AIスコア']:.0f}点**"
+        )
+
+# ③ ロジック・処理結果分析用CSV
+st.header("③ 📊 ロジック・処理結果分析用CSV")
+st.caption("普段の画面には詳細分析を表示せず、必要な時だけ全分析データをダウンロードできます。")
+st.download_button(
+    "📥 分析用CSVをダウンロード",
+    buf.getvalue(),
+    "ver5_5_RC2_6_analysis.zip",
+    "application/zip",
+    use_container_width=True,
+)
+st.caption("ZIP内に、今日のBUY/SELL、AI分析、売買履歴、資産推移、銘柄別実績、スコア帯分析、市場環境分析などを収録。")
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

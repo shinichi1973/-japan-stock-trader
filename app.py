@@ -2232,7 +2232,7 @@ rc33_diagnostics = pd.DataFrame([
 ])
 
 st.subheader("🧪 RC3.3 検証ポイント")
-st.dataframe(rc33_diagnostics, use_container_width=True, hide_index=True)
+st.dataframe(rc33_diagnostics, width="stretch", hide_index=True)
 
 # =========================================================
 # ZIP
@@ -2326,7 +2326,7 @@ st.download_button(
     "ver5_5_RC3_3_CLEAN_all_analysis.zip",
     "application/zip",
     mime="application/zip",
-    use_container_width=True,
+    width="stretch",
 )
 
 st.caption(

@@ -7,7 +7,7 @@ from io import BytesIO
 from zipfile import ZipFile
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.8",
+    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.9",
     page_icon="📈",
     layout="wide"
 )
@@ -798,7 +798,7 @@ with st.sidebar:
 # メイン画面
 # =========================================================
 st.title(
-    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.8"
+    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.9"
 )
 
 st.caption(
@@ -2613,60 +2613,169 @@ except Exception:
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")
 
 
+
+
 # =========================================================
-# RC3.8 THREE-LAYER DECISION DASHBOARD
-# 通常BUY / 急騰WATCH / 過熱警戒
+# RC3.9 PRE-BUY DECISION ENGINE
+# 通常BUY / PRE-BUY / WATCH / 過熱警戒 / SELL
 # =========================================================
 
-st.title("📈 日本株AI意思決定システム Ver.5.5 RC3.8")
-st.caption("朝は結論だけ。通常BUY・急騰WATCH・過熱警戒を分離し、裏側では従来通り詳細検証。")
-st.caption("BUILD: VER5.5-RC3.8-20260821")
+st.title("📈 日本株AI意思決定システム Ver.5.5 RC3.9")
+st.caption("通常BUYの精度を守りながら、急騰初動をPRE-BUYとして先回り検知。")
+st.caption("BUILD: VER5.5-RC3.9-20260821")
 
 # ---------------------------------------------------------
-# 最新の通常BUY
+# PRE-BUY ENGINE
+# 目的：
+# 「急騰した後」を買うのではなく、
+# 急騰予兆 + トレンド改善 + 出来高継続 + RSI + 通常AI距離
+# が揃った銘柄を先行監視する。
 # ---------------------------------------------------------
-top_buy = latest_df.head(3).copy() if not latest_df.empty else pd.DataFrame()
+
+def rc39_num(row, key, default=np.nan):
+    try:
+        v = row.get(key, default)
+        return float(v) if pd.notna(v) else default
+    except Exception:
+        return default
+
+def rc39_prebuy_score(row):
+    """
+    PRE-BUYは通常BUYより一段手前の監視シグナル。
+    急騰予兆そのものだけでは加点しすぎない。
+    """
+    surge = rc39_num(row, "急騰予兆スコア", 0)
+    vol = rc39_num(row, "出来高倍率", 0)
+    rsi = rc39_num(row, "RSI", 50)
+    r5 = rc39_num(row, "5日騰落率", 0)
+    r10 = rc39_num(row, "10日騰落率", 0)
+
+    score = 0.0
+
+    # 急騰予兆の黄金ゾーン 70-84
+    if 70 <= surge < 85:
+        score += 40
+    elif 60 <= surge < 70:
+        score += 25
+    elif 50 <= surge < 60:
+        score += 12
+    elif surge >= 85:
+        # 85+ は過熱の可能性が高いためPRE-BUYにはしない
+        score -= 10
+
+    # 出来高の「継続的な異常」を評価
+    if vol >= 2.5:
+        score += 20
+    elif vol >= 1.8:
+        score += 15
+    elif vol >= 1.3:
+        score += 8
+
+    # RSIは上がっているが過熱しすぎていない領域を優先
+    if 50 <= rsi <= 68:
+        score += 15
+    elif 68 < rsi <= 75:
+        score += 5
+    elif rsi > 75:
+        score -= 8
+
+    # 短期モメンタム
+    if r5 > 0 and r10 > 0:
+        score += 10
+    elif r5 > 0:
+        score += 5
+
+    # 5日で既に+20%超は追いかけを抑制
+    if r5 >= 20:
+        score -= 10
+
+    return float(np.clip(score, 0, 100))
+
+def rc39_prebuy_state(score, surge):
+    if surge >= 85:
+        return "🔴 過熱警戒"
+    if score >= 70:
+        return "🔵 PRE-BUY"
+    if 70 <= surge < 85:
+        return "🟡 WATCH"
+    return "⚪ 通常監視"
 
 # ---------------------------------------------------------
-# 保有銘柄SELL
+# 急騰検証データから最新状態を生成
 # ---------------------------------------------------------
-top_sell = sell_candidates.head(3).copy() if not sell_candidates.empty else pd.DataFrame()
-
-# ---------------------------------------------------------
-# 急騰レーダー
-# 70-84: WATCH
-# 85+: OVERHEAT
-# ---------------------------------------------------------
-surge_latest = pd.DataFrame()
-surge_watch = pd.DataFrame()
-surge_hot = pd.DataFrame()
+prebuy_df = pd.DataFrame()
 
 try:
     if isinstance(surge_validation_df, pd.DataFrame) and not surge_validation_df.empty:
         tmp = surge_validation_df.copy()
+
         if "予兆日" in tmp.columns:
             tmp = tmp.sort_values(["コード", "予兆日"])
-        surge_latest = tmp.groupby("コード", as_index=False).tail(1)
 
-        if "急騰予兆スコア" in surge_latest.columns:
-            surge_watch = (
-                surge_latest[
-                    surge_latest["急騰予兆スコア"].between(
-                        70, 84.999999, inclusive="both"
-                    )
-                ]
-                .sort_values("急騰予兆スコア", ascending=False)
-                .head(3)
+        latest_surge = tmp.groupby("コード", as_index=False).tail(1).copy()
+
+        latest_surge["PRE-BUYスコア"] = latest_surge.apply(
+            rc39_prebuy_score, axis=1
+        )
+
+        latest_surge["PRE-BUY判定"] = latest_surge.apply(
+            lambda r: rc39_prebuy_state(
+                rc39_num(r, "PRE-BUYスコア", 0),
+                rc39_num(r, "急騰予兆スコア", 0)
+            ),
+            axis=1
+        )
+
+        # コード→名称
+        if "銘柄名" not in latest_surge.columns:
+            latest_surge["銘柄名"] = latest_surge["コード"].apply(
+                lambda x: name(str(x) + ".T")
             )
-            surge_hot = (
-                surge_latest[surge_latest["急騰予兆スコア"] >= 85]
-                .sort_values("急騰予兆スコア", ascending=False)
-                .head(3)
-            )
+
+        # PRE-BUY候補
+        prebuy_df = latest_surge[
+            latest_surge["PRE-BUY判定"] == "🔵 PRE-BUY"
+        ].copy()
+
+        prebuy_df = prebuy_df.sort_values(
+            ["PRE-BUYスコア", "急騰予兆スコア"],
+            ascending=False
+        ).head(10)
+
 except Exception:
-    surge_latest = pd.DataFrame()
-    surge_watch = pd.DataFrame()
-    surge_hot = pd.DataFrame()
+    prebuy_df = pd.DataFrame()
+
+# ---------------------------------------------------------
+# 通常BUY / SELL
+# ---------------------------------------------------------
+top_buy = latest_df.head(3).copy() if not latest_df.empty else pd.DataFrame()
+top_sell = sell_candidates.head(3).copy() if not sell_candidates.empty else pd.DataFrame()
+
+# WATCH / 過熱
+watch_df = pd.DataFrame()
+hot_df = pd.DataFrame()
+
+try:
+    if isinstance(surge_validation_df, pd.DataFrame) and not surge_validation_df.empty:
+        tmp2 = surge_validation_df.copy()
+        if "予兆日" in tmp2.columns:
+            tmp2 = tmp2.sort_values(["コード", "予兆日"])
+
+        latest2 = tmp2.groupby("コード", as_index=False).tail(1)
+
+        watch_df = latest2[
+            latest2["急騰予兆スコア"].between(
+                70, 84.999999, inclusive="both"
+            )
+        ].sort_values("急騰予兆スコア", ascending=False).head(5)
+
+        hot_df = latest2[
+            latest2["急騰予兆スコア"] >= 85
+        ].sort_values("急騰予兆スコア", ascending=False).head(5)
+
+except Exception:
+    watch_df = pd.DataFrame()
+    hot_df = pd.DataFrame()
 
 # ---------------------------------------------------------
 # 市場環境
@@ -2680,22 +2789,24 @@ except Exception:
     market_state, market_points, market_factor = "⚪ 中立", 60, 0.60
 
 # ---------------------------------------------------------
-# 今日の総合結論
-# 優先順位：
-# SELL警戒 > BUY > WATCH > 何もしない
+# 総合結論
+# SELL > BUY > PRE-BUY > WATCH > HOT > NOTHING
 # ---------------------------------------------------------
 if not top_sell.empty:
     today_decision = "🔴 保有銘柄を確認"
     decision_help = "売却警戒を最優先で確認してください。"
 elif not top_buy.empty:
     today_decision = "🟢 BUY候補あり"
-    decision_help = "通常AIの根拠が揃った銘柄です。"
-elif not surge_watch.empty:
+    decision_help = "通常AIのエントリー条件が成立しています。"
+elif not prebuy_df.empty:
+    today_decision = "🔵 PRE-BUY監視"
+    decision_help = "急騰初動の可能性があります。まだ飛び乗らず監視します。"
+elif not watch_df.empty:
     today_decision = "🟡 WATCH中心"
-    decision_help = "急騰予兆がありますが、まだBUYにはしません。"
-elif not surge_hot.empty:
+    decision_help = "変化を検知していますが、PRE-BUY条件には未到達です。"
+elif not hot_df.empty:
     today_decision = "🔴 過熱警戒"
-    decision_help = "急騰後の過熱可能性があるため追いかけません。"
+    decision_help = "急騰後の可能性があるため高値追いを避けます。"
 else:
     today_decision = "⚪ 今日は無理に買わない"
     decision_help = "条件不足です。現金を守ります。"
@@ -2708,21 +2819,23 @@ st.caption(
 )
 
 # ---------------------------------------------------------
-# 3層を一目で表示
+# 5段階を一目で
 # ---------------------------------------------------------
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4, c5 = st.columns(5)
 
 with c1:
     st.metric("🟢 BUY", len(top_buy))
-
 with c2:
-    st.metric("🟡 WATCH", len(surge_watch))
-
+    st.metric("🔵 PRE-BUY", len(prebuy_df))
 with c3:
-    st.metric("🔴 売却/過熱警戒", len(top_sell) + len(surge_hot))
+    st.metric("🟡 WATCH", len(watch_df))
+with c4:
+    st.metric("🔴 過熱", len(hot_df))
+with c5:
+    st.metric("🔴 SELL", len(top_sell))
 
 # ---------------------------------------------------------
-# ① 通常BUY
+# ① BUY
 # ---------------------------------------------------------
 st.header("① 🟢 BUY候補 TOP3")
 
@@ -2731,13 +2844,11 @@ if top_buy.empty:
 else:
     for i, (_, r) in enumerate(top_buy.iterrows()):
         rank = ["🥇", "🥈", "🥉"][i]
-
         st.success(
             f"{rank} **{r['銘柄名']}（{r['コード']}）** "
             f"AI **{r['総合AIスコア']:.0f}点** ｜ "
             f"株価 ¥{r['株価']:.0f}"
         )
-
         st.caption(
             f"テクニカル {r.get('テクニカルスコア', 0):.0f} ｜ "
             f"過去PF {r.get('過去PF', 0):.2f} ｜ "
@@ -2745,60 +2856,70 @@ else:
         )
 
 # ---------------------------------------------------------
-# ② 急騰WATCH
+# ② PRE-BUY
 # ---------------------------------------------------------
-st.header("② 🟡 急騰予兆 WATCH TOP3")
+st.header("② 🔵 PRE-BUY — 急騰初動候補")
 
-if surge_watch.empty:
-    st.info("現在、70～84点の先行監視銘柄はありません。")
+if prebuy_df.empty:
+    st.info("現在、PRE-BUY条件を満たす銘柄はありません。")
 else:
-    st.warning(
-        "⚠️ WATCHはBUYではありません。"
-        "出来高・値動きなどから変化を早期検知した銘柄です。"
+    st.info(
+        "🔵 PRE-BUYは『買い』ではありません。"
+        "急騰予兆70～84点に加え、出来高・RSI・短期モメンタムを確認した先行監視です。"
     )
 
-    for _, r in surge_watch.iterrows():
-        parts = [
-            f"予兆 **{r.get('急騰予兆スコア', 0):.0f}点**"
+    for _, r in prebuy_df.head(5).iterrows():
+        details = [
+            f"PRE-BUY **{r['PRE-BUYスコア']:.0f}点**",
+            f"急騰予兆 {r.get('急騰予兆スコア', 0):.0f}点"
         ]
 
-        if "5日騰落率" in r and pd.notna(r["5日騰落率"]):
-            parts.append(f"5日 {r['5日騰落率']:+.1f}%")
-
         if "出来高倍率" in r and pd.notna(r["出来高倍率"]):
-            parts.append(f"出来高 {r['出来高倍率']:.1f}倍")
+            details.append(f"出来高 {r['出来高倍率']:.1f}倍")
 
         if "RSI" in r and pd.notna(r["RSI"]):
-            parts.append(f"RSI {r['RSI']:.1f}")
+            details.append(f"RSI {r['RSI']:.1f}")
 
-        st.warning(
-            f"🟡 **{r['銘柄名']}（{r['コード']}）** ｜ "
-            + " ｜ ".join(parts)
+        if "5日騰落率" in r and pd.notna(r["5日騰落率"]):
+            details.append(f"5日 {r['5日騰落率']:+.1f}%")
+
+        st.info(
+            f"🔵 **{r['銘柄名']}（{r['コード']}）** ｜ "
+            + " ｜ ".join(details)
         )
 
 # ---------------------------------------------------------
-# ③ 過熱警戒
+# ③ WATCH
 # ---------------------------------------------------------
-st.header("③ 🔴 過熱警戒")
+st.header("③ 🟡 WATCH")
 
-if surge_hot.empty:
-    st.success("🔵 現在、急騰予兆85点以上の銘柄はありません。")
+if watch_df.empty:
+    st.success("現在、急騰予兆70～84点のWATCH銘柄はありません。")
 else:
-    st.error(
-        "急騰予兆が非常に強い銘柄です。"
-        "高値追いを避け、通常BUY条件が整うまで待ちます。"
-    )
-
-    for _, r in surge_hot.iterrows():
-        st.error(
-            f"🔴 **{r['銘柄名']}（{r['コード']}）** "
+    for _, r in watch_df.head(5).iterrows():
+        st.warning(
+            f"🟡 **{r['銘柄名']}（{r['コード']}）** "
             f"予兆 **{r.get('急騰予兆スコア', 0):.0f}点**"
         )
 
 # ---------------------------------------------------------
-# ④ 保有銘柄
+# ④ 過熱
 # ---------------------------------------------------------
-st.header("④ 🔴 保有銘柄の判断")
+st.header("④ 🔴 過熱警戒")
+
+if hot_df.empty:
+    st.success("現在、急騰予兆85点以上はありません。")
+else:
+    for _, r in hot_df.head(5).iterrows():
+        st.error(
+            f"🔴 **{r['銘柄名']}（{r['コード']}）** "
+            f"予兆 **{r.get('急騰予兆スコア', 0):.0f}点** → 高値追い回避"
+        )
+
+# ---------------------------------------------------------
+# ⑤ SELL
+# ---------------------------------------------------------
+st.header("⑤ 🔴 保有銘柄の判断")
 
 if top_sell.empty:
     st.success("🟢 明確な売却警戒はありません。")
@@ -2809,24 +2930,23 @@ else:
             f"→ **{r['判定']}** ｜ "
             f"{r.get('売却期限目安', '1～3営業日以内')}"
         )
-
         if r.get("警戒理由"):
             st.caption(r["警戒理由"])
 
 # ---------------------------------------------------------
 # 詳細分析
 # ---------------------------------------------------------
-with st.expander("🔍 詳細分析・検証データ", expanded=False):
+with st.expander("🔍 詳細分析・PRE-BUY検証", expanded=False):
 
-    st.subheader("📊 通常AI BUY")
-    if not top_buy.empty:
-        st.dataframe(top_buy, use_container_width=True)
+    st.subheader("PRE-BUY候補")
+    if not prebuy_df.empty:
+        st.dataframe(prebuy_df, use_container_width=True)
     else:
-        st.info("BUY候補なし")
+        st.info("PRE-BUY候補なし")
 
-    st.subheader("🚨 急騰予兆検証")
+    st.subheader("急騰予兆の過去実績")
     if not surge_validation_df.empty:
-        surge_cols = [
+        cols = [
             c for c in [
                 "コード", "銘柄名", "予兆日", "急騰予兆スコア",
                 "急騰予兆判定", "5日騰落率", "10日騰落率",
@@ -2837,19 +2957,17 @@ with st.expander("🔍 詳細分析・検証データ", expanded=False):
         ]
 
         st.dataframe(
-            surge_validation_df[surge_cols]
+            surge_validation_df[cols]
             .sort_values("急騰予兆スコア", ascending=False)
-            .head(200),
+            .head(300),
             use_container_width=True
         )
 
-        if not surge_band_df.empty:
-            st.subheader("急騰予兆スコア帯別実績")
-            st.dataframe(surge_band_df, use_container_width=True)
-    else:
-        st.info("急騰予兆データなし")
+    if not surge_band_df.empty:
+        st.subheader("急騰予兆スコア帯別実績")
+        st.dataframe(surge_band_df, use_container_width=True)
 
-    st.subheader("📈 バックテスト概要")
+    st.subheader("通常BUYバックテスト")
     st.dataframe(summary, use_container_width=True)
 
     if not stock_results.empty:
@@ -2859,36 +2977,35 @@ with st.expander("🔍 詳細分析・検証データ", expanded=False):
             use_container_width=True
         )
 
-    if not open_positions_df.empty:
-        st.subheader("未決済ポジション")
-        st.dataframe(open_positions_df, use_container_width=True)
-
 # ---------------------------------------------------------
-# CSV / ZIP 出力
+# CSV / ZIP
 # ---------------------------------------------------------
 st.header("📥 検証データ出力")
 
-def rc38_df(x):
+def rc39_df(x):
     return x.copy() if isinstance(x, pd.DataFrame) else pd.DataFrame()
 
-rc38_files = {
-    "00_summary.csv": rc38_df(summary),
-    "01_today_buy.csv": rc38_df(top_buy),
-    "02_today_sell.csv": rc38_df(top_sell),
-    "03_all_ai_analysis.csv": rc38_df(analysis_df),
-    "04_trade_history.csv": rc38_df(trades_df),
-    "05_equity_curve.csv": rc38_df(equity_df),
-    "06_stock_results.csv": rc38_df(stock_results),
-    "07_liquidity_top50.csv": rc38_df(liq),
-    "08_holdings_check.csv": rc38_df(sell_df),
-    "09_open_positions.csv": rc38_df(open_positions_df),
-    "10_paired_buy_sell.csv": rc38_df(paired_df),
-    "11_score_band_analysis.csv": rc38_df(score_band),
-    "12_quality_factor_analysis.csv": rc38_df(q_band),
-    "13_market_analysis.csv": rc38_df(market_band),
-    "14_overseas_fx_analysis.csv": rc38_df(analysis_df),
-    "15_surge_validation.csv": rc38_df(surge_validation_df),
-    "16_surge_score_band.csv": rc38_df(surge_band_df),
+rc39_files = {
+    "00_summary.csv": rc39_df(summary),
+    "01_today_buy.csv": rc39_df(top_buy),
+    "02_today_prebuy.csv": rc39_df(prebuy_df),
+    "03_today_watch.csv": rc39_df(watch_df),
+    "04_today_overheat.csv": rc39_df(hot_df),
+    "05_today_sell.csv": rc39_df(top_sell),
+    "06_all_ai_analysis.csv": rc39_df(analysis_df),
+    "07_trade_history.csv": rc39_df(trades_df),
+    "08_equity_curve.csv": rc39_df(equity_df),
+    "09_stock_results.csv": rc39_df(stock_results),
+    "10_liquidity_top50.csv": rc39_df(liq),
+    "11_holdings_check.csv": rc39_df(sell_df),
+    "12_open_positions.csv": rc39_df(open_positions_df),
+    "13_paired_buy_sell.csv": rc39_df(paired_df),
+    "14_score_band_analysis.csv": rc39_df(score_band),
+    "15_quality_factor_analysis.csv": rc39_df(q_band),
+    "16_market_analysis.csv": rc39_df(market_band),
+    "17_surge_validation.csv": rc39_df(surge_validation_df),
+    "18_surge_score_band.csv": rc39_df(surge_band_df),
+    "19_prepuy_candidates.csv": rc39_df(prebuy_df),
 }
 
 ec1, ec2 = st.columns(2)
@@ -2896,29 +3013,29 @@ ec1, ec2 = st.columns(2)
 with ec1:
     st.download_button(
         "📄 今日のBUY CSV",
-        data=rc38_df(top_buy).to_csv(
+        data=rc39_df(top_buy).to_csv(
             index=False, encoding="utf-8-sig"
         ).encode("utf-8-sig"),
-        file_name="RC3_8_today_buy.csv",
+        file_name="RC3_9_today_buy.csv",
         mime="text/csv",
         width="stretch",
     )
 
 with ec2:
     st.download_button(
-        "📄 今日のSELL CSV",
-        data=rc38_df(top_sell).to_csv(
+        "📄 今日のPRE-BUY CSV",
+        data=rc39_df(prebuy_df).to_csv(
             index=False, encoding="utf-8-sig"
         ).encode("utf-8-sig"),
-        file_name="RC3_8_today_sell.csv",
+        file_name="RC3_9_today_prebuy.csv",
         mime="text/csv",
         width="stretch",
     )
 
-rc38_zip = BytesIO()
+rc39_zip = BytesIO()
 
-with ZipFile(rc38_zip, "w") as z:
-    for filename, frame in rc38_files.items():
+with ZipFile(rc39_zip, "w") as z:
+    for filename, frame in rc39_files.items():
         z.writestr(
             filename,
             frame.to_csv(
@@ -2926,26 +3043,26 @@ with ZipFile(rc38_zip, "w") as z:
             ).encode("utf-8-sig")
         )
 
-rc38_zip.seek(0)
+rc39_zip.seek(0)
 
 st.download_button(
-    "📦 全処理CSVをZIPで保存",
-    data=rc38_zip.getvalue(),
-    file_name="ver5_5_RC3_8_all_analysis.zip",
+    "📦 RC3.9 全処理CSVをZIP保存",
+    data=rc39_zip.getvalue(),
+    file_name="ver5_5_RC3_9_all_analysis.zip",
     mime="application/zip",
     width="stretch",
 )
 
 st.caption(
-    "通常BUY・急騰WATCH・過熱警戒・売却判断・バックテストを"
-    "すべてCSVとして保存し、次回RCの検証材料にします。"
+    "RC3.9：通常BUYの精度を守りながら、"
+    "急騰初動をPRE-BUYとして検知。"
+    "検証データはCSV/ZIPで保存します。"
 )
 
 st.caption(
     "※仮想バックテスト・投資判断補助です。"
     "SBI証券への自動発注は行いません。"
 )
-
 # =========================================================
-# END RC3.8
+# END RC3.9
 # =========================================================

@@ -2237,20 +2237,100 @@ st.dataframe(rc33_diagnostics, use_container_width=True, hide_index=True)
 # =========================================================
 # ZIP
 # =========================================================
+
 files = {
-    "00_summary.csv":summary,
-    "01_today_buy.csv":latest_df,
-    "02_today_sell.csv":sell_candidates,
-    "03_all_ai_analysis.csv":analysis_df,
-    "04_trade_history.csv":trades_df,
-    "05_equity_curve.csv":equity_df,
-    "06_stock_results.csv":stock_results,
-    "07_liquidity_top50.csv":liq,
-    "08_holdings_check.csv":sell_df,
-    "09_open_positions.csv":open_positions_df,
-    "10_paired_buy_sell.csv":paired_df,
-    "11_score_band_analysis.csv":score_band,
-    "12_quality_factor_analysis.csv":q_band,
-    "13_market_analysis.csv":market_band,
-    "14_overseas_fx_analysis.csv":analysis_df,
-    "15_6085_special_analysis.csv":analysis_6085,
+    "00_summary.csv": summary,
+    "01_today_buy.csv": latest_df,
+    "02_today_sell.csv": sell_candidates,
+    "03_all_ai_analysis.csv": analysis_df,
+    "04_trade_history.csv": trades_df,
+    "05_equity_curve.csv": equity_df,
+    "06_stock_results.csv": stock_results,
+    "07_liquidity_top50.csv": liq,
+    "08_holdings_check.csv": sell_df,
+    "09_open_positions.csv": open_positions_df,
+    "10_paired_buy_sell.csv": paired_df,
+    "11_score_band_analysis.csv": score_band,
+    "12_quality_factor_analysis.csv": q_band,
+    "13_market_analysis.csv": market_band,
+    "14_overseas_fx_analysis.csv": analysis_df,
+}
+
+# RC3.3 diagnostic: 85-90 vs 90+.
+diagnostic_rows = []
+if not paired_df.empty:
+    for _, row in paired_df.iterrows():
+        ai = float(row.get("AIスコア", np.nan))
+        if not np.isfinite(ai):
+            continue
+        if 85 <= ai < 90:
+            zone, adjusted, capital_factor = "85-90", ai, 1.00
+        elif ai >= 90:
+            zone, adjusted, capital_factor = "90+", ai * 0.90, 0.85
+        else:
+            zone, adjusted, capital_factor = "<85", ai, 1.00
+
+        diagnostic_rows.append({
+            "コード": row.get("コード", ""),
+            "銘柄名": row.get("銘柄名", ""),
+            "BUY日": row.get("BUY日", ""),
+            "SELL日": row.get("SELL日", ""),
+            "元AIスコア": ai,
+            "RC3_3補正後スコア": adjusted,
+            "資金係数補正": capital_factor,
+            "検証帯": zone,
+            "損益": row.get("損益", 0),
+            "損益率": row.get("損益率", 0),
+            "過去PF": row.get("過去PF", 0),
+            "銘柄期待値係数": row.get("銘柄期待値係数", 1.0),
+        })
+
+files["15_rc3_3_diagnostics.csv"] = pd.DataFrame(diagnostic_rows)
+
+# 6085 dedicated diagnostic.
+special_rows = []
+if "6085.T" in data and not data["6085.T"].empty:
+    d6085 = data["6085.T"].copy()
+    r = d6085.iloc[-1]
+    special_rows.append({
+        "コード": "6085",
+        "銘柄名": "アーキテクツ・スタジオ・ジャパン",
+        "取得最終日": str(d6085.index[-1].date()),
+        "現在価格": float(r["Close"]),
+        "RSI": float(r["RSI"]),
+        "MA25": float(r["MA25"]),
+        "MA75": float(r["MA75"]),
+        "MA200": float(r["MA200"]),
+        "5日騰落率": float(
+            (d6085["Close"].iloc[-1] / d6085["Close"].iloc[-6] - 1) * 100
+        ) if len(d6085) >= 6 else np.nan,
+        "20日平均出来高": float(r["VOL20"]),
+        "現在出来高": float(r["Volume"]),
+        "出来高倍率": float(r["Volume"] / r["VOL20"]) if r["VOL20"] else np.nan,
+        "テクニカルスコア": tech(r, rlo, rhi),
+    })
+
+files["16_6085_special_analysis.csv"] = pd.DataFrame(special_rows)
+
+buf = BytesIO()
+with ZipFile(buf, "w") as z:
+    for filename, df in files.items():
+        z.writestr(filename, csv_bytes(df))
+
+buf.seek(0)
+
+st.divider()
+st.download_button(
+    "📦 Ver.5.5 RC3.3 CLEAN 全処理データをZIPでダウンロード",
+    buf.getvalue(),
+    "ver5_5_RC3_3_CLEAN_all_analysis.zip",
+    "application/zip",
+    mime="application/zip",
+    use_container_width=True,
+)
+
+st.caption(
+    "RC3.3 CLEAN：AI 85～90点帯を重点検証し、90点以上は過信補正を検証。"
+    "6085は専用診断CSVで取得最終日・テクニカル・出来高を確認します。"
+)
+st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

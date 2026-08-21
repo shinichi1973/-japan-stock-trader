@@ -7,7 +7,7 @@ from io import BytesIO
 from zipfile import ZipFile
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.2",
+    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.3",
     page_icon="📈",
     layout="wide"
 )
@@ -75,6 +75,13 @@ HELD_CODES = {
     "6702","6954","6965","7012","9432","9984"
 }
 
+# RC3.3検証パラメータ
+# 90+は過去データでPFが弱かったため、無条件に最高評価として扱わない。
+# 85-90を基準帯、90+はスコアを0.90倍して過信を抑制する。
+RC33_OVER90_SCORE_FACTOR = 0.90
+RC33_OVER90_BUDGET_FACTOR = 0.85
+RC33_STALE_DAYS = 10
+
 
 def code(t):
     return t.replace(".T", "")
@@ -123,60 +130,74 @@ def csv_bytes(df):
 # =========================================================
 @st.cache_data(ttl=3600)
 def stock_data(t, years=5):
+    """5年日足取得。6085などでYahoo側の取得終端が古い場合は再取得を試す。"""
     end = datetime.now()
     start = end - timedelta(days=365*years+300)
 
-    try:
-        df = yf.download(
-            t,
-            start=start,
-            end=end+timedelta(days=1),
-            auto_adjust=False,
-            progress=False,
-            threads=False
-        )
-
-        if df.empty:
+    def normalize(df):
+        if df is None or df.empty:
             return pd.DataFrame()
-
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-
         cols = ["Open", "High", "Low", "Close", "Volume"]
-
         if not all(c in df.columns for c in cols):
             return pd.DataFrame()
-
         df = df[cols].copy()
-
         for c in cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-
+        df = df.dropna(subset=cols)
+        if df.empty:
+            return pd.DataFrame()
         df["MA25"] = df.Close.rolling(25).mean()
         df["MA75"] = df.Close.rolling(75).mean()
         df["MA200"] = df.Close.rolling(200).mean()
-
         df["MA25_Slope"] = df.MA25 - df.MA25.shift(5)
         df["MA75_Slope"] = df.MA75 - df.MA75.shift(5)
-
         df["VOL20"] = df.Volume.rolling(20).mean()
         df["Turnover"] = df.Close * df.Volume
-
         delta = df.Close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         rs = gain / loss.replace(0, np.nan)
         df["RSI"] = 100 - (100/(1+rs))
-
-        # 急騰・モメンタム検証用
         df["Return_5d"] = df.Close.pct_change(5) * 100
         df["Return_25d"] = df.Close.pct_change(25) * 100
         df["Volume_Ratio"] = df.Volume / df.VOL20.replace(0, np.nan)
-
         return df.dropna()
 
+    try:
+        df = yf.download(
+            t, start=start, end=end+timedelta(days=1),
+            auto_adjust=False, progress=False, threads=False
+        )
+        out = normalize(df)
+
+        # RC3.3: 6085でYahoo downloadの終端が古い場合、Ticker.historyで再取得。
+        if code(t) == "6085" and not out.empty:
+            latest = pd.Timestamp(out.index.max()).tz_localize(None) if getattr(out.index.max(), 'tzinfo', None) else pd.Timestamp(out.index.max())
+            if (pd.Timestamp(end.date()) - latest).days > RC33_STALE_DAYS:
+                try:
+                    alt = yf.Ticker(t).history(
+                        period="max", auto_adjust=False, actions=False
+                    )
+                    alt = normalize(alt)
+                    if not alt.empty:
+                        alt_latest = pd.Timestamp(alt.index.max()).tz_localize(None) if getattr(alt.index.max(), 'tzinfo', None) else pd.Timestamp(alt.index.max())
+                        if alt_latest > latest:
+                            out = alt
+                except Exception:
+                    pass
+
+        return out
     except Exception:
-        return pd.DataFrame()
+        try:
+            alt = yf.Ticker(t).history(
+                start=start, end=end+timedelta(days=1),
+                auto_adjust=False, actions=False
+            )
+            return normalize(alt)
+        except Exception:
+            return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600)
@@ -347,6 +368,13 @@ def overseas_snapshot(overseas, dt):
 # AIスコア
 # =========================================================
 def score_band_policy(score, market_state, overseas_factor):
+    """RC3.3 experimental score-band policy.
+
+    85-90 is treated as the reference band. 90+ receives a 10%
+    confidence reduction because RC3.2 historical analysis showed
+    materially weaker PF in that band. This is a testable correction,
+    not a permanent rule.
+    """
     if 82 <= score < 85:
         band = "82-85"
     elif 80 <= score < 82:
@@ -359,15 +387,21 @@ def score_band_policy(score, market_state, overseas_factor):
         band = "<80"
 
     conf = {
-        "82-85":1.02,
-        "85-90":0.98,
-        "90+":0.99
+        "80-82": 1.00,
+        "82-85": 1.00,
+        "85-90": 1.00,
+        "90+": RC33_OVER90_SCORE_FACTOR
     }.get(band, 1.0)
 
     if overseas_factor < 0.50:
         conf *= 0.92
 
     return band, float(conf)
+
+
+def score_band_budget_factor(band):
+    """RC3.3: 90+ is also position-size cautious; other bands unchanged."""
+    return RC33_OVER90_BUDGET_FACTOR if band == "90+" else 1.0
 
 
 def sector_overseas_bonus(ticker, snap):
@@ -664,11 +698,11 @@ with st.sidebar:
 # メイン画面
 # =========================================================
 st.title(
-    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.2"
+    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.3"
 )
 
 st.caption(
-    "RC3.2：実保有12銘柄＋6085アーキテクツ・スタジオ・ジャパンを追加。"
+    "RC3.3検証版：AIスコア90+の過信を抑制し、85-90帯を基準帯として検証。6085のデータ欠落を自動検知・再取得します。"
     "BUY最低AIスコア条件を実際の判定にも反映。"
 )
 
@@ -840,10 +874,12 @@ for dt in dates:
             losses
         )
 
-        budget = min(
-            maxbuy,
-            cash
-        ) * factor(order["score"]) * risk_factor
+        budget = (
+            min(maxbuy, cash)
+            * factor(order["score"])
+            * order.get("score_band_budget_factor", 1.0)
+            * risk_factor
+        )
 
         shares = int(budget/p)
 
@@ -871,10 +907,13 @@ for dt in dates:
             "株数":shares,
             "損益":0,
             "損益率":0,
-            "理由":"Ver.5.5 RC3.2 AI BUY（翌営業日寄付約定）",
+            "理由":"Ver.5.5 RC3.3 AI BUY（翌営業日寄付約定）",
             "シグナル日":order["signal_date"],
             "テクニカルスコア":order["ts"],
             "総合AIスコア":order["score"],
+            "元スコア帯":order.get("score_band", ""),
+            "90+過信補正係数":order.get("score_band_conf", 1.0),
+            "90+資金係数":order.get("score_band_budget_factor", 1.0),
             "銘柄実績信頼度":order["hc"],
             "市場判定":order["market_state"],
             "銘柄期待値係数":order.get("qfactor",1.0),
@@ -1139,6 +1178,8 @@ for dt in dates:
             "海外補正":obonus,
             "AIスコア帯":score_band,
             "スコア信頼補正":score_conf,
+            "90+過信補正":score_band == "90+",
+            "90+資金係数":score_band_budget_factor(score_band),
             "総合AIスコア":score,
             "元AIスコア":base_score,
             "銘柄期待値係数":qfactor,
@@ -1156,6 +1197,8 @@ for dt in dates:
             "5日騰落率":float(r.Return_5d),
             "25日騰落率":float(r.Return_25d),
             "出来高倍率":float(r.Volume_Ratio),
+            "5日急騰警戒":bool(r.Return_5d >= 15),
+            "90+過信警戒":bool(score_band == "90+"),
             "新規BUY停止":blocked,
             "BUY最低スコア未達":score < minbuy_score,
             "市場条件未達":score < buy_threshold,
@@ -1230,7 +1273,10 @@ for dt in dates:
             "qfactor":qfactor,
             "wr_hist":wr_hist,
             "pf_hist":pf_hist,
-            "avg_hist":avg_hist
+            "avg_hist":avg_hist,
+            "score_band":score_band,
+            "score_band_conf":score_conf,
+            "score_band_budget_factor":score_band_budget_factor(score_band)
         })
 
         pending_tickers.add(t)
@@ -1666,10 +1712,10 @@ open_positions_df = pd.DataFrame(
 
 
 # =========================================================
-# RC3.2 健全性
+# RC3.3 健全性
 # =========================================================
 st.header(
-    "🛡️ Ver.5.5 RC3.2 モデル健全性"
+    "🛡️ Ver.5.5 RC3.3 モデル健全性"
 )
 
 st.info(
@@ -1677,7 +1723,7 @@ st.info(
     "各銘柄の次回取引日の寄付で仮想約定。"
     "株価2,000円以上は新規BUY対象外、"
     "明けの明星は不使用。"
-    "RC3.2ではBUY最低AIスコア条件を実判定にも適用し、"
+    "RC3.3ではBUY最低AIスコア条件に加え、90+過信補正を実判定にも適用し、"
     "実保有12銘柄＋6085を重点監視します。"
 )
 
@@ -1760,6 +1806,18 @@ if "6085.T" in data:
 
     p6085 = float(r6085.Close)
     ts6085 = tech(r6085,rlo,rhi)
+    data6085_latest = pd.Timestamp(d6085.index.max())
+    data6085_age = (pd.Timestamp(datetime.now().date()) - data6085_latest.normalize()).days
+
+    if data6085_age > RC33_STALE_DAYS:
+        st.error(
+            f"⚠️ 6085のデータが古い状態です。最終取得日：{data6085_latest.date()} "
+            f"（現在から約{data6085_age}日）。自動再取得でも更新できない場合はYahoo側の取得制限を確認してください。"
+        )
+    else:
+        st.success(
+            f"🟢 6085データ最新日：{data6085_latest.date()}（約{data6085_age}日遅れ）"
+        )
 
     os6085 = overseas_snapshot(
         overseas,
@@ -1811,6 +1869,12 @@ if "6085.T" in data:
     st.metric(
         "6085 現在AIスコア",
         f"{score6085:.0f}点"
+    )
+
+    st.write(
+        f"**RC3.3判定：** AIスコア帯 {band6085} "
+        f"｜90+過信補正 {conf6085:.2f} "
+        f"｜90+資金係数 {score_band_budget_factor(band6085):.2f}"
     )
 
     c1,c2,c3,c4 = st.columns(4)
@@ -1925,7 +1989,10 @@ summary = pd.DataFrame({
         "BUY最低AIスコア",
         "実保有銘柄",
         "6085重点監視",
-        "RC3.2検証"
+        "90+過信補正",
+        "85-90基準帯",
+        "6085データ鮮度監視",
+        "RC3.3検証"
     ],
     "結果":[
         "5.5 RC3.2",
@@ -1948,7 +2015,10 @@ summary = pd.DataFrame({
         minbuy_score,
         "12銘柄",
         "あり",
-        "BUY条件・実保有・6085特別監視を統合"
+        "90+は0.90倍・資金0.85倍",
+        "85-90を基準帯",
+        f"{RC33_STALE_DAYS}日超で警告・再取得",
+        "90+過信抑制＋6085取得改善＋連敗ブレーキ再検証"
     ]
 })
 
@@ -2132,6 +2202,39 @@ else:
 
 
 # =========================================================
+# RC3.3 診断
+# =========================================================
+rc33_diagnostics = pd.DataFrame([
+    {
+        "検証項目":"90+過信補正",
+        "RC3.2実績":"90+ PF 0.526",
+        "RC3.3変更":"90+スコア×0.90・資金係数0.85",
+        "目的":"90点以上の過信を抑制"
+    },
+    {
+        "検証項目":"85-90基準帯",
+        "RC3.2実績":"85-90 PF 2.241",
+        "RC3.3変更":"基準帯として補正なし",
+        "目的":"好成績帯を歪めず検証"
+    },
+    {
+        "検証項目":"6085データ鮮度",
+        "RC3.2実績":"取得終端が古い場合あり",
+        "RC3.3変更":"6085のみTicker.history再取得＋鮮度警告",
+        "目的":"2026年8月までの連続データを確保"
+    },
+    {
+        "検証項目":"未来情報",
+        "RC3.2実績":"当日終値→次回寄付",
+        "RC3.3変更":"同一ルールを維持",
+        "目的":"検証の公平性を維持"
+    }
+])
+
+st.subheader("🧪 RC3.3 検証ポイント")
+st.dataframe(rc33_diagnostics, use_container_width=True, hide_index=True)
+
+# =========================================================
 # ZIP
 # =========================================================
 files = {
@@ -2150,43 +2253,4 @@ files = {
     "12_quality_factor_analysis.csv":q_band,
     "13_market_analysis.csv":market_band,
     "14_overseas_fx_analysis.csv":analysis_df,
-    "15_6085_special_analysis.csv":analysis_6085
-}
-
-
-buf = BytesIO()
-
-with ZipFile(buf,"w") as z:
-
-    for fn,df in files.items():
-
-        z.writestr(
-            fn,
-            csv_bytes(df)
-        )
-
-buf.seek(0)
-
-
-# =========================================================
-# ダウンロード
-# =========================================================
-st.divider()
-
-st.download_button(
-    "📦 Ver.5.5 RC3.2 全処理データをZIPでダウンロード",
-    buf.getvalue(),
-    "ver5_5_RC3_2_all_analysis.zip",
-    "application/zip",
-    use_container_width=True
-)
-
-st.caption(
-    "RC3.2：実保有12銘柄＋6085特別監視。"
-    "BUYは銘柄ごとの次回取引日寄付約定モデル。"
-)
-
-st.caption(
-    "※仮想バックテスト・投資判断補助です。"
-    "SBI証券への自動発注は行いません。"
-)
+    "15_6085_special_analysis.csv":analysis_6085,

@@ -2325,7 +2325,6 @@ st.download_button(
     buf.getvalue(),
     "ver5_5_RC3_3_CLEAN_all_analysis.zip",
     "application/zip",
-    mime="application/zip",
     width="stretch",
 )
 

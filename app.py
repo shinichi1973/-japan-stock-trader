@@ -2731,3 +2731,114 @@ with st.expander("🔍 詳細分析を開く", expanded=False):
             st.dataframe(surge_band_df, use_container_width=True)
     else:
         st.info("急騰予兆検証データなし")
+
+    st.subheader("📈 バックテスト概要")
+    st.dataframe(summary, use_container_width=True)
+
+    if not stock_results.empty:
+        st.subheader("銘柄別実績")
+        st.dataframe(
+            stock_results.sort_values("損益", ascending=False),
+            use_container_width=True
+        )
+
+    if not open_positions_df.empty:
+        st.subheader("未決済ポジション")
+        st.dataframe(open_positions_df, use_container_width=True)
+
+st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")
+# ===== END RC3.6 SIMPLE DECISION DASHBOARD =====
+
+buf = BytesIO()
+with ZipFile(buf, "w") as z:
+    for filename, df in files.items():
+        z.writestr(filename, csv_bytes(df))
+
+buf.seek(0)
+
+st.divider()
+st.download_button(
+    "📦 Ver.5.5 RC3.6 CLEAN 全処理データをZIPでダウンロード",
+    buf.getvalue(),
+    "ver5_5_RC3_3_CLEAN_all_analysis.zip",
+    "application/zip",
+    width="stretch",
+)
+
+st.caption(
+    "RC3.6：通常AI＋急騰予兆AIの二刀流。急騰予兆はBUYではなくWATCH専用で、ニュースは現在情報のみを補助利用します。"
+    "6085は専用診断CSVで取得最終日・テクニカル・出来高を確認します。"
+)
+
+# ===== RC3.7 CSV EXPORT =====
+def _rc37_df(x):
+    return x.copy() if isinstance(x, pd.DataFrame) else pd.DataFrame()
+
+rc37_files = {
+    "00_summary.csv": _rc37_df(summary),
+    "01_today_buy.csv": _rc37_df(top_buy if "top_buy" in globals() else latest_df),
+    "02_today_sell.csv": _rc37_df(top_sell if "top_sell" in globals() else sell_candidates),
+    "03_all_ai_analysis.csv": _rc37_df(analysis_df),
+    "04_trade_history.csv": _rc37_df(trades_df),
+    "05_equity_curve.csv": _rc37_df(equity_df),
+    "06_stock_results.csv": _rc37_df(stock_results),
+    "07_liquidity_top50.csv": _rc37_df(liq),
+    "08_holdings_check.csv": _rc37_df(sell_df),
+    "09_open_positions.csv": _rc37_df(open_positions_df),
+    "10_paired_buy_sell.csv": _rc37_df(paired_df),
+    "11_score_band_analysis.csv": _rc37_df(score_band),
+    "12_quality_factor_analysis.csv": _rc37_df(q_band),
+    "13_market_analysis.csv": _rc37_df(market_band),
+    "14_overseas_fx_analysis.csv": _rc37_df(analysis_df),
+    "15_surge_validation.csv": _rc37_df(surge_validation_df),
+    "16_surge_score_band.csv": _rc37_df(surge_band_df),
+}
+
+st.header("📥 データ出力")
+
+csv_col1, csv_col2 = st.columns(2)
+
+with csv_col1:
+    st.download_button(
+        "📄 今日のBUY候補 CSV",
+        data=_rc37_df(top_buy if "top_buy" in globals() else latest_df)
+            .to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+        file_name="RC3_7_today_buy.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+
+with csv_col2:
+    st.download_button(
+        "📄 今日の売却判断 CSV",
+        data=_rc37_df(top_sell if "top_sell" in globals() else sell_candidates)
+            .to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+        file_name="RC3_7_today_sell.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+
+rc37_zip = BytesIO()
+with ZipFile(rc37_zip, "w") as z:
+    for filename, frame in rc37_files.items():
+        z.writestr(
+            filename,
+            frame.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        )
+rc37_zip.seek(0)
+
+st.download_button(
+    "📦 全処理データ CSV一式をZIPでダウンロード",
+    data=rc37_zip.getvalue(),
+    file_name="ver5_5_RC3_7_all_analysis.zip",
+    mime="application/zip",
+    width="stretch",
+)
+
+st.caption(
+    "CSVは今後のシステム改善・実績検証用です。"
+    "急騰予兆、通常BUY、売却判断、バックテスト、銘柄別実績をまとめて保存できます。"
+)
+# ===== END RC3.7 CSV EXPORT =====
+
+st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

@@ -7,7 +7,7 @@ from io import BytesIO
 from zipfile import ZipFile
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.4",
+    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.5",
     page_icon="📈",
     layout="wide"
 )
@@ -798,11 +798,11 @@ with st.sidebar:
 # メイン画面
 # =========================================================
 st.title(
-    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.4"
+    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.5"
 )
 
 st.caption(
-    "RC3.4検証版：通常AIは根拠重視、別系統で「急騰予兆AI」を搭載。出来高・値動き・トレンド転換・現在ニュースを検知します。"
+    "RC3.5検証版：通常AIは根拠重視、別系統で「急騰予兆AI」を搭載。出来高・値動き・トレンド転換・現在ニュースを検知します。"
     "BUY最低AIスコア条件を実際の判定にも反映。"
 )
 
@@ -1007,7 +1007,7 @@ for dt in dates:
             "株数":shares,
             "損益":0,
             "損益率":0,
-            "理由":"Ver.5.5 RC3.4 AI BUY（翌営業日寄付約定）",
+            "理由":"Ver.5.5 RC3.5 AI BUY（翌営業日寄付約定）",
             "シグナル日":order["signal_date"],
             "テクニカルスコア":order["ts"],
             "総合AIスコア":order["score"],
@@ -2457,6 +2457,148 @@ if "6085.T" in data and not data["6085.T"].empty:
 files["16_6085_special_analysis.csv"] = pd.DataFrame(special_rows)
 files["17_surge_radar.csv"] = surge_df
 
+
+# ===== RC3.5 SURGE VALIDATION =====
+def surge_signal_row(d, dt):
+    """Generate a surge-alert using information available at dt only."""
+    if dt not in d.index:
+        return None
+    i = d.index.get_loc(dt)
+    if isinstance(i, slice) or i < 25:
+        return None
+    r = d.iloc[i]
+    close = float(r.Close)
+    vol20 = float(r.VOL20) if np.isfinite(r.VOL20) else np.nan
+    if close <= 0 or not np.isfinite(vol20) or vol20 <= 0:
+        return None
+
+    p5 = float((close / float(d.iloc[i-5].Close) - 1) * 100)
+    p10 = float((close / float(d.iloc[i-10].Close) - 1) * 100)
+    p25 = float((close / float(d.iloc[i-25].Close) - 1) * 100)
+    vm = float(r.Volume / vol20) if vol20 else np.nan
+    ma25_gap = float((close / float(r.MA25) - 1) * 100) if np.isfinite(r.MA25) else np.nan
+    high20 = float(d.iloc[max(0, i-20):i+1].High.max())
+    breakout = int(close >= high20)
+
+    points = 0
+    if p5 >= 10: points += 20
+    if p5 >= 20: points += 10
+    if p10 >= 15: points += 15
+    if p25 >= 20: points += 10
+    if vm >= 1.5: points += 15
+    if vm >= 3.0: points += 10
+    if breakout: points += 10
+    if np.isfinite(r.MA25_Slope) and r.MA25_Slope > 0: points += 10
+
+    # Overheating penalty: alert is still recorded, but the score is reduced.
+    if np.isfinite(r.RSI) and r.RSI >= 80:
+        points -= 15
+    elif np.isfinite(r.RSI) and r.RSI >= 75:
+        points -= 8
+
+    score = float(np.clip(points, 0, 100))
+    if score >= 70:
+        state = "🚨 強い急騰予兆"
+    elif score >= 55:
+        state = "🟠 急騰予兆"
+    elif score >= 40:
+        state = "🟡 変化検知"
+    else:
+        state = "⚪ 通常"
+
+    return {
+        "予兆日": dt, "急騰予兆スコア": score, "急騰予兆判定": state,
+        "5日騰落率": p5, "10日騰落率": p10, "25日騰落率": p25,
+        "出来高倍率": vm, "MA25乖離率": ma25_gap, "20日高値更新": breakout,
+        "RSI": float(r.RSI) if np.isfinite(r.RSI) else np.nan,
+        "予兆時株価": close,
+    }
+
+def build_surge_validation(data, threshold=55):
+    rows = []
+    for t, d in data.items():
+        if d.empty or len(d) < 40:
+            continue
+        idx = pd.DatetimeIndex(d.index)
+        for dt in idx:
+            s = surge_signal_row(d, dt)
+            if not s or s["急騰予兆スコア"] < threshold:
+                continue
+            i = d.index.get_loc(dt)
+            if isinstance(i, slice):
+                continue
+            row = {"コード": code(t), "銘柄名": name(t), **s}
+            for days in (1, 3, 5, 10):
+                j = i + days
+                if j < len(d):
+                    future_close = float(d.iloc[j].Close)
+                    future_high = float(d.iloc[i+1:j+1].High.max())
+                    future_low = float(d.iloc[i+1:j+1].Low.min())
+                    base = s["予兆時株価"]
+                    row[f"{days}営業日後騰落率"] = (future_close/base-1)*100
+                    row[f"{days}営業日後最大上昇率"] = (future_high/base-1)*100
+                    row[f"{days}営業日後最大下落率"] = (future_low/base-1)*100
+                else:
+                    row[f"{days}営業日後騰落率"] = np.nan
+                    row[f"{days}営業日後最大上昇率"] = np.nan
+                    row[f"{days}営業日後最大下落率"] = np.nan
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+try:
+    surge_validation_df = build_surge_validation(data, threshold=55)
+except Exception as e:
+    surge_validation_df = pd.DataFrame()
+    st.warning(f"急騰予兆検証の生成をスキップしました: {e}")
+
+if not surge_validation_df.empty:
+    st.header("🚨 急騰予兆 → その後の実績")
+    st.caption("予兆判定には予兆日までの情報だけを使用。将来の価格は検証結果の集計にのみ使用します。")
+    display_cols = [
+        "コード","銘柄名","予兆日","急騰予兆スコア","急騰予兆判定",
+        "5日騰落率","出来高倍率","RSI",
+        "1営業日後騰落率","3営業日後騰落率",
+        "5営業日後騰落率","10営業日後騰落率",
+        "5営業日後最大上昇率","5営業日後最大下落率"
+    ]
+    display_cols = [c for c in display_cols if c in surge_validation_df.columns]
+    st.dataframe(surge_validation_df[display_cols].sort_values(
+        ["急騰予兆スコア","予兆日"], ascending=[False, False]
+    ).head(100), use_container_width=True)
+
+    # Score-band validation
+    bins = [-np.inf, 55, 70, 85, np.inf]
+    labels = ["55-69","70-84","85-100"]
+    tmp = surge_validation_df.copy()
+    tmp["予兆スコア帯"] = pd.cut(
+        tmp["急騰予兆スコア"], bins=bins, labels=["<55","55-69","70-84","85+"],
+        right=False
+    )
+    completed = tmp.dropna(subset=["5営業日後騰落率"])
+    if not completed.empty:
+        surge_band_df = completed.groupby("予兆スコア帯", observed=False).agg(
+            件数=("5営業日後騰落率","count"),
+            5日後平均騰落率=("5営業日後騰落率","mean"),
+            5日後プラス率=("5営業日後騰落率",lambda x:(x>0).mean()*100),
+            5日後最大上昇平均=("5営業日後最大上昇率","mean"),
+            5日後最大下落平均=("5営業日後最大下落率","mean")
+        ).reset_index()
+        st.subheader("📊 急騰予兆スコア帯別の5営業日後実績")
+        st.dataframe(surge_band_df, use_container_width=True)
+    else:
+        surge_band_df = pd.DataFrame()
+else:
+    surge_band_df = pd.DataFrame()
+    st.info("急騰予兆検証データがありません。")
+
+# Export the new diagnostic datasets if the original app has a files dict.
+try:
+    files["15_surge_validation.csv"] = surge_validation_df
+    files["16_surge_score_band.csv"] = surge_band_df
+except Exception:
+    pass
+# ===== END RC3.5 SURGE VALIDATION =====
+
 buf = BytesIO()
 with ZipFile(buf, "w") as z:
     for filename, df in files.items():
@@ -2474,7 +2616,7 @@ st.download_button(
 )
 
 st.caption(
-    "RC3.4：通常AI＋急騰予兆AIの二刀流。急騰予兆はBUYではなくWATCH専用で、ニュースは現在情報のみを補助利用します。"
+    "RC3.5：通常AI＋急騰予兆AIの二刀流。急騰予兆はBUYではなくWATCH専用で、ニュースは現在情報のみを補助利用します。"
     "6085は専用診断CSVで取得最終日・テクニカル・出来高を確認します。"
 )
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

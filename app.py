@@ -2568,21 +2568,29 @@ if not surge_validation_df.empty:
 
     # Score-band validation
     bins = [-np.inf, 55, 70, 85, np.inf]
-    labels = ["55-69","70-84","85-100"]
     tmp = surge_validation_df.copy()
     tmp["予兆スコア帯"] = pd.cut(
-        tmp["急騰予兆スコア"], bins=bins, labels=["<55","55-69","70-84","85+"],
+        tmp["急騰予兆スコア"],
+        bins=bins,
+        labels=["<55", "55-69", "70-84", "85+"],
         right=False
     )
     completed = tmp.dropna(subset=["5営業日後騰落率"])
     if not completed.empty:
-        surge_band_df = completed.groupby("予兆スコア帯", observed=False).agg(
-            件数=("5営業日後騰落率","count"),
-            5日後平均騰落率=("5営業日後騰落率","mean"),
-            5日後プラス率=("5営業日後騰落率",lambda x:(x>0).mean()*100),
-            5日後最大上昇平均=("5営業日後最大上昇率","mean"),
-            5日後最大下落平均=("5営業日後最大下落率","mean")
-        ).reset_index()
+        surge_band_df = (
+            completed
+            .groupby("予兆スコア帯", observed=False)
+            .agg(
+                件数=("5営業日後騰落率", "count"),
+                **{
+                    "5日後平均騰落率": ("5営業日後騰落率", "mean"),
+                    "5日後プラス率": ("5営業日後騰落率", lambda x: (x > 0).mean() * 100),
+                    "5日後最大上昇平均": ("5営業日後最大上昇率", "mean"),
+                    "5日後最大下落平均": ("5営業日後最大下落率", "mean"),
+                }
+            )
+            .reset_index()
+        )
         st.subheader("📊 急騰予兆スコア帯別の5営業日後実績")
         st.dataframe(surge_band_df, use_container_width=True)
     else:

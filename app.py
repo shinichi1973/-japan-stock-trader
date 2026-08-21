@@ -7,7 +7,7 @@ from io import BytesIO
 from zipfile import ZipFile
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.5",
+    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.6",
     page_icon="📈",
     layout="wide"
 )
@@ -75,7 +75,7 @@ HELD_CODES = {
     "6702","6954","6965","7012","9432","9984"
 }
 
-# RC3.3検証パラメータ
+# RC3.6検証パラメータ
 # 90+は過去データでPFが弱かったため、無条件に最高評価として扱わない。
 # 85-90を基準帯、90+はスコアを0.90倍して過信を抑制する。
 RC33_OVER90_SCORE_FACTOR = 0.90
@@ -172,7 +172,7 @@ def stock_data(t, years=5):
         )
         out = normalize(df)
 
-        # RC3.3: 6085でYahoo downloadの終端が古い場合、Ticker.historyで再取得。
+        # RC3.6: 6085でYahoo downloadの終端が古い場合、Ticker.historyで再取得。
         if code(t) == "6085" and not out.empty:
             latest = pd.Timestamp(out.index.max()).tz_localize(None) if getattr(out.index.max(), 'tzinfo', None) else pd.Timestamp(out.index.max())
             if (pd.Timestamp(end.date()) - latest).days > RC33_STALE_DAYS:
@@ -368,7 +368,7 @@ def overseas_snapshot(overseas, dt):
 # AIスコア
 # =========================================================
 def score_band_policy(score, market_state, overseas_factor):
-    """RC3.3 experimental score-band policy.
+    """RC3.6 experimental score-band policy.
 
     85-90 is treated as the reference band. 90+ receives a 10%
     confidence reduction because RC3.2 historical analysis showed
@@ -400,7 +400,7 @@ def score_band_policy(score, market_state, overseas_factor):
 
 
 def score_band_budget_factor(band):
-    """RC3.3: 90+ is also position-size cautious; other bands unchanged."""
+    """RC3.6: 90+ is also position-size cautious; other bands unchanged."""
     return RC33_OVER90_BUDGET_FACTOR if band == "90+" else 1.0
 
 
@@ -798,11 +798,11 @@ with st.sidebar:
 # メイン画面
 # =========================================================
 st.title(
-    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.5"
+    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.6"
 )
 
 st.caption(
-    "RC3.5検証版：通常AIは根拠重視、別系統で「急騰予兆AI」を搭載。出来高・値動き・トレンド転換・現在ニュースを検知します。"
+    "RC3.6検証版：通常AIは根拠重視、別系統で「急騰予兆AI」を搭載。出来高・値動き・トレンド転換・現在ニュースを検知します。"
     "BUY最低AIスコア条件を実際の判定にも反映。"
 )
 
@@ -1007,7 +1007,7 @@ for dt in dates:
             "株数":shares,
             "損益":0,
             "損益率":0,
-            "理由":"Ver.5.5 RC3.5 AI BUY（翌営業日寄付約定）",
+            "理由":"Ver.5.5 RC3.6 AI BUY（翌営業日寄付約定）",
             "シグナル日":order["signal_date"],
             "テクニカルスコア":order["ts"],
             "総合AIスコア":order["score"],
@@ -1832,10 +1832,10 @@ open_positions_df = pd.DataFrame(
 
 
 # =========================================================
-# RC3.3 健全性
+# RC3.6 健全性
 # =========================================================
 st.header(
-    "🛡️ Ver.5.5 RC3.3 モデル健全性"
+    "🛡️ Ver.5.5 RC3.6 モデル健全性"
 )
 
 st.info(
@@ -1843,7 +1843,7 @@ st.info(
     "各銘柄の次回取引日の寄付で仮想約定。"
     "株価2,000円以上は新規BUY対象外、"
     "明けの明星は不使用。"
-    "RC3.3ではBUY最低AIスコア条件に加え、90+過信補正を実判定にも適用し、"
+    "RC3.6ではBUY最低AIスコア条件に加え、90+過信補正を実判定にも適用し、"
     "実保有12銘柄＋6085を重点監視します。"
 )
 
@@ -2016,7 +2016,7 @@ if "6085.T" in data:
     )
 
     st.write(
-        f"**RC3.3判定：** AIスコア帯 {band6085} "
+        f"**RC3.6判定：** AIスコア帯 {band6085} "
         f"｜90+過信補正 {conf6085:.2f} "
         f"｜90+資金係数 {score_band_budget_factor(band6085):.2f}"
     )
@@ -2136,7 +2136,7 @@ summary = pd.DataFrame({
         "90+過信補正",
         "85-90基準帯",
         "6085データ鮮度監視",
-        "RC3.3検証"
+        "RC3.6検証"
     ],
     "結果":[
         "5.5 RC3.2",
@@ -2346,36 +2346,36 @@ else:
 
 
 # =========================================================
-# RC3.3 診断
+# RC3.6 診断
 # =========================================================
 rc33_diagnostics = pd.DataFrame([
     {
         "検証項目":"90+過信補正",
         "RC3.2実績":"90+ PF 0.526",
-        "RC3.3変更":"90+スコア×0.90・資金係数0.85",
+        "RC3.6変更":"90+スコア×0.90・資金係数0.85",
         "目的":"90点以上の過信を抑制"
     },
     {
         "検証項目":"85-90基準帯",
         "RC3.2実績":"85-90 PF 2.241",
-        "RC3.3変更":"基準帯として補正なし",
+        "RC3.6変更":"基準帯として補正なし",
         "目的":"好成績帯を歪めず検証"
     },
     {
         "検証項目":"6085データ鮮度",
         "RC3.2実績":"取得終端が古い場合あり",
-        "RC3.3変更":"6085のみTicker.history再取得＋鮮度警告",
+        "RC3.6変更":"6085のみTicker.history再取得＋鮮度警告",
         "目的":"2026年8月までの連続データを確保"
     },
     {
         "検証項目":"未来情報",
         "RC3.2実績":"当日終値→次回寄付",
-        "RC3.3変更":"同一ルールを維持",
+        "RC3.6変更":"同一ルールを維持",
         "目的":"検証の公平性を維持"
     }
 ])
 
-st.subheader("🧪 RC3.3 検証ポイント")
+st.subheader("🧪 RC3.6 検証ポイント")
 st.dataframe(rc33_diagnostics, width="stretch", hide_index=True)
 
 # =========================================================
@@ -2400,7 +2400,7 @@ files = {
     "14_overseas_fx_analysis.csv": analysis_df,
 }
 
-# RC3.3 diagnostic: 85-90 vs 90+.
+# RC3.6 diagnostic: 85-90 vs 90+.
 diagnostic_rows = []
 if not paired_df.empty:
     for _, row in paired_df.iterrows():
@@ -2458,7 +2458,7 @@ files["16_6085_special_analysis.csv"] = pd.DataFrame(special_rows)
 files["17_surge_radar.csv"] = surge_df
 
 
-# ===== RC3.5 SURGE VALIDATION =====
+# ===== RC3.6 SURGE VALIDATION =====
 def surge_signal_row(d, dt):
     """Generate a surge-alert using information available at dt only."""
     if dt not in d.index:
@@ -2605,26 +2605,129 @@ try:
     files["16_surge_score_band.csv"] = surge_band_df
 except Exception:
     pass
-# ===== END RC3.5 SURGE VALIDATION =====
+# ===== END RC3.6 SURGE VALIDATION =====
 
-buf = BytesIO()
-with ZipFile(buf, "w") as z:
-    for filename, df in files.items():
-        z.writestr(filename, csv_bytes(df))
 
-buf.seek(0)
+# ===== RC3.6 SIMPLE DECISION DASHBOARD =====
+st.title("📈 日本株AI意思決定システム Ver.5.5 RC3.6")
+st.caption("朝は結論だけ。詳細分析は収納。通常AI＝BUY判断、急騰予兆AI＝先行監視として役割を分離。")
 
-st.divider()
-st.download_button(
-    "📦 Ver.5.5 RC3.3 CLEAN 全処理データをZIPでダウンロード",
-    buf.getvalue(),
-    "ver5_5_RC3_3_CLEAN_all_analysis.zip",
-    "application/zip",
-    width="stretch",
-)
+# 今日の市場環境
+try:
+    ref_date = next(iter(data.values())).index[-1] if data else datetime.now()
+    market_state, market_points, market_factor = market_info(market, ref_date)
+except Exception:
+    market_state, market_points, market_factor = "⚪ 中立", 60, 0.60
 
-st.caption(
-    "RC3.5：通常AI＋急騰予兆AIの二刀流。急騰予兆はBUYではなくWATCH専用で、ニュースは現在情報のみを補助利用します。"
-    "6085は専用診断CSVで取得最終日・テクニカル・出来高を確認します。"
-)
-st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")
+top_buy = latest_df.head(3).copy() if not latest_df.empty else pd.DataFrame()
+top_sell = sell_candidates.head(3).copy() if not sell_candidates.empty else pd.DataFrame()
+
+# 最新の急騰予兆を銘柄ごとに1件だけ取得
+try:
+    if not surge_validation_df.empty:
+        surge_latest = (
+            surge_validation_df
+            .sort_values(["コード", "予兆日"])
+            .groupby("コード", as_index=False)
+            .tail(1)
+        )
+        surge_watch = (
+            surge_latest[
+                surge_latest["急騰予兆スコア"].between(70, 84.999, inclusive="both")
+            ]
+            .sort_values("急騰予兆スコア", ascending=False)
+            .head(3)
+        )
+    else:
+        surge_watch = pd.DataFrame()
+except Exception:
+    surge_watch = pd.DataFrame()
+
+if not top_buy.empty:
+    today_decision = "🟢 BUY候補あり"
+elif not surge_watch.empty:
+    today_decision = "🟡 WATCH中心"
+else:
+    today_decision = "⚪ 今日は無理に買わない"
+
+st.header("📌 今日の結論")
+st.success(f"## {today_decision}")
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.metric("BUY候補", len(top_buy))
+with c2:
+    st.metric("急騰WATCH", len(surge_watch))
+with c3:
+    st.metric("売却警戒", len(top_sell))
+
+st.caption(f"市場環境：{market_state} ｜ 市場係数：{market_factor:.2f}")
+
+st.header("🥇 今日の買い候補 TOP3")
+if top_buy.empty:
+    st.info("買い条件を満たす銘柄はありません。")
+else:
+    for i, (_, r) in enumerate(top_buy.iterrows()):
+        rank = ["🥇", "🥈", "🥉"][i]
+        st.success(
+            f"{rank} **{r['銘柄名']}（{r['コード']}）** "
+            f"AI **{r['総合AIスコア']:.0f}点** ｜ 株価 ¥{r['株価']:.0f}"
+        )
+        st.caption(
+            f"テクニカル {r.get('テクニカルスコア', 0):.0f} ｜ "
+            f"過去PF {r.get('過去PF', 0):.2f} ｜ "
+            f"海外 {r.get('海外為替判定', '中立')}"
+        )
+
+st.header("🚨 急騰予兆レーダー")
+if surge_watch.empty:
+    st.info("現在、70～84点の先行監視ゾーンはありません。")
+else:
+    st.warning("急騰予兆はBUYではありません。70～84点を先行監視、85点以上は過熱警戒として扱います。")
+    for _, r in surge_watch.iterrows():
+        st.warning(
+            f"🟡 **{r['銘柄名']}（{r['コード']}）** "
+            f"予兆 **{r['急騰予兆スコア']:.0f}点** ｜ "
+            f"5日 {r.get('5日騰落率', np.nan):+.1f}% ｜ "
+            f"出来高 {r.get('出来高倍率', np.nan):.1f}倍 ｜ "
+            f"RSI {r.get('RSI', np.nan):.1f}"
+        )
+
+st.header("🔴 保有銘柄の判断")
+if top_sell.empty:
+    st.success("🟢 明確な売却警戒はありません。")
+else:
+    for _, r in top_sell.iterrows():
+        st.error(
+            f"🔴 **{r['銘柄名']}（{r['コード']}）** → **{r['判定']}**"
+            f" ｜ {r.get('売却期限目安', '1～3営業日以内')}"
+        )
+        if r.get("警戒理由"):
+            st.caption(r["警戒理由"])
+
+with st.expander("🔍 詳細分析を開く", expanded=False):
+    st.subheader("📊 今日のAI候補")
+    if not top_buy.empty:
+        st.dataframe(top_buy, use_container_width=True)
+    else:
+        st.info("BUY候補なし")
+
+    st.subheader("🚨 急騰予兆の検証実績")
+    if not surge_validation_df.empty:
+        cols = [c for c in [
+            "コード", "銘柄名", "予兆日", "急騰予兆スコア", "急騰予兆判定",
+            "5日騰落率", "10日騰落率", "出来高倍率", "RSI",
+            "5営業日後騰落率", "5営業日後最大上昇率",
+            "5営業日後最大下落率"
+        ] if c in surge_validation_df.columns]
+        st.dataframe(
+            surge_validation_df[cols]
+            .sort_values("急騰予兆スコア", ascending=False)
+            .head(100),
+            use_container_width=True
+        )
+        if not surge_band_df.empty:
+            st.subheader("スコア帯別実績")
+            st.dataframe(surge_band_df, use_container_width=True)
+    else:
+        st.info("急騰予兆検証データなし")

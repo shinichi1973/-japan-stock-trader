@@ -7,7 +7,7 @@ from io import BytesIO
 from zipfile import ZipFile
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.3",
+    page_title="日本株 AI投資アシスタント Ver.5.5 RC3.4",
     page_icon="📈",
     layout="wide"
 )
@@ -604,6 +604,101 @@ def stock_quality(s):
     return float(np.clip(q, 0.0, 1.08)), False, reason, wr, pf, avg
 
 
+
+# =========================================================
+# 急騰予兆AI / ニュースレーダー
+# =========================================================
+def news_signal(ticker):
+    """現在取得できるYahoo Financeニュースだけを補助情報として評価。
+    過去バックテストには使用せず、未来情報混入を防ぐ。
+    """
+    positive = [
+        "上方修正", "増額", "黒字", "最高益", "増益", "受注", "提携",
+        "業務提携", "資本提携", "買収", "TOB", "自社株買い", "復配",
+        "増配", "新製品", "大型受注", "採用", "契約", "材料", "上場"
+    ]
+    negative = [
+        "下方修正", "減額", "赤字", "減益", "債務超過", "希薄化",
+        "増資", "第三者割当", "売出し", "特損", "不適切", "監査",
+        "継続企業", "業績悪化", "配当減", "無配"
+    ]
+    try:
+        items = yf.Ticker(ticker).news or []
+    except Exception:
+        items = []
+
+    score = 0
+    headlines = []
+    for item in items[:8]:
+        title = str(item.get("title", ""))
+        if not title:
+            continue
+        ps = sum(title.count(k) for k in positive)
+        ns = sum(title.count(k) for k in negative)
+        score += min(ps, 2) * 8
+        score -= min(ns, 2) * 10
+        headlines.append(title)
+
+    score = int(np.clip(score, -20, 30))
+    state = "🟢 材料良好" if score >= 16 else "🟡 材料あり" if score >= 8 else "⚪ 材料中立" if score > -8 else "🔴 材料注意"
+    return score, state, headlines[:3]
+
+
+def surge_radar_row(t, d, use_news=True):
+    """急騰予兆は通常BUYと別系統。WATCH用途でありBUY判定には直接使用しない。"""
+    r = d.iloc[-1]
+    p = float(r.Close)
+    if p <= 0 or p >= 2000:
+        return None
+
+    ret5 = float(r.Return_5d)
+    ret25 = float(r.Return_25d)
+    vr = float(r.Volume_Ratio)
+    ma25_gap = (p / float(r.MA25) - 1) * 100 if float(r.MA25) else np.nan
+    slope = float(r.MA25_Slope)
+
+    # 先回り寄り：出来高・価格・トレンド転換の組み合わせを評価。
+    vol_pts = 30 if vr >= 3 else 22 if vr >= 2 else 14 if vr >= 1.5 else 6 if vr >= 1.2 else 0
+    ret_pts = 24 if 8 <= ret5 <= 25 else 18 if 5 <= ret5 < 8 else 10 if 0 <= ret5 < 5 else 6 if ret5 > 25 else 0
+    trend_pts = 18 if slope > 0 and p > r.MA25 else 10 if slope > 0 else 0
+
+    prior20 = d.Close.shift(1).rolling(20).max().iloc[-1] if len(d) >= 21 else np.nan
+    breakout_pts = 18 if np.isfinite(prior20) and p > prior20 else 0
+
+    # 急騰し過ぎは予兆としては検出するが、過熱リスクを別途減点。
+    overheat_penalty = 18 if ret5 >= 30 or r.RSI >= 80 else 10 if ret5 >= 20 or r.RSI >= 75 else 0
+
+    news_score, news_state, headlines = (news_signal(t) if use_news else (0, "⚪ ニュース未取得", []))
+    raw = vol_pts + ret_pts + trend_pts + breakout_pts + max(news_score, 0) - overheat_penalty
+    score = int(np.clip(raw, 0, 100))
+
+    if score >= 70:
+        state = "🚨 強い急騰予兆"
+    elif score >= 55:
+        state = "🟠 急騰予兆"
+    elif score >= 40:
+        state = "🟡 変化検知"
+    else:
+        state = "⚪ 通常"
+
+    return {
+        "コード": code(t), "銘柄名": name(t), "株価": p,
+        "急騰予兆スコア": score, "急騰予兆判定": state,
+        "5日騰落率": ret5, "25日騰落率": ret25,
+        "出来高倍率": vr, "MA25乖離率": ma25_gap,
+        "MA25傾き": slope, "RSI": float(r.RSI),
+        "出来高ポイント": vol_pts, "騰落率ポイント": ret_pts,
+        "トレンドポイント": trend_pts, "ブレイクポイント": breakout_pts,
+        "ニュースポイント": news_score, "過熱減点": overheat_penalty,
+        "ニュース判定": news_state,
+        "ニュース見出し": " | ".join(headlines),
+        "重点監視": code(t) in WATCH_CODES,
+        "6085特別監視": code(t) == "6085",
+        "実保有": code(t) in HELD_CODES,
+        "先回り用途": True,
+        "通常BUYとは別判定": True,
+    }
+
 # =========================================================
 # サイドバー
 # =========================================================
@@ -678,6 +773,11 @@ with st.sidebar:
         True
     )
 
+    use_news_radar = st.checkbox(
+        "急騰予兆AIで現在ニュースも取得",
+        True
+    )
+
     universe = st.text_area(
         "分析対象銘柄コード",
         DEFAULT
@@ -698,11 +798,11 @@ with st.sidebar:
 # メイン画面
 # =========================================================
 st.title(
-    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.3"
+    "📈 日本株 AI投資アシスタント Ver.5.5 RC3.4"
 )
 
 st.caption(
-    "RC3.3検証版：AIスコア90+の過信を抑制し、85-90帯を基準帯として検証。6085のデータ欠落を自動検知・再取得します。"
+    "RC3.4検証版：通常AIは根拠重視、別系統で「急騰予兆AI」を搭載。出来高・値動き・トレンド転換・現在ニュースを検知します。"
     "BUY最低AIスコア条件を実際の判定にも反映。"
 )
 
@@ -907,7 +1007,7 @@ for dt in dates:
             "株数":shares,
             "損益":0,
             "損益率":0,
-            "理由":"Ver.5.5 RC3.3 AI BUY（翌営業日寄付約定）",
+            "理由":"Ver.5.5 RC3.4 AI BUY（翌営業日寄付約定）",
             "シグナル日":order["signal_date"],
             "テクニカルスコア":order["ts"],
             "総合AIスコア":order["score"],
@@ -1480,6 +1580,26 @@ latest_df = (
 )
 
 
+
+# =========================================================
+# 急騰予兆AI
+# =========================================================
+surge_rows = []
+for t, d in data.items():
+    c = code(t)
+    if use_liq and c not in liq_codes and c not in WATCH_CODES:
+        continue
+    row = surge_radar_row(t, d, use_news=use_news_radar and (c in WATCH_CODES or c in liq_codes))
+    if row is not None:
+        surge_rows.append(row)
+
+surge_df = pd.DataFrame(surge_rows)
+if not surge_df.empty:
+    surge_df = surge_df.sort_values(
+        ["急騰予兆スコア", "出来高倍率"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
 # =========================================================
 # 保有銘柄SELL判定
 # =========================================================
@@ -1767,6 +1887,30 @@ else:
             f"　｜海外環境 **{r.get('海外為替判定','中立')}**"
         )
 
+
+
+# =========================================================
+# 急騰予兆WATCH
+# =========================================================
+st.header("🟠 急騰予兆AI WATCH TOP3")
+st.caption("急騰予兆AIはBUY推奨ではありません。通常AIとは独立して『異変の早期検知』を行い、先回り候補をWATCHします。")
+if surge_df.empty:
+    st.info("急騰予兆データがありません。")
+else:
+    watch_df = surge_df[surge_df["急騰予兆スコア"] >= 40].copy()
+    if watch_df.empty:
+        st.info("現時点で強い急騰予兆は検出されていません。")
+    else:
+        for _, rr in watch_df.head(3).iterrows():
+            badge = "🚨" if rr["急騰予兆スコア"] >= 70 else "🟠"
+            special = " 6085重点監視" if rr["6085特別監視"] else ""
+            st.warning(
+                f"{badge} **{rr['銘柄名']}（{rr['コード']}）**{special} "
+                f"｜予兆 {rr['急騰予兆スコア']:.0f}点 "
+                f"｜5日 {rr['5日騰落率']:+.1f}% "
+                f"｜出来高 {rr['出来高倍率']:.1f}倍 "
+                f"｜{rr['ニュース判定']}"
+            )
 
 # =========================================================
 # SELL
@@ -2311,6 +2455,7 @@ if "6085.T" in data and not data["6085.T"].empty:
     })
 
 files["16_6085_special_analysis.csv"] = pd.DataFrame(special_rows)
+files["17_surge_radar.csv"] = surge_df
 
 buf = BytesIO()
 with ZipFile(buf, "w") as z:
@@ -2329,7 +2474,7 @@ st.download_button(
 )
 
 st.caption(
-    "RC3.3 CLEAN：AI 85～90点帯を重点検証し、90点以上は過信補正を検証。"
+    "RC3.4：通常AI＋急騰予兆AIの二刀流。急騰予兆はBUYではなくWATCH専用で、ニュースは現在情報のみを補助利用します。"
     "6085は専用診断CSVで取得最終日・テクニカル・出来高を確認します。"
 )
 st.caption("※仮想バックテスト・投資判断補助です。SBI証券への自動発注は行いません。")

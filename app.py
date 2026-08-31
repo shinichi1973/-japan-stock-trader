@@ -1,4 +1,4 @@
-# ============================================================
+============================================================
 # 日本株 AI投資アシスタント Ver.6.0
 # BUILD: VER6.0-FOUNDATION-20260831
 #
@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import plistlib
 from datetime import datetime, timedelta
 from zipfile import ZipFile
 
@@ -34,8 +35,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6 SBI-TRADE-CSV"
-BUILD = "VER6.0-RC6-SBI-TRADE-CSV-20260901"
+VERSION = "6.0 RC6.1 SBI-TRADE-CSV + BUYING-POWER"
+BUILD = "VER6.0-RC6.1-BUYING-POWER-SIZING-20260901"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -704,6 +705,179 @@ def rebuild_holdings_from_trades(trades):
     return holdings, lots, pd.DataFrame(audit), warning_df
 
 # ------------------------------------------------------------
+# SBI買付余力ファイル読取 / 購入株数プラン
+# ------------------------------------------------------------
+def _decode_text_bytes(raw):
+    """CSV/TXT/HTMLなどを文字列化。Apple WebArchiveにも対応。"""
+    if raw is None:
+        return ""
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw)
+
+    # Safari等で保存した .webarchive はbinary plistの場合がある。
+    try:
+        obj = plistlib.loads(raw)
+        main = obj.get("WebMainResource", {}) if isinstance(obj, dict) else {}
+        data = main.get("WebResourceData")
+        if isinstance(data, (bytes, bytearray)):
+            raw = bytes(data)
+    except Exception:
+        pass
+
+    for enc in ("utf-8-sig", "cp932", "shift_jis", "utf-8", "euc_jp"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
+def extract_buying_power_from_file(uploaded_file):
+    """SBI口座サマリー等の保存ファイルから買付余力を抽出する。
+
+    優先順:
+      1) 買付余力（2営業日後）
+      2) 現物買付余力
+      3) 買付余力
+    スクリーンショット/OCRは使用しない。
+    """
+    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    text = _decode_text_bytes(raw)
+    # HTMLタグ・連続空白を簡易正規化
+    plain = re.sub(r"<script.*?</script>|<style.*?</style>", " ", text, flags=re.I | re.S)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    plain = plain.replace("&nbsp;", " ").replace("&#44;", ",")
+    plain = re.sub(r"[\u00a0\s]+", " ", plain)
+
+    labels = [
+        r"買付余力\s*[（(]?\s*2営業日後\s*[）)]?",
+        r"現物買付余力",
+        r"買付余力",
+    ]
+    for label in labels:
+        m = re.search(label + r"[^0-9]{0,80}([0-9][0-9,]{0,20})\s*円?", plain, flags=re.I)
+        if m:
+            try:
+                val = int(m.group(1).replace(",", ""))
+                if 0 <= val <= 10_000_000_000:
+                    return val, plain[:5000]
+            except Exception:
+                pass
+    raise ValueError("買付余力の金額を自動検出できませんでした。手入力欄を使用してください。")
+
+
+def build_purchase_plan(candidates, buying_power, current_assets, held_codes, max_positions,
+                        max_per_stock, stop_loss_pct, reserve_pct, daily_deploy_pct,
+                        risk_per_trade_pct, price_buffer_pct, allow_addon=False,
+                        market_block=False):
+    """S株を前提に、買付余力・リスク上限から購入株数を算出する。
+
+    資金上限 = min(
+      1銘柄最大購入額,
+      1日投資上限の候補按分,
+      1トレード損失許容額 ÷ 損切り率
+    )
+    寄付価格上振れに備え、計算用価格には price_buffer_pct を加える。
+    """
+    cols = [
+        "購入優先度","コード","銘柄名","総合AIスコア","現在株価","計算用株価",
+        "購入株数","予定購入額","余力引当額","買付余力使用率","注文想定",
+        "買付可否","見送り理由","購入後推定余力"
+    ]
+    if candidates is None or candidates.empty:
+        return pd.DataFrame(columns=cols)
+
+    bp = max(float(buying_power or 0), 0.0)
+    assets = max(float(current_assets or 0), 0.0)
+    if bp <= 0:
+        x = candidates.head(3).copy()
+        rows = []
+        for i, (_, r) in enumerate(x.iterrows(), 1):
+            rows.append({
+                "購入優先度": i, "コード": r["コード"], "銘柄名": r["銘柄名"],
+                "総合AIスコア": r["総合AIスコア"], "現在株価": r["現在株価"],
+                "計算用株価": np.nan, "購入株数": 0, "予定購入額": 0,
+                "余力引当額": 0, "買付余力使用率": 0.0, "注文想定": "S株",
+                "買付可否": "⛔ NO BUY", "見送り理由": "買付余力が0円/未入力",
+                "購入後推定余力": bp,
+            })
+        return pd.DataFrame(rows, columns=cols)
+
+    x = candidates.sort_values("総合AIスコア", ascending=False).copy()
+    if not allow_addon:
+        x = x[~x["コード"].astype(str).isin(set(map(str, held_codes)))]
+
+    slots = max(int(max_positions) - len(set(map(str, held_codes))), 0)
+    x = x.head(min(3, slots if slots > 0 else 3)).copy()
+
+    if x.empty:
+        return pd.DataFrame(columns=cols)
+
+    reserve_yen = bp * float(reserve_pct) / 100.0
+    usable = max(bp - reserve_yen, 0.0)
+    daily_cap = usable * float(daily_deploy_pct) / 100.0
+    risk_yen = assets * float(risk_per_trade_pct) / 100.0
+    risk_notional_cap = risk_yen / max(float(stop_loss_pct) / 100.0, 0.001)
+    per_candidate_daily = daily_cap / max(len(x), 1)
+    base_cap = min(float(max_per_stock), per_candidate_daily, risk_notional_cap)
+
+    remaining = bp
+    rows = []
+    for i, (_, r) in enumerate(x.iterrows(), 1):
+        price = float(r["現在株価"])
+        calc_price = price * (1.0 + float(price_buffer_pct) / 100.0)
+        reason = ""
+        can_buy = True
+
+        if market_block:
+            can_buy = False
+            reason = "市場環境悪化によるNO TRADE"
+        elif slots <= 0:
+            can_buy = False
+            reason = f"最大保有銘柄数{int(max_positions)}に到達"
+        elif calc_price <= 0:
+            can_buy = False
+            reason = "株価データ不正"
+
+        budget = min(base_cap, remaining, max(remaining - reserve_yen, 0.0)) if can_buy else 0.0
+        shares = int(math.floor(budget / calc_price)) if calc_price > 0 and budget > 0 else 0
+        if shares < 1 and can_buy:
+            can_buy = False
+            reason = "安全余力・リスク上限内では1株も購入できない"
+            shares = 0
+
+        planned_cost = shares * price
+        reserved_cost = shares * calc_price
+        if reserved_cost > remaining + 1e-9:
+            shares = int(math.floor(remaining / calc_price))
+            planned_cost = shares * price
+            reserved_cost = shares * calc_price
+
+        if shares <= 0:
+            can_buy = False
+        if can_buy:
+            remaining = max(remaining - reserved_cost, 0.0)
+
+        rows.append({
+            "購入優先度": i,
+            "コード": str(r["コード"]),
+            "銘柄名": r["銘柄名"],
+            "総合AIスコア": float(r["総合AIスコア"]),
+            "現在株価": price,
+            "計算用株価": calc_price,
+            "購入株数": int(shares),
+            "予定購入額": float(planned_cost),
+            "余力引当額": float(reserved_cost),
+            "買付余力使用率": (reserved_cost / bp * 100.0) if bp else 0.0,
+            "注文想定": "S株（価格上振れバッファ込みで株数計算）",
+            "買付可否": "🟢 BUY" if can_buy and shares > 0 else "⛔ NO BUY",
+            "見送り理由": reason,
+            "購入後推定余力": float(remaining),
+        })
+
+    return pd.DataFrame(rows, columns=cols)
+
+# ------------------------------------------------------------
 # サイドバー
 # ------------------------------------------------------------
 with st.sidebar:
@@ -723,6 +897,13 @@ with st.sidebar:
     minbuy_score = st.slider("BUY最低AIスコア", 70, 95, 80)
     max_gap = st.slider("翌営業日寄付ギャップ許容（%）", 1.0, 10.0, 5.0, .5)
 
+    st.subheader("購入株数・資金管理")
+    reserve_pct = st.slider("買付余力の現金温存率（%）", 0, 80, 20, 5)
+    daily_deploy_pct = st.slider("1日に使う余力上限（%）", 10, 100, 50, 5)
+    risk_per_trade_pct = st.slider("1銘柄の許容損失（総資産比%）", 0.25, 3.0, 1.0, 0.25)
+    price_buffer_pct = st.slider("寄付価格上振れバッファ（%）", 0.0, 10.0, 3.0, .5)
+    allow_addon = st.checkbox("保有銘柄への買い増しを許可", False)
+
     st.subheader("連敗ブレーキ")
     cooldown = st.number_input("4連敗後のBUY停止日数", 5, 30, 10)
     risk_cooldown = st.number_input("9連敗後のBUY停止日数", 5, 45, 15)
@@ -741,9 +922,9 @@ st.title("📈 日本株 AI投資アシスタント Ver.6.0")
 st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
-    "保有銘柄はSBI証券『約定履歴CSV』だけから自動復元するVer.6.0 RC6です。"
+    "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算するVer.6.0 RC6.1です。"
 )
-st.success("📄 保有銘柄取得：SBI約定履歴CSV方式（スクショ/OCR完全除外）")
+st.success("📄 保有銘柄：SBI約定履歴CSV / 💴 購入株数：買付余力連動（スクショ/OCR完全除外）")
 
 # ------------------------------------------------------------
 # SBI約定履歴CSV
@@ -862,6 +1043,53 @@ else:
     st.warning("🤖 保有AI入力：0銘柄。SBI約定履歴CSVをアップロードしてください。")
 
 # ------------------------------------------------------------
+# SBI買付余力
+# ------------------------------------------------------------
+st.header("💴 ② SBI買付余力 / 購入可能資金")
+st.caption(
+    "SBI『口座管理 → 口座（円建）→ 買付余力』の買付余力を使用します。"
+    "CSV/TXT/HTML/WebArchiveとして保存できた場合は自動読取できます。"
+    "自動読取できない場合も、金額1つだけ入力すれば購入株数を自動計算します。"
+)
+
+bp_file = st.file_uploader(
+    "SBI買付余力情報ファイル（任意・スクショ不可）",
+    type=["csv", "txt", "html", "htm", "webarchive"],
+    key="sbi_buying_power_file"
+)
+
+detected_buying_power = None
+buying_power_source = "手入力"
+bp_parse_error = ""
+if bp_file is not None:
+    try:
+        detected_buying_power, _bp_text = extract_buying_power_from_file(bp_file)
+        st.session_state["sbi_buying_power_yen"] = int(detected_buying_power)
+        buying_power_source = f"SBI余力ファイル自動読取: {bp_file.name}"
+        st.success(f"✅ 買付余力を自動取得：¥{int(detected_buying_power):,}")
+    except Exception as e:
+        bp_parse_error = str(e)
+        st.warning(f"買付余力ファイルを自動読取できませんでした：{e}")
+
+if "sbi_buying_power_yen" not in st.session_state:
+    st.session_state["sbi_buying_power_yen"] = 0
+buying_power = st.number_input(
+    "SBI 現物買付余力（円）",
+    min_value=0,
+    max_value=1_000_000_000,
+    step=1000,
+    key="sbi_buying_power_yen",
+    help="SBI画面の買付余力を入力。保有銘柄のような複数項目の手入力は不要で、この1項目だけです。"
+)
+if detected_buying_power is None:
+    buying_power_source = "手入力"
+
+bp_c1, bp_c2, bp_c3 = st.columns(3)
+bp_c1.metric("買付余力", f"¥{int(buying_power):,}")
+bp_c2.metric("現金温存", f"{reserve_pct}%")
+bp_c3.metric("1日使用上限", f"{daily_deploy_pct}%")
+
+# ------------------------------------------------------------
 # データ取得
 # ------------------------------------------------------------
 analysis_codes = list(dict.fromkeys(parse_codes(universe_text) + held_codes))
@@ -876,7 +1104,7 @@ st.success(f"株価データ取得：{len(data)}銘柄")
 # ------------------------------------------------------------
 # 目標資産 / 複利ロードマップ
 # ------------------------------------------------------------
-st.header("🎯 ② 60万円 → 1億円 複利ロードマップ")
+st.header("🎯 ③ 60万円 → 1億円 複利ロードマップ")
 if current_assets > 0 and target_assets > current_assets:
     months_10 = math.log(target_assets / current_assets) / math.log(1.10)
     st.write(f"月利10%を毎月完全に複利で達成した場合の理論値：**約{months_10:.1f}か月**")
@@ -1137,6 +1365,31 @@ today_buy_df = latest_df[latest_df["総合AIスコア"] >= minbuy_score].copy() 
 if not today_buy_df.empty:
     today_buy_df = today_buy_df.sort_values("総合AIスコア", ascending=False).reset_index(drop=True)
 
+# 現在市場のNO TRADE判定（購入株数計算にも使用）
+_latest_dt_for_market = max(data[next(iter(data))].index) if data else datetime.now()
+_current_market_state = market_info(market, _latest_dt_for_market)[0] if not market.empty and data else "⚪ データなし"
+_market_block = bool(no_trade_on_bad_market and ("🔴" in _current_market_state or "🟠" in _current_market_state))
+
+purchase_plan_df = build_purchase_plan(
+    today_buy_df, buying_power, current_assets, held_codes, maxpos, maxbuy, sl,
+    reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
+    allow_addon=allow_addon, market_block=_market_block
+)
+
+buying_power_df = pd.DataFrame([{
+    "買付余力": float(buying_power),
+    "データ元": buying_power_source,
+    "現金温存率": float(reserve_pct),
+    "1日使用上限率": float(daily_deploy_pct),
+    "1銘柄許容損失率_総資産比": float(risk_per_trade_pct),
+    "寄付価格上振れバッファ": float(price_buffer_pct),
+    "最大保有銘柄数": int(maxpos),
+    "現在保有銘柄数": len(held_codes),
+    "買い増し許可": bool(allow_addon),
+    "市場NO_TRADE": bool(_market_block),
+    "市場判定": _current_market_state,
+}])
+
 # ------------------------------------------------------------
 # 保有銘柄AI
 # ------------------------------------------------------------
@@ -1229,19 +1482,33 @@ else:
         st.dataframe(hold, use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------
-# UI：新規BUY / テンバガー
+# UI：新規BUY / 購入株数 / テンバガー
 # ------------------------------------------------------------
-st.header("🟢 ⑤ 今日の新規BUY候補 TOP3")
-if latest_df.empty:
-    st.info("💤 条件を満たす新規BUY候補はありません。NO TRADEを優先します。")
+st.header("🟢 ⑤ 今日の正式BUY / 購入株数 TOP3")
+if today_buy_df.empty:
+    st.info(f"💤 BUY基準（AI {minbuy_score}点以上）を満たす銘柄はありません。今日はNO TRADEです。")
+elif purchase_plan_df.empty:
+    st.warning("正式BUY候補はありますが、資金管理条件により購入株数を出せません。最大保有銘柄数などを確認してください。")
 else:
-    for i,(_,rr) in enumerate(latest_df.head(3).iterrows()):
-        icon = ["🥇","🥈","🥉"][i]
-        st.success(
-            f"{icon} **{rr['銘柄名']}（{rr['コード']}）**｜"
-            f"総合AI {rr['総合AIスコア']:.0f}｜企業価値 {rr['企業価値スコア']:.0f}｜"
-            f"成長性 {rr['成長性スコア']:.0f}｜テンバガー {rr['テンバガー度']:.0f}"
-        )
+    executable = purchase_plan_df[(purchase_plan_df["買付可否"] == "🟢 BUY") & (purchase_plan_df["購入株数"] > 0)]
+    if executable.empty:
+        st.warning("正式BUY候補はありますが、本日の買付余力・市場・保有上限では購入指示は0株です。")
+    for _, rr in purchase_plan_df.iterrows():
+        if rr["買付可否"] == "🟢 BUY":
+            st.success(
+                f"**{int(rr['購入優先度'])}位 {rr['銘柄名']}（{rr['コード']}）**｜"
+                f"AI {rr['総合AIスコア']:.1f}｜**{int(rr['購入株数'])}株**｜"
+                f"概算 ¥{rr['予定購入額']:,.0f}｜購入後余力 約¥{rr['購入後推定余力']:,.0f}"
+            )
+        else:
+            st.info(
+                f"{int(rr['購入優先度'])}位 {rr['銘柄名']}（{rr['コード']}）｜0株｜{rr['見送り理由']}"
+            )
+    st.dataframe(purchase_plan_df, use_container_width=True, hide_index=True)
+    st.caption(
+        "購入株数はS株1株単位。現在株価に上振れバッファを加えて余力を引き当てます。"
+        "実際の約定価格は寄付等で変動するため、表示金額は概算です。"
+    )
 
 st.header("🔥 ⑥ テンバガーAI候補")
 if latest_df.empty:
@@ -1258,7 +1525,7 @@ else:
 # ------------------------------------------------------------
 # UI：市場とNO TRADE
 # ------------------------------------------------------------
-latest_market_state = market_info(market, max(data[next(iter(data))].index) if data else datetime.now())[0] if not market.empty and data else "⚪ データなし"
+latest_market_state = _current_market_state
 st.header("🌎 ⑦ 市場環境 / NO TRADE")
 if "🔴" in latest_market_state or "🟠" in latest_market_state:
     st.warning(f"市場環境：{latest_market_state} → 無理な新規BUYを抑制")
@@ -1276,13 +1543,13 @@ summary = pd.DataFrame({
         "Ver","初期資金","最終資産","損益","損益率","決済トレード数",
         "勝率","Profit Factor","最大DD","最大DD率","最大連続損失",
         "ファンダメンタルAI","テンバガーAI","保有銘柄AI","SBI約定履歴CSV",
-        "未来情報混入","SBI自動発注"
+        "SBI買付余力","購入株数自動計算","未来情報混入","SBI自動発注"
     ],
     "結果":[
         VERSION,initial,final,final-initial,(final/initial-1)*100 if initial else 0,
         len(selltr),winrate,pf,maxdd,maxddrate,maxloss,
         "現在情報のみ・バックテスト未使用","あり","あり","あり",
-        "なし","なし"
+        f"¥{int(buying_power):,} ({buying_power_source})","あり","なし","なし"
     ]
 })
 st.dataframe(summary, use_container_width=True, hide_index=True)
@@ -1295,6 +1562,8 @@ quality = pd.DataFrame([
     {"チェック":"未来情報","状態":"🟢 OK","内容":"バックテストのBUY/SELL判定は日付時点の価格データのみ"},
     {"チェック":"現在ファンダメンタル","状態":"🟡 現在分析のみ","内容":"Yahoo Financeの現在情報。過去バックテストには混入させない"},
     {"チェック":"SBI約定履歴CSV","状態":"🟢 自動復元","内容":"約定履歴の買付・売却を時系列処理し、現在株数と平均取得単価を自動復元。スクショ/OCRは完全除外"},
+    {"チェック":"買付余力","状態":"🟢 連動" if buying_power > 0 else "🟡 未入力","内容":f"{buying_power_source} / 購入株数計算に使用"},
+    {"チェック":"購入株数","状態":"🟢 資金管理","内容":"買付余力・現金温存率・1日上限・損切り幅・1銘柄リスク・価格上振れバッファからS株数を算出"},
     {"チェック":"SBI自動発注","状態":"🟢 OFF","内容":"注文は行わない"},
     {"チェック":"NO TRADE","状態":"🟢 ON","内容":"市場悪化・条件不足時は無理なBUYを抑制"},
 ])
@@ -1315,7 +1584,9 @@ stock_results = (
 
 files = {
     "00_summary.csv":summary,
+    "00b_buying_power.csv":buying_power_df,
     "01_today_buy.csv":today_buy_df,
+    "01a_purchase_plan.csv":purchase_plan_df,
     "01b_current_candidates.csv":latest_df,
     "02_holdings_ai.csv":holdings_df,
     "02a_holdings_input.csv":holdings_input_df,
@@ -1344,12 +1615,12 @@ st.header("📦 ⑩ 全処理データ")
 st.download_button(
     "📦 Ver.6.0 全処理データをZIPでダウンロード",
     buf.getvalue(),
-    "ver6_0_all_analysis.zip",
+    "ver6_0_RC6_1_all_analysis.zip",
     "application/zip",
     use_container_width=True
 )
 
 st.caption(
     "※本版は投資判断補助・検証用です。月利10%・1億円到達・テンバガー化・"
-    "AI適正株価を保証するものではありません。"
+    "AI適正株価・購入株数による利益を保証するものではありません。SBIへの自動発注は行いません。"
 )

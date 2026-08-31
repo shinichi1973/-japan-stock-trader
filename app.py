@@ -35,8 +35,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC4 HOLDINGS-BRIDGE-SAFE"
-BUILD = "VER6.0-RC4-HOLDINGS-BRIDGE-SAFE-20260901"
+VERSION = "6.0 RC5 HOLDINGS-WORKBENCH"
+BUILD = "VER6.0-RC5-HOLDINGS-WORKBENCH-20260901"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -608,6 +608,17 @@ def normalize_holdings_rows(rows):
     for i, r in df.iterrows():
         cp, ap, pl = r["current_price"], r["avg_price"], r["pnl"]
         cp, ap, repair_notes = repair_sbi_prices(cp, ap, r["pnl_pct"])
+
+        # 取得単価がOCRで欠落した場合、現在値と損益率から「確認用の参考値」を補完。
+        # 自動確定はせず、ユーザー確認を必須にする。
+        if (not np.isfinite(_num(ap))) and np.isfinite(_num(cp)) and np.isfinite(_num(r["pnl_pct"])):
+            pp = _num(r["pnl_pct"])
+            if -95 < pp < 500 and abs(1 + pp/100) > 1e-9:
+                implied_ap = _num(cp) / (1 + pp/100)
+                if np.isfinite(implied_ap) and implied_ap > 0:
+                    ap = round(implied_ap, 2)
+                    repair_notes.append(f"取得単価参考補完:{ap:g}(損益率から計算)")
+
         df.at[i, "current_price"] = cp
         df.at[i, "avg_price"] = ap
         sh = r["shares"]
@@ -850,7 +861,7 @@ st.title("📈 日本株 AI投資アシスタント Ver.6.0")
 st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・"
-    "損切り/資金管理を追加し、SBIスクショ無料OCRと保有AIへの安全な受け渡しを強化したVer.6.0 RC4です。"
+    "損切り/資金管理に加え、SBIスクショを『OCR→編集確認→確定→保有AI』へ確実に渡すワークベンチ方式を搭載したVer.6.0 RC5です。"
 )
 
 st.success("📷 スクショ解析：無料OCR版（OpenAI APIキー不要）")
@@ -906,118 +917,195 @@ if not ocr_df.empty:
         st.success("全銘柄の主要数値が整合しました。最終的にはSBI証券画面との照合を推奨します。")
 
 # ------------------------------------------------------------
-# OCR結果の確認・確定（RC4: 保有AIへの受け渡しを明示化）
+# OCR結果の確認・確定（RC5: HOLDINGS WORKBENCH）
 # ------------------------------------------------------------
-# 重要: OCRでコードだけ読めた行を、そのまま保有AIへ流さない。
-#       株数・取得単価が確認できた行だけをユーザー操作で確定する。
+# 方針:
+#   1) OCRで見えた銘柄は必ず編集可能な表に並べる
+#   2) 読めなかった「株数」「取得単価」だけ人が補正できる
+#   3) 確定ボタンは st.form 内に置き、編集途中の再実行で値を失いにくくする
+#   4) 確定済みデータは session_state に保持
+#   5) 株数/取得単価が欠けた行は保有AIへ渡さない
+#   6) ZIPへ「02a_holdings_input.csv」を出し、入力橋渡しを後から検証可能にする
+
 confirmed = st.session_state.get("confirmed_holdings", {})
 
-if not ocr_df.empty:
-    st.subheader("✅ OCR結果を確認して保有銘柄として確定")
-    st.caption(
-        "株数・取得単価を確認してください。黄色/赤の行も、正しい値へ修正すれば使用できます。"
-        "『使用』にチェックした行だけが保有AIへ渡ります。"
-    )
-
-    edit = ocr_df.copy()
-    for col in ["shares","avg_price","current_price","pnl","pnl_pct"]:
-        if col not in edit.columns:
-            edit[col] = np.nan
-        edit[col] = pd.to_numeric(edit[col], errors="coerce")
-
-    # 高信頼かつ株数・取得単価が揃った行のみ、初期状態で使用ON。
-    auto_ok = (
-        edit.get("読取信頼度", pd.Series(index=edit.index, dtype=str)).eq("🟢 高")
-        & edit["shares"].notna() & (edit["shares"] > 0)
-        & edit["avg_price"].notna() & (edit["avg_price"] > 0)
-    )
-    edit.insert(0, "使用", auto_ok)
-
-    # すでに確定済みの値があれば再表示へ反映。
-    for idx, rr in edit.iterrows():
-        c = str(rr.get("code", ""))
-        if c in confirmed:
-            edit.at[idx, "使用"] = True
-            edit.at[idx, "shares"] = confirmed[c].get("shares", edit.at[idx, "shares"])
-            edit.at[idx, "avg_price"] = confirmed[c].get("avg_price", edit.at[idx, "avg_price"])
-
-    editor_cols = [c for c in [
+def _make_workbench_from_ocr(df, confirmed_map):
+    cols = [
         "使用","code","name","shares","avg_price","current_price","pnl","pnl_pct",
         "読取信頼度","自動補正","株数取得方法","確認要否"
-    ] if c in edit.columns]
+    ]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
 
-    edited = st.data_editor(
-        edit[editor_cols],
-        use_container_width=True,
-        hide_index=True,
-        disabled=[c for c in editor_cols if c not in ["使用","shares","avg_price"]],
-        column_config={
-            "使用": st.column_config.CheckboxColumn("使用"),
-            "shares": st.column_config.NumberColumn("株数", min_value=1, step=1, format="%d"),
-            "avg_price": st.column_config.NumberColumn("取得単価", min_value=0.01, step=0.01, format="%.2f"),
-        },
-        key="holdings_ocr_editor",
-    )
+    wb = df.copy()
+    for c in ["shares","avg_price","current_price","pnl","pnl_pct"]:
+        if c not in wb.columns:
+            wb[c] = np.nan
+        wb[c] = pd.to_numeric(wb[c], errors="coerce")
+    if "name" not in wb.columns:
+        wb["name"] = wb["code"].map(lambda x: STOCK_NAMES.get(str(x), str(x)))
 
-    if st.button("✅ この内容を保有銘柄として確定", type="primary", use_container_width=True):
+    # 認識した銘柄は原則「使用ON」。足りない値だけ補正する運用。
+    wb.insert(0, "使用", True)
+
+    # 確定済み値はOCR値より優先して復元。
+    for idx, rr in wb.iterrows():
+        c = str(rr.get("code", "")).strip()
+        if c in confirmed_map:
+            wb.at[idx, "shares"] = confirmed_map[c].get("shares", wb.at[idx, "shares"])
+            wb.at[idx, "avg_price"] = confirmed_map[c].get("avg_price", wb.at[idx, "avg_price"])
+
+    for c in cols:
+        if c not in wb.columns:
+            wb[c] = ""
+    return wb[cols].copy()
+
+# OCR結果が変わった時だけワークベンチを初期化。
+ocr_signature = tuple(
+    (str(r.get("code","")), _num(r.get("avg_price")), _num(r.get("current_price")), _num(r.get("pnl")))
+    for _, r in ocr_df.iterrows()
+) if not ocr_df.empty else tuple()
+
+if ocr_signature and st.session_state.get("ocr_signature") != ocr_signature:
+    st.session_state["holdings_workbench"] = _make_workbench_from_ocr(ocr_df, confirmed)
+    st.session_state["ocr_signature"] = ocr_signature
+
+if "holdings_workbench" not in st.session_state:
+    st.session_state["holdings_workbench"] = _make_workbench_from_ocr(ocr_df, confirmed)
+
+workbench = st.session_state["holdings_workbench"]
+
+st.subheader("🧾 保有銘柄ワークベンチ")
+st.caption(
+    "OCRで認識した銘柄をここで最終確認します。"
+    "株数・取得単価が空欄または誤っている場合だけ直してください。"
+    "『確定して保有AIへ登録』を押した内容だけが売買判定に使われます。"
+)
+
+if workbench.empty:
+    st.info("まだOCR結果がありません。上でSBI証券スクショを解析してください。")
+else:
+    # 状況を先に見せる
+    total_detected = len(workbench)
+    missing_shares = int(pd.to_numeric(workbench["shares"], errors="coerce").isna().sum())
+    missing_avg = int(pd.to_numeric(workbench["avg_price"], errors="coerce").isna().sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("認識銘柄", total_detected)
+    c2.metric("株数未確定", missing_shares)
+    c3.metric("取得単価未確定", missing_avg)
+
+    with st.form("holdings_workbench_form", clear_on_submit=False):
+        edited = st.data_editor(
+            workbench,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=[
+                "code","name","current_price","pnl","pnl_pct",
+                "読取信頼度","自動補正","株数取得方法","確認要否"
+            ],
+            column_config={
+                "使用": st.column_config.CheckboxColumn("使用", help="保有AIへ登録する銘柄"),
+                "code": st.column_config.TextColumn("コード"),
+                "name": st.column_config.TextColumn("銘柄名"),
+                "shares": st.column_config.NumberColumn(
+                    "株数", min_value=1, step=1, format="%d",
+                    help="SBI画面に株数が無ければ、保有株数を入力してください"
+                ),
+                "avg_price": st.column_config.NumberColumn(
+                    "取得単価", min_value=0.01, step=0.01, format="%.2f",
+                    help="SBI表示の取得単価を入力してください"
+                ),
+                "current_price": st.column_config.NumberColumn("OCR現在値", format="%.2f"),
+                "pnl": st.column_config.NumberColumn("OCR評価損益", format="%.2f"),
+                "pnl_pct": st.column_config.NumberColumn("OCR損益率(%)", format="%.2f"),
+            },
+            key="holdings_workbench_editor",
+        )
+
+        submitted = st.form_submit_button(
+            "✅ 確定して保有AIへ登録",
+            type="primary",
+            use_container_width=True
+        )
+
+    # 編集値は常にワークベンチへ保存。フォーム送信後も保持。
+    st.session_state["holdings_workbench"] = edited.copy()
+    workbench = edited.copy()
+
+    if submitted:
         new_confirmed = {}
-        errors = []
+        invalid_rows = []
+
         for _, rr in edited.iterrows():
             if not bool(rr.get("使用", False)):
                 continue
+
             c = str(rr.get("code", "")).strip()
             sh = _num(rr.get("shares"))
             ap = _num(rr.get("avg_price"))
+
+            reasons = []
             if not re.fullmatch(r"\d{4}", c):
-                errors.append(f"銘柄コード {c}: 4桁コードではありません")
-                continue
+                reasons.append("銘柄コード不正")
             if not (np.isfinite(sh) and sh > 0 and abs(sh-round(sh)) < 1e-6):
-                errors.append(f"{c} {STOCK_NAMES.get(c,c)}: 株数を確認してください")
-                continue
+                reasons.append("株数未確定")
             if not (np.isfinite(ap) and ap > 0):
-                errors.append(f"{c} {STOCK_NAMES.get(c,c)}: 取得単価を確認してください")
+                reasons.append("取得単価未確定")
+
+            if reasons:
+                invalid_rows.append(f"{c} {STOCK_NAMES.get(c,c)}：{' / '.join(reasons)}")
                 continue
+
             new_confirmed[c] = {
                 "shares": int(round(sh)),
                 "avg_price": float(ap),
-                "source": "SBIスクショ確認済み",
+                "source": "SBIスクショ・ワークベンチ確認済み",
             }
 
-        if errors:
-            st.error("確定できない行があります。\n- " + "\n- ".join(errors))
-        elif not new_confirmed:
-            st.warning("『使用』にチェックされた銘柄がありません。")
-        else:
+        # 有効行は登録し、不完全行だけ残して警告する。
+        if new_confirmed:
             st.session_state["confirmed_holdings"] = new_confirmed
             confirmed = new_confirmed
-            st.success(f"{len(new_confirmed)}銘柄を保有AIへ登録しました。")
+            st.success(f"✅ {len(new_confirmed)}銘柄を保有AIへ登録しました。")
+        else:
+            st.warning("登録できる銘柄がありません。株数と取得単価を確認してください。")
 
+        if invalid_rows:
+            st.warning(
+                "次の行は未確定のため保有AIへ登録していません。\n\n- "
+                + "\n- ".join(invalid_rows)
+            )
+
+# 確定済みデータの表示
+confirmed = st.session_state.get("confirmed_holdings", confirmed)
 if confirmed:
     st.subheader("📦 保有AIへ登録済み")
     confirmed_view = pd.DataFrame([
         {
-            "code": c,
-            "name": STOCK_NAMES.get(c,c),
-            "shares": v.get("shares"),
-            "avg_price": v.get("avg_price"),
+            "コード": c,
+            "銘柄名": STOCK_NAMES.get(c,c),
+            "株数": int(v.get("shares")),
+            "取得単価": float(v.get("avg_price")),
             "データ元": v.get("source", "確認済み"),
         }
         for c,v in confirmed.items()
     ])
     st.dataframe(confirmed_view, use_container_width=True, hide_index=True)
 
-# 手動補正欄（OCRが使えない場合・追加銘柄がある場合）
-with st.expander("📝 手動入力／追加補正（任意）"):
-    manual_held_text = st.text_area(
-        "追加する保有銘柄コード（例：7203,9432）",
-        "",
-        height=70
-    )
+    if st.button("🗑️ 保有AI登録をクリア", use_container_width=True):
+        st.session_state["confirmed_holdings"] = {}
+        confirmed = {}
+        st.rerun()
+
+# OCRが不十分だった場合の追加手動入力。
+with st.expander("➕ OCRに無い保有銘柄を追加（任意）"):
+    st.caption("形式：銘柄コード、取得単価、株数。3項目すべて揃った銘柄だけ追加します。")
+    manual_held_text = st.text_area("追加銘柄コード（例：7203,9432）", "", height=70)
     entries_text = st.text_area("取得単価（例：7203:1500）", "")
     shares_text = st.text_area("株数（例：7203:10）", "")
 
-# RC4では、OCRでコードだけ見えた銘柄を自動登録しない。
-# 確定ボタンを通過したデータ + 明示的な手動入力だけを使用する。
+# 確定データ＋明示的な手動入力のみを保有AIへ渡す。
 held_codes = list(confirmed.keys())
 entry_map = {c: float(v["avg_price"]) for c,v in confirmed.items()}
 share_map = {c: int(v["shares"]) for c,v in confirmed.items()}
@@ -1034,7 +1122,24 @@ for c in manual_codes:
 
 held_codes = list(dict.fromkeys(held_codes))
 
-# 保有情報の最終安全チェック。取得単価または株数が無い銘柄は保有AIへ渡さない。
+# 入力橋渡し監査用データ。ZIPにも保存する。
+holdings_input_rows = []
+for c in held_codes:
+    holdings_input_rows.append({
+        "コード": c,
+        "銘柄名": STOCK_NAMES.get(c,c),
+        "株数": share_map.get(c, np.nan),
+        "取得単価": entry_map.get(c, np.nan),
+        "データ元": confirmed.get(c, {}).get("source", "手動入力"),
+        "保有AI使用可": (
+            "YES"
+            if np.isfinite(_num(share_map.get(c))) and _num(share_map.get(c)) > 0
+            and np.isfinite(_num(entry_map.get(c))) and _num(entry_map.get(c)) > 0
+            else "NO"
+        )
+    })
+holdings_input_df = pd.DataFrame(holdings_input_rows)
+
 invalid_holdings = [
     c for c in held_codes
     if c not in entry_map or c not in share_map
@@ -1047,6 +1152,12 @@ if invalid_holdings:
         + ", ".join(invalid_holdings)
     )
     held_codes = [c for c in held_codes if c not in invalid_holdings]
+
+if held_codes:
+    st.success(f"🤖 保有AI入力：{len(held_codes)}銘柄")
+else:
+    st.warning("🤖 保有AI入力：0銘柄。スクショ解析後、ワークベンチで株数・取得単価を確認して確定してください。")
+
 
 # ------------------------------------------------------------
 # データ取得
@@ -1481,7 +1592,7 @@ st.header("🛡️ ⑨ データ品質・AI安全チェック")
 quality = pd.DataFrame([
     {"チェック":"未来情報","状態":"🟢 OK","内容":"バックテストのBUY/SELL判定は日付時点の価格データのみ"},
     {"チェック":"現在ファンダメンタル","状態":"🟡 現在分析のみ","内容":"Yahoo Financeの現在情報。過去バックテストには混入させない"},
-    {"チェック":"スクショOCR","状態":"🟢 無料・安全強化","内容":"SBI専用OCR。先頭桁欠落補正＋株数逆算＋整合性検証。RC4では株数/取得単価を確認・確定した行だけ保有AIへ渡す"},
+    {"チェック":"スクショOCR","状態":"🟢 無料・安全強化","内容":"SBI専用無料OCR＋編集ワークベンチ。RC5では株数/取得単価を確認・確定した行だけ保有AIへ渡し、入力橋渡しCSVも保存"},
     {"チェック":"SBI自動発注","状態":"🟢 OFF","内容":"注文は行わない"},
     {"チェック":"NO TRADE","状態":"🟢 ON","内容":"市場悪化・条件不足時は無理なBUYを抑制"},
 ])
@@ -1505,6 +1616,7 @@ files = {
     "01_today_buy.csv":today_buy_df,
     "01b_current_candidates.csv":latest_df,
     "02_holdings_ai.csv":holdings_df,
+    "02a_holdings_input.csv":holdings_input_df,
     "03_tenbagger_candidates.csv":latest_df.sort_values("テンバガー度",ascending=False) if not latest_df.empty else latest_df,
     "04_all_ai_analysis.csv":analysis_df,
     "05_trade_history.csv":trades_df,

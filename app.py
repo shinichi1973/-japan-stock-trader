@@ -652,10 +652,6 @@ with st.expander("📝 OCRを使わない場合／補正用（任意）"):
     )
     entries_text = st.text_area("取得単価（例：7203:1500）", "")
     shares_text = st.text_area("株数（例：7203:10）", "")
-else:
-    held_text = ""
-    entries_text = ""
-    shares_text = ""
 
 held_codes = parse_codes(held_text)
 entry_map = parse_entries(entries_text)

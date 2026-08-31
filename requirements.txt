@@ -2,5 +2,3 @@ streamlit
 pandas
 numpy
 yfinance
-Pillow
-pytesseract

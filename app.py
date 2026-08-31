@@ -35,8 +35,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC2 FREE-OCR"
-BUILD = "VER6.0-RC2-FREE-OCR-20260831"
+VERSION = "6.0 RC3 SBI-OCR-SAFE"
+BUILD = "VER6.0-RC3-SBI-OCR-SAFE-20260831"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -550,6 +550,32 @@ def infer_shares_from_screen(current_price, avg_price, pnl):
     return (rounded if ok else np.nan), err, ok
 
 
+def repair_sbi_prices(current_price, avg_price, pnl_pct):
+    """SBI画面OCRで4桁価格の先頭桁が落ちる誤読を、損益率との整合性で安全に補正する。
+    補正は明確に改善する場合だけ採用する。"""
+    cp, ap, pp = map(_num, [current_price, avg_price, pnl_pct])
+    notes=[]
+    if not (np.isfinite(cp) and cp > 0):
+        return cp, ap, notes
+    # 損益率が読めていれば取得単価の理論値を得られる
+    implied_ap = np.nan
+    if np.isfinite(pp) and abs(pp) < 100 and abs(1 + pp/100) > 1e-9:
+        implied_ap = cp / (1 + pp/100)
+    if np.isfinite(ap) and np.isfinite(implied_ap):
+        base_err = abs(ap-implied_ap) / max(implied_ap,1)
+        candidates=[ap]
+        # 854 -> 4854 のような「先頭1桁欠落」を候補化
+        digits=str(int(round(abs(ap))))
+        if len(digits) <= 4:
+            for lead in range(1,10):
+                candidates.append(float(str(lead)+digits))
+        best=min(candidates, key=lambda x: abs(x-implied_ap))
+        best_err=abs(best-implied_ap)/max(implied_ap,1)
+        if best != ap and best_err <= 0.015 and best_err < base_err*0.25:
+            notes.append(f"取得単価先頭桁補正:{ap:g}→{best:g}")
+            ap=best
+    return cp, ap, notes
+
 def normalize_holdings_rows(rows):
     """複数スクショの重複統合・数値正規化・株数逆算・整合性チェック。"""
     if not rows:
@@ -581,6 +607,9 @@ def normalize_holdings_rows(rows):
     checks = []
     for i, r in df.iterrows():
         cp, ap, pl = r["current_price"], r["avg_price"], r["pnl"]
+        cp, ap, repair_notes = repair_sbi_prices(cp, ap, r["pnl_pct"])
+        df.at[i, "current_price"] = cp
+        df.at[i, "avg_price"] = ap
         sh = r["shares"]
         source = "画像表示"
         err = np.nan
@@ -622,6 +651,8 @@ def normalize_holdings_rows(rows):
             "損益率誤差_pt":pct_err,
             "読取信頼度":confidence,
             "確認要否":confirm,
+            "自動補正":" / ".join(repair_notes) if repair_notes else "なし",
+            "売買判定使用可": "YES" if confidence == "🟢 高" else "NO",
         })
 
     out = pd.concat([df.reset_index(drop=True), pd.DataFrame(checks)], axis=1)
@@ -854,7 +885,7 @@ if not ocr_df.empty:
     st.subheader("🔎 読み取り確認")
     view_cols = [c for c in [
         "code","name","shares","株数取得方法","avg_price","current_price","pnl","pnl_pct",
-        "読取信頼度","確認要否","重複画像数"
+        "読取信頼度","確認要否","自動補正","売買判定使用可","重複画像数"
     ] if c in ocr_df.columns]
     st.dataframe(ocr_df[view_cols], use_container_width=True, hide_index=True)
 
@@ -889,16 +920,20 @@ entry_map = parse_entries(entries_text)
 share_map = parse_shares(shares_text)
 
 if not ocr_df.empty:
+    trusted_codes=[]
     for _, rr in ocr_df.iterrows():
         c = str(rr.get("code",""))
-        if re.fullmatch(r"\d{4}", c):
+        trusted = str(rr.get("売買判定使用可","NO")) == "YES"
+        if re.fullmatch(r"\d{4}", c) and trusted:
+            trusted_codes.append(c)
             ap = _num(rr.get("avg_price"))
             sh = _num(rr.get("shares"))
             if np.isfinite(ap):
                 entry_map[c] = ap
             if np.isfinite(sh) and sh > 0:
                 share_map[c] = int(round(sh))
-    held_codes = list(dict.fromkeys(held_codes + ocr_df["code"].astype(str).tolist()))
+    # OCR低信頼行は自動で売買判定へ流さない。手動入力したコードは従来どおり利用可。
+    held_codes = list(dict.fromkeys(held_codes + trusted_codes))
 
 # ------------------------------------------------------------
 # データ取得
@@ -1171,6 +1206,11 @@ latest_df = pd.DataFrame(latest_rows)
 if not latest_df.empty:
     latest_df = latest_df.sort_values("総合AIスコア",ascending=False).reset_index(drop=True)
 
+# 「今日のBUY」は最低AIスコアを通過した銘柄だけ。候補一覧とは分離する。
+today_buy_df = latest_df[latest_df["総合AIスコア"] >= minbuy_score].copy() if not latest_df.empty else pd.DataFrame()
+if not today_buy_df.empty:
+    today_buy_df = today_buy_df.sort_values("総合AIスコア", ascending=False).reset_index(drop=True)
+
 # ------------------------------------------------------------
 # 保有銘柄AI
 # ------------------------------------------------------------
@@ -1327,7 +1367,7 @@ st.header("🛡️ ⑨ データ品質・AI安全チェック")
 quality = pd.DataFrame([
     {"チェック":"未来情報","状態":"🟢 OK","内容":"バックテストのBUY/SELL判定は日付時点の価格データのみ"},
     {"チェック":"現在ファンダメンタル","状態":"🟡 現在分析のみ","内容":"Yahoo Financeの現在情報。過去バックテストには混入させない"},
-    {"チェック":"スクショOCR","状態":"🟢 無料","内容":"Tesseract日本語OCR。複数画像統合＋株数逆算＋整合性検証。低信頼行は要確認"},
+    {"チェック":"スクショOCR","状態":"🟢 無料・安全強化","内容":"SBI専用OCR。先頭桁欠落補正＋株数逆算＋整合性検証。低信頼行は売買判定から自動除外"},
     {"チェック":"SBI自動発注","状態":"🟢 OFF","内容":"注文は行わない"},
     {"チェック":"NO TRADE","状態":"🟢 ON","内容":"市場悪化・条件不足時は無理なBUYを抑制"},
 ])
@@ -1348,7 +1388,8 @@ stock_results = (
 
 files = {
     "00_summary.csv":summary,
-    "01_today_buy.csv":latest_df,
+    "01_today_buy.csv":today_buy_df,
+    "01b_current_candidates.csv":latest_df,
     "02_holdings_ai.csv":holdings_df,
     "03_tenbagger_candidates.csv":latest_df.sort_values("テンバガー度",ascending=False) if not latest_df.empty else latest_df,
     "04_all_ai_analysis.csv":analysis_df,

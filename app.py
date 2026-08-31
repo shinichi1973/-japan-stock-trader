@@ -12,11 +12,11 @@
 #   ・現行のファンダメンタル評価は「現在情報」に限定
 #     （過去バックテストへ混ぜない）
 #   ・SBI証券への自動発注は行わない
-#   ・保有銘柄スクショは任意。AI OCRにはOPENAI_API_KEYが必要
+#   ・保有銘柄スクショは任意。無料Tesseract OCRで解析（APIキー不要）
 # ============================================================
 
-import base64
 import io
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 import json
 import math
 import os
@@ -35,8 +35,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC1"
-BUILD = "VER6.0-RC1-SCREENSHOT-20260831"
+VERSION = "6.0 RC2 FREE-OCR"
+BUILD = "VER6.0-RC2-FREE-OCR-20260831"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -511,14 +511,8 @@ def tenbagger_score(f):
     return clamp(score)
 
 # ------------------------------------------------------------
-# 保有銘柄スクショAI OCR
+# 保有銘柄スクショ無料OCR（OpenAI API不要）
 # ------------------------------------------------------------
-def image_to_data_url(uploaded_file):
-    raw = uploaded_file.getvalue()
-    mime = uploaded_file.type or "image/png"
-    return f"data:{mime};base64,{base64.b64encode(raw).decode('utf-8')}"
-
-
 def _num(v):
     """OCR文字列（3,440円 / +2,800円 / -1.56%）を数値へ。"""
     if v is None:
@@ -526,7 +520,9 @@ def _num(v):
     if isinstance(v, (int, float, np.integer, np.floating)):
         return safe_float(v)
     s = str(v).strip().replace(",", "").replace("円", "").replace("%", "")
-    s = s.replace("＋", "+").replace("−", "-").replace("ー", "-")
+    s = s.replace("＋", "+").replace("−", "-").replace("ー", "-").replace("―", "-")
+    # OCRで起きやすい数字まわりの誤認識だけ補正
+    s = s.replace("O", "0").replace("o", "0")
     s = re.sub(r"[^0-9+\-.]", "", s)
     return safe_float(s)
 
@@ -548,7 +544,6 @@ def infer_shares_from_screen(current_price, avg_price, pnl):
     if rounded <= 0:
         return np.nan, np.nan, False
     calc = diff * rounded
-    # SBI表示の丸めを考慮。絶対2円または損益の1.5%の大きい方まで許容。
     tol = max(2.0, abs(pl) * 0.015)
     err = abs(calc - pl)
     ok = err <= tol
@@ -564,7 +559,6 @@ def normalize_holdings_rows(rows):
     if raw.empty:
         return raw
 
-    # 必要列を必ず用意
     for col in ["code","name","shares","avg_price","current_price","pnl","pnl_pct"]:
         if col not in raw.columns:
             raw[col] = np.nan
@@ -574,11 +568,10 @@ def normalize_holdings_rows(rows):
     for col in ["shares","avg_price","current_price","pnl","pnl_pct"]:
         raw[col] = raw[col].map(_num)
 
-    # 同じ銘柄が複数画像に映る場合、非欠損値を優先して統合
     merged = []
     for c, g in raw.groupby("code", sort=False):
-        rec = {"code": c}
-        for col in ["name","shares","avg_price","current_price","pnl","pnl_pct"]:
+        rec = {"code": c, "name": STOCK_NAMES.get(c, c)}
+        for col in ["shares","avg_price","current_price","pnl","pnl_pct"]:
             vals = g[col].dropna().tolist()
             rec[col] = vals[-1] if vals else np.nan
         rec["重複画像数"] = int(len(g))
@@ -592,7 +585,6 @@ def normalize_holdings_rows(rows):
         source = "画像表示"
         err = np.nan
 
-        # 株数が画像にない/不明なら逆算
         if not np.isfinite(_num(sh)):
             inferred, err, ok = infer_shares_from_screen(cp, ap, pl)
             if ok:
@@ -606,27 +598,22 @@ def normalize_holdings_rows(rows):
             if np.isfinite(_num(cp)) and np.isfinite(_num(ap)) and np.isfinite(_num(pl)):
                 err = abs((_num(cp)-_num(ap))*shn - _num(pl))
 
-        # 損益率も別ルートで確認
         pct_calc = np.nan
         if np.isfinite(_num(cp)) and np.isfinite(_num(ap)) and _num(ap) != 0:
             pct_calc = (_num(cp)/_num(ap)-1)*100
         pct_err = abs(pct_calc-_num(r["pnl_pct"])) if np.isfinite(pct_calc) and np.isfinite(_num(r["pnl_pct"])) else np.nan
 
-        # 信頼度判定
         has_core = all(np.isfinite(_num(x)) for x in [cp, ap, pl])
         sh_ok = np.isfinite(_num(df.at[i,"shares"]))
         pnl_ok = (not np.isfinite(err)) or err <= max(2.0, abs(_num(pl))*0.015 if np.isfinite(_num(pl)) else 2.0)
-        pct_ok = (not np.isfinite(pct_err)) or pct_err <= 0.15
+        pct_ok = (not np.isfinite(pct_err)) or pct_err <= 0.20
 
         if has_core and sh_ok and pnl_ok and pct_ok:
-            confidence = "🟢 高"
-            confirm = "不要"
+            confidence, confirm = "🟢 高", "不要"
         elif has_core and (sh_ok or np.isfinite(_num(r["pnl_pct"]))):
-            confidence = "🟡 中"
-            confirm = "要確認"
+            confidence, confirm = "🟡 中", "要確認"
         else:
-            confidence = "🔴 低"
-            confirm = "要確認"
+            confidence, confirm = "🔴 低", "要確認"
 
         checks.append({
             "株数取得方法":source,
@@ -637,68 +624,163 @@ def normalize_holdings_rows(rows):
             "確認要否":confirm,
         })
 
-    return pd.concat([df.reset_index(drop=True), pd.DataFrame(checks)], axis=1)
+    out = pd.concat([df.reset_index(drop=True), pd.DataFrame(checks)], axis=1)
+    return out
 
 
-def extract_holdings_with_openai(images):
-    """複数SBIスクショをAIで読み取り、重複統合＋株数逆算まで行う。"""
-    api_key = None
+def _prep_sbi_image(uploaded_file):
+    """SBIの濃色画面をTesseractが読みやすい白地画像へ変換。"""
+    img = Image.open(io.BytesIO(uploaded_file.getvalue())).convert("RGB")
+    w, h = img.size
+    # ステータスバー・下部ナビを削り、表のある範囲を中心に処理
+    top = int(h * 0.20)
+    bottom = int(h * 0.94)
+    img = img.crop((0, top, w, bottom))
+    # 2倍にして数字と4桁コードを優先して拾う
+    img = img.resize((img.width * 2, img.height * 2), Image.Resampling.LANCZOS)
+    gray = ImageOps.grayscale(img)
+    gray = ImageEnhance.Contrast(gray).enhance(1.8)
+    # SBIは暗背景なので反転してTesseract向けに白背景化
+    gray = ImageOps.invert(gray)
+    gray = gray.filter(ImageFilter.SHARPEN)
+    return gray
+
+
+def _tesseract_tokens(uploaded_file):
+    """1枚につきOCRは1回だけ。座標付きtokenを返す。"""
     try:
-        api_key = st.secrets.get("OPENAI_API_KEY")
-    except Exception:
-        api_key = None
-    api_key = api_key or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return pd.DataFrame(), "OPENAI_API_KEY未設定：Streamlit Secretsに設定するとスクショAI解析が使えます。"
-
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        content = [{
-            "type":"input_text",
-            "text":(
-                "SBI証券の『口座管理→保有証券』画面のスクリーンショットです。"
-                "複数枚はスクロールで重複していることがあります。画像ごとではなく全画像を統合して読んでください。"
-                "画面の列は主に『銘柄/預り』『現在値/取得単価』『評価損益/評価損益率』です。"
-                "重要: この画面には株数が表示されていない場合があります。その場合 shares は必ず null にしてください。"
-                "株数を推測しないでください。株数は後段のプログラムが数式で検証・逆算します。"
-                "銘柄コードは4桁数字を最優先で正確に読んでください。"
-                "数値は符号を保持してください（例 -36, +2800, -1.56）。"
-                "余力画面が含まれる場合のみ cash_available を読んでください。"
-                "JSON以外の文章は返さないでください。形式は必ず "
-                "{\"holdings\":[{\"code\":\"5401\",\"name\":\"日本製鉄\",\"shares\":null,"
-                "\"avg_price\":671.0,\"current_price\":669.8,\"pnl\":-36,\"pnl_pct\":-0.18}],"
-                "\"cash_available\":null,\"evaluation_pnl_total\":null,\"evaluation_pnl_pct_total\":null}。"
-                "読めない項目は null。画像にない情報を作らないでください。"
-            )
-        }]
-        for img in images:
-            content.append({"type":"input_image","image_url":image_to_data_url(img)})
-
-        resp = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[{"role":"user","content":content}],
-        )
-        text = resp.output_text.strip()
-        # ```json ... ``` にも対応
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I|re.S).strip()
-        match = re.search(r"\{.*\}", text, re.S)
-        if not match:
-            return pd.DataFrame(), "AI応答からJSONを取得できませんでした。"
-        obj = json.loads(match.group(0))
-        rows = obj.get("holdings", []) if isinstance(obj, dict) else []
-        if isinstance(obj, dict):
-            for k in ["cash_available","evaluation_pnl_total","evaluation_pnl_pct_total"]:
-                if obj.get(k) is not None:
-                    st.session_state[f"ocr_{k}"] = _num(obj.get(k))
-
-        df = normalize_holdings_rows(rows)
-        if df.empty:
-            return df, "保有銘柄を認識できませんでした。画像が『保有証券』タブか確認してください。"
-        return df, "OK"
+        import pytesseract
+        from pytesseract import Output
     except Exception as e:
-        return pd.DataFrame(), f"スクショAI解析エラー: {e}"
+        raise RuntimeError("pytesseractが読み込めません。requirements.txtを確認してください。") from e
 
+    img = _prep_sbi_image(uploaded_file)
+    try:
+        dat = pytesseract.image_to_data(
+            img,
+            lang="jpn+eng",
+            config="--psm 6 --oem 3",
+            output_type=Output.DATAFRAME,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Tesseract日本語OCRを起動できません。packages.txt に tesseract-ocr / tesseract-ocr-jpn が必要です。"
+        ) from e
+
+    dat = dat.dropna(subset=["text"]).copy()
+    dat["text"] = dat["text"].astype(str).str.strip()
+    dat = dat[dat["text"] != ""]
+    dat["conf"] = pd.to_numeric(dat["conf"], errors="coerce")
+    dat = dat[dat["conf"].fillna(-1) >= 20]
+    # 座標を0〜1へ正規化
+    W, H = img.size
+    dat["cx"] = (pd.to_numeric(dat["left"], errors="coerce") + pd.to_numeric(dat["width"], errors="coerce")/2) / W
+    dat["cy"] = (pd.to_numeric(dat["top"], errors="coerce") + pd.to_numeric(dat["height"], errors="coerce")/2) / H
+    return dat[["text","conf","cx","cy","left","top","width","height"]].reset_index(drop=True)
+
+
+def _extract_numbers_in_band(tokens, x_lo, x_hi, y_lo, y_hi):
+    g = tokens[(tokens.cx >= x_lo) & (tokens.cx < x_hi) & (tokens.cy >= y_lo) & (tokens.cy < y_hi)].copy()
+    if g.empty:
+        return []
+    # y座標で並べ、同一行の分割tokenをまとめる
+    g = g.sort_values(["cy","cx"])
+    vals = []
+    used = []
+    for _, r in g.iterrows():
+        txt = str(r.text)
+        if not re.search(r"\d", txt):
+            continue
+        n = _num(txt)
+        if np.isfinite(n):
+            vals.append((float(r.cy), n, txt))
+    # 近いyの重複を除く
+    out=[]
+    for item in vals:
+        if not out or abs(item[0]-out[-1][0]) > 0.014:
+            out.append(item)
+        elif len(str(item[2])) > len(str(out[-1][2])):
+            out[-1]=item
+    return out
+
+
+def _parse_sbi_tokens(tokens):
+    """SBI保有証券画面の固定3列レイアウトを座標で読む。"""
+    if tokens.empty:
+        return []
+
+    code_hits=[]
+    for _, r in tokens.iterrows():
+        m = re.search(r"(?<!\d)(\d{4})(?!\d)", str(r.text))
+        if m and float(r.cx) < 0.40:
+            c=m.group(1)
+            # 時刻や金額ではなく、日本株コード候補を優先
+            if c in STOCK_NAMES or (1000 <= int(c) <= 9999):
+                code_hits.append((float(r.cy), c))
+    # yが近い同一コード重複を整理
+    uniq=[]
+    for y,c in sorted(code_hits):
+        if not uniq or c != uniq[-1][1] or abs(y-uniq[-1][0]) > 0.025:
+            uniq.append((y,c))
+    if not uniq:
+        return []
+
+    rows=[]
+    for i,(y,c) in enumerate(uniq):
+        prev_y = uniq[i-1][0] if i>0 else y-0.045
+        next_y = uniq[i+1][0] if i+1<len(uniq) else y+0.070
+        y_lo=max(0.0, (prev_y+y)/2 - 0.010)
+        y_hi=min(1.0, (y+next_y)/2 + 0.010)
+
+        center=_extract_numbers_in_band(tokens, 0.38, 0.72, y_lo, y_hi)
+        right=_extract_numbers_in_band(tokens, 0.72, 1.01, y_lo, y_hi)
+
+        # 中央列: 上=現在値、下=取得単価
+        center_sorted=sorted(center, key=lambda z:z[0])
+        current_price=center_sorted[0][1] if len(center_sorted)>=1 else np.nan
+        avg_price=center_sorted[1][1] if len(center_sorted)>=2 else np.nan
+
+        # 右列: 上=評価損益、下=評価損益率。%記号が落ちてもy順で判定
+        right_sorted=sorted(right, key=lambda z:z[0])
+        pnl=right_sorted[0][1] if len(right_sorted)>=1 else np.nan
+        pnl_pct=right_sorted[1][1] if len(right_sorted)>=2 else np.nan
+
+        # 値段/損益率の明らかな異常を弾く
+        if np.isfinite(pnl_pct) and abs(pnl_pct) > 200:
+            pnl_pct=np.nan
+        if np.isfinite(current_price) and current_price <= 0:
+            current_price=np.nan
+        if np.isfinite(avg_price) and avg_price <= 0:
+            avg_price=np.nan
+
+        rows.append({
+            "code":c,
+            "name":STOCK_NAMES.get(c,c),
+            "shares":np.nan,
+            "avg_price":avg_price,
+            "current_price":current_price,
+            "pnl":pnl,
+            "pnl_pct":pnl_pct,
+        })
+    return rows
+
+
+def extract_holdings_free_ocr(images):
+    """API課金なし。Tesseract OCR + SBI画面座標 + 数値整合性で解析。"""
+    all_rows=[]
+    debug=[]
+    try:
+        for idx,img in enumerate(images, start=1):
+            tok=_tesseract_tokens(img)
+            rows=_parse_sbi_tokens(tok)
+            all_rows.extend(rows)
+            debug.append(f"画像{idx}: {len(rows)}銘柄")
+        df=normalize_holdings_rows(all_rows)
+        if df.empty:
+            return df, "銘柄を認識できませんでした。SBI『口座管理→保有証券』の画面全体をアップロードしてください。"
+        return df, " / ".join(debug)
+    except Exception as e:
+        return pd.DataFrame(), f"無料OCR解析エラー: {e}"
 # ------------------------------------------------------------
 # サイドバー
 # ------------------------------------------------------------
@@ -737,18 +819,11 @@ st.title("📈 日本株 AI投資アシスタント Ver.6.0")
 st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・"
-    "損切り/資金管理を追加したVer.6.0 RC1です。"
+    "損切り/資金管理を追加し、SBIスクショを無料OCRで読めるVer.6.0 RC2です。"
 )
 
-_api_ready = False
-try:
-    _api_ready = bool(st.secrets.get("OPENAI_API_KEY"))
-except Exception:
-    _api_ready = bool(os.getenv("OPENAI_API_KEY"))
-if _api_ready:
-    st.success("📷 スクショAI解析：利用可能")
-else:
-    st.warning("📷 スクショAI解析：OPENAI_API_KEY未設定。StreamlitのApp settings → Secretsに設定すると利用できます。")
+st.success("📷 スクショ解析：無料OCR版（OpenAI APIキー不要）")
+st.caption("Tesseract日本語OCRを使います。API料金は発生しません。読み取り結果は必ず確認してから売買判断に使用します。")
 
 # ------------------------------------------------------------
 # 保有銘柄スクショ
@@ -768,10 +843,10 @@ images = st.file_uploader(
 ocr_df = st.session_state.get("ocr_df", pd.DataFrame())
 if images and st.button("🤖 スクショを一括解析", use_container_width=True):
     with st.spinner(f"{len(images)}枚のスクショを統合解析中…"):
-        ocr_df, msg = extract_holdings_with_openai(images)
+        ocr_df, msg = extract_holdings_free_ocr(images)
     st.session_state["ocr_df"] = ocr_df
-    if msg == "OK":
-        st.success(f"解析完了：{len(ocr_df)}銘柄を認識しました。")
+    if not ocr_df.empty:
+        st.success(f"解析完了：{len(ocr_df)}銘柄を認識しました。{msg}")
     else:
         st.warning(msg)
 
@@ -800,7 +875,7 @@ if not ocr_df.empty:
         st.success("全銘柄の主要数値が整合しました。最終的にはSBI証券画面との照合を推奨します。")
 
 # 手動補正欄（OCRが使えない場合も利用可能）
-with st.expander("📝 OCRを使わない場合／補正用（任意）"):
+with st.expander("📝 読み取り結果の補正／手入力（任意）"):
     held_text = st.text_area(
         "保有銘柄コード",
         ",".join(ocr_df["code"].tolist()) if not ocr_df.empty else "",
@@ -1252,7 +1327,7 @@ st.header("🛡️ ⑨ データ品質・AI安全チェック")
 quality = pd.DataFrame([
     {"チェック":"未来情報","状態":"🟢 OK","内容":"バックテストのBUY/SELL判定は日付時点の価格データのみ"},
     {"チェック":"現在ファンダメンタル","状態":"🟡 現在分析のみ","内容":"Yahoo Financeの現在情報。過去バックテストには混入させない"},
-    {"チェック":"スクショOCR","状態":"🟡 要確認","内容":"複数画像統合＋株数逆算＋整合性検証。低信頼行は要確認"},
+    {"チェック":"スクショOCR","状態":"🟢 無料","内容":"Tesseract日本語OCR。複数画像統合＋株数逆算＋整合性検証。低信頼行は要確認"},
     {"チェック":"SBI自動発注","状態":"🟢 OFF","内容":"注文は行わない"},
     {"チェック":"NO TRADE","状態":"🟢 ON","内容":"市場悪化・条件不足時は無理なBUYを抑制"},
 ])

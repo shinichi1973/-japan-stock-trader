@@ -35,8 +35,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0"
-BUILD = "VER6.0-FOUNDATION-20260831"
+VERSION = "6.0 RC1"
+BUILD = "VER6.0-RC1-SCREENSHOT-20260831"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -518,8 +518,130 @@ def image_to_data_url(uploaded_file):
     mime = uploaded_file.type or "image/png"
     return f"data:{mime};base64,{base64.b64encode(raw).decode('utf-8')}"
 
+
+def _num(v):
+    """OCR文字列（3,440円 / +2,800円 / -1.56%）を数値へ。"""
+    if v is None:
+        return np.nan
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return safe_float(v)
+    s = str(v).strip().replace(",", "").replace("円", "").replace("%", "")
+    s = s.replace("＋", "+").replace("−", "-").replace("ー", "-")
+    s = re.sub(r"[^0-9+\-.]", "", s)
+    return safe_float(s)
+
+
+def infer_shares_from_screen(current_price, avg_price, pnl):
+    """SBI画面に株数が無い場合、損益=(現在値-取得単価)*株数 から逆算。
+    整数に十分近い場合だけ採用し、推測し過ぎない。
+    """
+    cp, ap, pl = map(_num, [current_price, avg_price, pnl])
+    if not (np.isfinite(cp) and np.isfinite(ap) and np.isfinite(pl)):
+        return np.nan, np.nan, False
+    diff = cp - ap
+    if abs(diff) < 1e-9:
+        return np.nan, np.nan, False
+    raw = pl / diff
+    if raw <= 0 or raw > 1_000_000:
+        return np.nan, np.nan, False
+    rounded = int(round(raw))
+    if rounded <= 0:
+        return np.nan, np.nan, False
+    calc = diff * rounded
+    # SBI表示の丸めを考慮。絶対2円または損益の1.5%の大きい方まで許容。
+    tol = max(2.0, abs(pl) * 0.015)
+    err = abs(calc - pl)
+    ok = err <= tol
+    return (rounded if ok else np.nan), err, ok
+
+
+def normalize_holdings_rows(rows):
+    """複数スクショの重複統合・数値正規化・株数逆算・整合性チェック。"""
+    if not rows:
+        return pd.DataFrame()
+
+    raw = pd.DataFrame(rows)
+    if raw.empty:
+        return raw
+
+    # 必要列を必ず用意
+    for col in ["code","name","shares","avg_price","current_price","pnl","pnl_pct"]:
+        if col not in raw.columns:
+            raw[col] = np.nan
+
+    raw["code"] = raw["code"].astype(str).str.extract(r"(\d{4})")[0]
+    raw = raw.dropna(subset=["code"])
+    for col in ["shares","avg_price","current_price","pnl","pnl_pct"]:
+        raw[col] = raw[col].map(_num)
+
+    # 同じ銘柄が複数画像に映る場合、非欠損値を優先して統合
+    merged = []
+    for c, g in raw.groupby("code", sort=False):
+        rec = {"code": c}
+        for col in ["name","shares","avg_price","current_price","pnl","pnl_pct"]:
+            vals = g[col].dropna().tolist()
+            rec[col] = vals[-1] if vals else np.nan
+        rec["重複画像数"] = int(len(g))
+        merged.append(rec)
+
+    df = pd.DataFrame(merged)
+    checks = []
+    for i, r in df.iterrows():
+        cp, ap, pl = r["current_price"], r["avg_price"], r["pnl"]
+        sh = r["shares"]
+        source = "画像表示"
+        err = np.nan
+
+        # 株数が画像にない/不明なら逆算
+        if not np.isfinite(_num(sh)):
+            inferred, err, ok = infer_shares_from_screen(cp, ap, pl)
+            if ok:
+                df.at[i, "shares"] = inferred
+                source = "評価損益から逆算"
+            else:
+                source = "不明"
+        else:
+            shn = int(round(_num(sh)))
+            df.at[i, "shares"] = shn
+            if np.isfinite(_num(cp)) and np.isfinite(_num(ap)) and np.isfinite(_num(pl)):
+                err = abs((_num(cp)-_num(ap))*shn - _num(pl))
+
+        # 損益率も別ルートで確認
+        pct_calc = np.nan
+        if np.isfinite(_num(cp)) and np.isfinite(_num(ap)) and _num(ap) != 0:
+            pct_calc = (_num(cp)/_num(ap)-1)*100
+        pct_err = abs(pct_calc-_num(r["pnl_pct"])) if np.isfinite(pct_calc) and np.isfinite(_num(r["pnl_pct"])) else np.nan
+
+        # 信頼度判定
+        has_core = all(np.isfinite(_num(x)) for x in [cp, ap, pl])
+        sh_ok = np.isfinite(_num(df.at[i,"shares"]))
+        pnl_ok = (not np.isfinite(err)) or err <= max(2.0, abs(_num(pl))*0.015 if np.isfinite(_num(pl)) else 2.0)
+        pct_ok = (not np.isfinite(pct_err)) or pct_err <= 0.15
+
+        if has_core and sh_ok and pnl_ok and pct_ok:
+            confidence = "🟢 高"
+            confirm = "不要"
+        elif has_core and (sh_ok or np.isfinite(_num(r["pnl_pct"]))):
+            confidence = "🟡 中"
+            confirm = "要確認"
+        else:
+            confidence = "🔴 低"
+            confirm = "要確認"
+
+        checks.append({
+            "株数取得方法":source,
+            "損益整合誤差_円":err,
+            "損益率計算値":pct_calc,
+            "損益率誤差_pt":pct_err,
+            "読取信頼度":confidence,
+            "確認要否":confirm,
+        })
+
+    return pd.concat([df.reset_index(drop=True), pd.DataFrame(checks)], axis=1)
+
+
 def extract_holdings_with_openai(images):
-    """OPENAI_API_KEYがある場合のみ実行。APIなしなら空DF。"""
+    """複数SBIスクショをAIで読み取り、重複統合＋株数逆算まで行う。"""
     api_key = None
     try:
         api_key = st.secrets.get("OPENAI_API_KEY")
@@ -527,7 +649,7 @@ def extract_holdings_with_openai(images):
         api_key = None
     api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return pd.DataFrame(), "OPENAI_API_KEY未設定"
+        return pd.DataFrame(), "OPENAI_API_KEY未設定：Streamlit Secretsに設定するとスクショAI解析が使えます。"
 
     try:
         from openai import OpenAI
@@ -535,11 +657,19 @@ def extract_holdings_with_openai(images):
         content = [{
             "type":"input_text",
             "text":(
-                "これは日本の証券口座の保有銘柄画面です。画像をすべて統合し、"
-                "重複を除いてJSON配列だけを返してください。"
-                "各要素は code(4桁数字), name, shares, avg_price, current_price, pnl, pnl_pct のキー。"
-                "読み取れない値はnull。余力は銘柄配列とは別に cash_available として可能なら返してください。"
-                "推測は禁止。画像に書かれている値だけを使ってください。"
+                "SBI証券の『口座管理→保有証券』画面のスクリーンショットです。"
+                "複数枚はスクロールで重複していることがあります。画像ごとではなく全画像を統合して読んでください。"
+                "画面の列は主に『銘柄/預り』『現在値/取得単価』『評価損益/評価損益率』です。"
+                "重要: この画面には株数が表示されていない場合があります。その場合 shares は必ず null にしてください。"
+                "株数を推測しないでください。株数は後段のプログラムが数式で検証・逆算します。"
+                "銘柄コードは4桁数字を最優先で正確に読んでください。"
+                "数値は符号を保持してください（例 -36, +2800, -1.56）。"
+                "余力画面が含まれる場合のみ cash_available を読んでください。"
+                "JSON以外の文章は返さないでください。形式は必ず "
+                "{\"holdings\":[{\"code\":\"5401\",\"name\":\"日本製鉄\",\"shares\":null,"
+                "\"avg_price\":671.0,\"current_price\":669.8,\"pnl\":-36,\"pnl_pct\":-0.18}],"
+                "\"cash_available\":null,\"evaluation_pnl_total\":null,\"evaluation_pnl_pct_total\":null}。"
+                "読めない項目は null。画像にない情報を作らないでください。"
             )
         }]
         for img in images:
@@ -548,29 +678,26 @@ def extract_holdings_with_openai(images):
         resp = client.responses.create(
             model="gpt-4.1-mini",
             input=[{"role":"user","content":content}],
-            temperature=0
         )
-        text = resp.output_text
+        text = resp.output_text.strip()
+        # ```json ... ``` にも対応
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I|re.S).strip()
         match = re.search(r"\{.*\}", text, re.S)
         if not match:
-            match = re.search(r"\[.*\]", text, re.S)
-        if not match:
-            return pd.DataFrame(), "JSONを取得できませんでした"
+            return pd.DataFrame(), "AI応答からJSONを取得できませんでした。"
         obj = json.loads(match.group(0))
-        if isinstance(obj, list):
-            rows = obj
-        else:
-            rows = obj.get("holdings", [])
-            if obj.get("cash_available") is not None:
-                st.session_state["ocr_cash"] = obj.get("cash_available")
-        df = pd.DataFrame(rows)
+        rows = obj.get("holdings", []) if isinstance(obj, dict) else []
+        if isinstance(obj, dict):
+            for k in ["cash_available","evaluation_pnl_total","evaluation_pnl_pct_total"]:
+                if obj.get(k) is not None:
+                    st.session_state[f"ocr_{k}"] = _num(obj.get(k))
+
+        df = normalize_holdings_rows(rows)
         if df.empty:
-            return df, "保有銘柄を認識できませんでした"
-        df["code"] = df["code"].astype(str).str.extract(r"(\d{4})")[0]
-        df = df.dropna(subset=["code"]).drop_duplicates("code")
+            return df, "保有銘柄を認識できませんでした。画像が『保有証券』タブか確認してください。"
         return df, "OK"
     except Exception as e:
-        return pd.DataFrame(), f"OCRエラー: {e}"
+        return pd.DataFrame(), f"スクショAI解析エラー: {e}"
 
 # ------------------------------------------------------------
 # サイドバー
@@ -610,16 +737,26 @@ st.title("📈 日本株 AI投資アシスタント Ver.6.0")
 st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・"
-    "損切り/資金管理を追加した基盤版です。"
+    "損切り/資金管理を追加したVer.6.0 RC1です。"
 )
+
+_api_ready = False
+try:
+    _api_ready = bool(st.secrets.get("OPENAI_API_KEY"))
+except Exception:
+    _api_ready = bool(os.getenv("OPENAI_API_KEY"))
+if _api_ready:
+    st.success("📷 スクショAI解析：利用可能")
+else:
+    st.warning("📷 スクショAI解析：OPENAI_API_KEY未設定。StreamlitのApp settings → Secretsに設定すると利用できます。")
 
 # ------------------------------------------------------------
 # 保有銘柄スクショ
 # ------------------------------------------------------------
 st.header("📷 ① 現在の保有銘柄をスクショから取り込み")
 st.caption(
-    "SBI証券の保有状況を必要な枚数だけ追加できます。"
-    "5枚・6枚でも問題ありません。AI OCRは重複銘柄を統合します。"
+    "SBI証券の『口座管理 → 保有証券』をスクロールして必要な枚数だけ追加してください。"
+    "5枚・6枚でもOK。重複銘柄を統合し、画面に株数が無い場合は現在値・取得単価・評価損益から数式で逆算して整合性を確認します。"
 )
 images = st.file_uploader(
     "保有銘柄スクショを追加",
@@ -640,8 +777,27 @@ if images and st.button("🤖 スクショを一括解析", use_container_width=
 
 if not ocr_df.empty:
     st.subheader("🔎 読み取り確認")
-    st.dataframe(ocr_df, use_container_width=True, hide_index=True)
-    st.caption("画像認識値は必ずSBI証券画面と照合してから売買判断に利用してください。")
+    view_cols = [c for c in [
+        "code","name","shares","株数取得方法","avg_price","current_price","pnl","pnl_pct",
+        "読取信頼度","確認要否","重複画像数"
+    ] if c in ocr_df.columns]
+    st.dataframe(ocr_df[view_cols], use_container_width=True, hide_index=True)
+
+    high = int((ocr_df.get("読取信頼度", pd.Series(dtype=str)) == "🟢 高").sum())
+    need = int((ocr_df.get("確認要否", pd.Series(dtype=str)) == "要確認").sum())
+    c1, c2 = st.columns(2)
+    c1.metric("🟢 高信頼", high)
+    c2.metric("⚠️ 要確認", need)
+
+    if "ocr_cash_available" in st.session_state and np.isfinite(_num(st.session_state["ocr_cash_available"])):
+        st.metric("💴 スクショから読んだ買付余力", f"{_num(st.session_state['ocr_cash_available']):,.0f}円")
+    if "ocr_evaluation_pnl_total" in st.session_state and np.isfinite(_num(st.session_state["ocr_evaluation_pnl_total"])):
+        st.metric("評価損益合計（画像）", f"{_num(st.session_state['ocr_evaluation_pnl_total']):+,.0f}円")
+
+    if need:
+        st.warning("黄色/赤の行は、売買判断に使う前にSBI証券画面で数値を確認してください。")
+    else:
+        st.success("全銘柄の主要数値が整合しました。最終的にはSBI証券画面との照合を推奨します。")
 
 # 手動補正欄（OCRが使えない場合も利用可能）
 with st.expander("📝 OCRを使わない場合／補正用（任意）"):
@@ -661,11 +817,12 @@ if not ocr_df.empty:
     for _, rr in ocr_df.iterrows():
         c = str(rr.get("code",""))
         if re.fullmatch(r"\d{4}", c):
-            if pd.notna(rr.get("avg_price")):
-                entry_map[c] = safe_float(rr.get("avg_price"), entry_map.get(c, np.nan))
-            if pd.notna(rr.get("shares")):
-                try: share_map[c] = int(float(rr.get("shares")))
-                except Exception: pass
+            ap = _num(rr.get("avg_price"))
+            sh = _num(rr.get("shares"))
+            if np.isfinite(ap):
+                entry_map[c] = ap
+            if np.isfinite(sh) and sh > 0:
+                share_map[c] = int(round(sh))
     held_codes = list(dict.fromkeys(held_codes + ocr_df["code"].astype(str).tolist()))
 
 # ------------------------------------------------------------
@@ -1095,7 +1252,7 @@ st.header("🛡️ ⑨ データ品質・AI安全チェック")
 quality = pd.DataFrame([
     {"チェック":"未来情報","状態":"🟢 OK","内容":"バックテストのBUY/SELL判定は日付時点の価格データのみ"},
     {"チェック":"現在ファンダメンタル","状態":"🟡 現在分析のみ","内容":"Yahoo Financeの現在情報。過去バックテストには混入させない"},
-    {"チェック":"スクショOCR","状態":"🟡 要確認","内容":"画像認識後にSBI画面と照合して登録"},
+    {"チェック":"スクショOCR","状態":"🟡 要確認","内容":"複数画像統合＋株数逆算＋整合性検証。低信頼行は要確認"},
     {"チェック":"SBI自動発注","状態":"🟢 OFF","内容":"注文は行わない"},
     {"チェック":"NO TRADE","状態":"🟢 ON","内容":"市場悪化・条件不足時は無理なBUYを抑制"},
 ])

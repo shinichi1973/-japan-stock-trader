@@ -36,8 +36,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.2.1 NIKKEI-LATEST-ROW-REPAIR"
-BUILD = "VER6.0-RC6.2.1-NIKKEI-LATEST-ROW-REPAIR-20260902"
+VERSION = "6.0 RC6.2.2 NIKKEI-INTRADAY-REPAIR"
+BUILD = "VER6.0-RC6.2.2-NIKKEI-INTRADAY-REPAIR-20260902"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -236,6 +236,81 @@ def _append_regular_market_row(frame, meta, regular_date):
     return frame.sort_index(), True
 
 
+def _aggregate_intraday_day(stamps, quote, tz_name, target_date):
+    """Yahooの分足を指定日の日足OHLCVへ集約する。"""
+    if not stamps:
+        return None
+    size = len(stamps)
+
+    def values(key):
+        vals = list(quote.get(key) or [])
+        return (vals + [np.nan] * size)[:size]
+
+    idx = pd.to_datetime(stamps, unit="s", utc=True)
+    try:
+        idx = idx.tz_convert(tz_name)
+    except Exception:
+        pass
+    idx = idx.tz_localize(None)
+    intraday = pd.DataFrame({
+        "Open": values("open"), "High": values("high"),
+        "Low": values("low"), "Close": values("close"),
+        "Volume": values("volume"),
+    }, index=idx)
+    target_date = pd.Timestamp(target_date).normalize()
+    intraday = intraday[intraday.index.normalize() == target_date].copy()
+    intraday["Close"] = pd.to_numeric(intraday["Close"], errors="coerce")
+    intraday = intraday.dropna(subset=["Close"]).sort_index()
+    if intraday.empty:
+        return None
+    for c in ["Open", "High", "Low", "Volume"]:
+        intraday[c] = pd.to_numeric(intraday[c], errors="coerce")
+    open_values = intraday["Open"].dropna()
+    high_values = intraday["High"].dropna()
+    low_values = intraday["Low"].dropna()
+    volume = intraday["Volume"].sum(min_count=1)
+    return {
+        "Open": float(open_values.iloc[0]) if not open_values.empty else float(intraday["Close"].iloc[0]),
+        "High": float(high_values.max()) if not high_values.empty else float(intraday["Close"].max()),
+        "Low": float(low_values.min()) if not low_values.empty else float(intraday["Close"].min()),
+        "Close": float(intraday["Close"].iloc[-1]),
+        "Volume": float(volume) if np.isfinite(volume) else 0.0,
+    }
+
+
+def _yahoo_intraday_day(symbol, target_date):
+    """直近5日分の分足から、指定日の確定OHLCVを取得する。"""
+    encoded = requests.utils.quote(str(symbol), safe="")
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; JPStockAssistant/6.0)"}
+    last_error = None
+    for interval in ("1m", "5m"):
+        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+            try:
+                url = f"https://{host}/v8/finance/chart/{encoded}"
+                params = {
+                    "range": "5d", "interval": interval,
+                    "includePrePost": "false", "events": "history",
+                }
+                response = requests.get(url, params=params, headers=headers, timeout=12)
+                response.raise_for_status()
+                payload = response.json()
+                result = payload.get("chart", {}).get("result") or []
+                if not result:
+                    raise ValueError(payload.get("chart", {}).get("error") or "分足データなし")
+                item = result[0]
+                quote = ((item.get("indicators") or {}).get("quote") or [{}])[0]
+                tz_name = (item.get("meta") or {}).get("exchangeTimezoneName") or "Asia/Tokyo"
+                row = _aggregate_intraday_day(
+                    item.get("timestamp") or [], quote, tz_name, target_date
+                )
+                if row is not None:
+                    return row, f"Yahoo Finance {interval}分足集約 ({host})"
+                raise ValueError(f"{pd.Timestamp(target_date).date()}の分足なし")
+            except Exception as e:
+                last_error = e
+    raise RuntimeError(f"日経平均の分足取得失敗: {last_error}")
+
+
 def _yahoo_chart(symbol, years=5):
     """Yahoo Financeの最新日足を直接取得し、取引時刻メタ情報も返す。"""
     end_ts = int(datetime.now(timezone.utc).timestamp()) + 86400
@@ -400,11 +475,24 @@ def stock_data(t, years=5):
 
 
 @st.cache_data(ttl=1800)
-def market_data():
+def market_data(required_date=None):
     end = datetime.now()
     start = end - timedelta(days=365 * 5 + 300)
+    required_date = pd.Timestamp(required_date).normalize() if pd.notna(required_date) else pd.NaT
     try:
         raw, meta = _yahoo_chart("^N225", 5)
+        if pd.notna(required_date) and not raw.empty and pd.Timestamp(raw.index.max()).normalize() < required_date:
+            try:
+                row, repair_source = _yahoo_intraday_day("^N225", required_date)
+                raw = raw.copy()
+                raw.loc[required_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+                    row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+                ]
+                meta["source"] = f"{meta.get('source', 'Yahoo Finance')} + {repair_source}"
+                meta["regular_market_date"] = required_date
+                meta["latest_row_repaired"] = True
+            except Exception:
+                pass
         out = _market_indicators(raw)
         if not out.empty:
             out.attrs.update(meta)
@@ -1177,7 +1265,7 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.2.1では取得経路を多重化し、日足更新が遅い場合は同一レスポンスの最新四本値で補完します。"
+    "RC6.2.2では取得経路を多重化し、日足更新が遅い場合は当日の分足から最新四本値を復元します。"
     "それでも古いデータなら売買判定を停止します。"
 )
 st.success("📄 保有銘柄：SBI約定履歴CSV / 💴 購入株数：買付余力連動（スクショ/OCR完全除外）")
@@ -1352,7 +1440,12 @@ analysis_codes = list(dict.fromkeys(parse_codes(universe_text) + held_codes))
 with st.spinner("📡 株価・市場・海外データを取得中…"):
     data = {t: stock_data(t) for t in tickers(",".join(analysis_codes))}
     data = {t:d for t,d in data.items() if not d.empty}
-    market = market_data()
+    individual_dates = [
+        pd.Timestamp(d.attrs.get("regular_market_date")).normalize()
+        for d in data.values() if pd.notna(d.attrs.get("regular_market_date", pd.NaT))
+    ]
+    expected_market_date = max(individual_dates) if individual_dates else pd.NaT
+    market = market_data(expected_market_date)
     overseas = overseas_data()
 
 freshness_df, market_data_stale, stale_tickers = build_freshness_report(data, market)
@@ -1655,7 +1748,7 @@ if not latest_df.empty:
 # 「今日のBUY」は最低AIスコアを通過した銘柄だけ。候補一覧とは分離する。
 today_buy_df = (
     latest_df[latest_df["総合AIスコア"] >= minbuy_score].copy()
-    if not latest_df.empty and not market_data_stale else pd.DataFrame()
+    if not latest_df.empty and not market_data_stale else latest_df.iloc[0:0].copy()
 )
 if not today_buy_df.empty:
     today_buy_df = today_buy_df.sort_values("総合AIスコア", ascending=False).reset_index(drop=True)
@@ -1949,7 +2042,7 @@ st.header("📦 ⑩ 全処理データ")
 st.download_button(
     "📦 Ver.6.0 全処理データをZIPでダウンロード",
     buf.getvalue(),
-    "ver6_0_RC6_2_1_all_analysis.zip",
+    "ver6_0_RC6_2_2_all_analysis.zip",
     "application/zip",
     use_container_width=True
 )

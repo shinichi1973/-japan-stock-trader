@@ -22,6 +22,7 @@ import os
 import re
 import plistlib
 from datetime import datetime, timedelta, timezone
+from html import unescape as html_unescape
 from zipfile import ZipFile
 
 import numpy as np
@@ -36,8 +37,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.2.2 NIKKEI-INTRADAY-REPAIR"
-BUILD = "VER6.0-RC6.2.2-NIKKEI-INTRADAY-REPAIR-20260902"
+VERSION = "6.0 RC6.2.3 NIKKEI-MULTISOURCE"
+BUILD = "VER6.0-RC6.2.3-NIKKEI-MULTISOURCE-20260902"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -311,6 +312,109 @@ def _yahoo_intraday_day(symbol, target_date):
     raise RuntimeError(f"日経平均の分足取得失敗: {last_error}")
 
 
+def _json_number_from_html(text, key):
+    patterns = [
+        rf'"{re.escape(key)}"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?)',
+        rf'"{re.escape(key)}"\s*:\s*\{{[^{{}}]*?"raw"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?)',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.I | re.S)
+        if m:
+            return safe_float(m.group(1), np.nan)
+    return np.nan
+
+
+def _yahoo_japan_nikkei_snapshot(target_date):
+    """Yahoo Japanの998407.O指数ページから最新の四本値を取得する。"""
+    url = "https://finance.yahoo.co.jp/quote/998407.O"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; JPStockAssistant/6.0)"}
+    response = requests.get(url, headers=headers, timeout=15)
+    response.raise_for_status()
+    html = response.text
+    visible = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.I | re.S)
+    visible = html_unescape(re.sub(r"<[^>]+>", " ", visible))
+    visible = re.sub(r"\s+", " ", visible)
+
+    target_date = pd.Timestamp(target_date).normalize()
+    timestamp = _json_number_from_html(html, "regularMarketTime")
+    page_date = pd.NaT
+    if np.isfinite(timestamp) and timestamp > 1_000_000_000:
+        page_date = pd.Timestamp(int(timestamp), unit="s", tz="UTC").tz_convert("Asia/Tokyo").tz_localize(None).normalize()
+    if pd.isna(page_date):
+        date_tokens = {
+            f"{target_date.year}/{target_date.month}/{target_date.day}",
+            f"{target_date.month}月{target_date.day}日",
+            target_date.strftime("%Y/%m/%d"),
+        }
+        if any(token in visible for token in date_tokens):
+            page_date = target_date
+    if pd.isna(page_date) or page_date != target_date:
+        raise ValueError(f"Yahoo Japan指数ページの日付不一致: {page_date}")
+
+    values = {
+        "Open": _json_number_from_html(html, "regularMarketOpen"),
+        "High": _json_number_from_html(html, "regularMarketDayHigh"),
+        "Low": _json_number_from_html(html, "regularMarketDayLow"),
+        "Close": _json_number_from_html(html, "regularMarketPrice"),
+        "Volume": _json_number_from_html(html, "regularMarketVolume"),
+    }
+    label_patterns = {
+        "Open": r"始値[^0-9]{0,80}([0-9][0-9,]*(?:\.[0-9]+)?)",
+        "High": r"高値[^0-9]{0,80}([0-9][0-9,]*(?:\.[0-9]+)?)",
+        "Low": r"安値[^0-9]{0,80}([0-9][0-9,]*(?:\.[0-9]+)?)",
+        "Close": r"(?:取引値|現在値)[^0-9]{0,80}([0-9][0-9,]*(?:\.[0-9]+)?)",
+    }
+    for key, pattern in label_patterns.items():
+        if not np.isfinite(values[key]):
+            m = re.search(pattern, visible)
+            if m:
+                values[key] = safe_float(m.group(1).replace(",", ""), np.nan)
+    if not all(np.isfinite(values[k]) and values[k] > 0 for k in ["Open", "High", "Low", "Close"]):
+        raise ValueError("Yahoo Japan指数ページから四本値を抽出できません")
+    if not np.isfinite(values["Volume"]):
+        values["Volume"] = 0.0
+    return values, "Yahoo Japan 998407.O指数ページ"
+
+
+def _repair_nikkei_day(raw, required_date):
+    """日経平均の欠落日を独立した複数経路で補完する。"""
+    required_date = pd.Timestamp(required_date).normalize()
+    if raw is not None and not raw.empty and pd.Timestamp(raw.index.max()).normalize() >= required_date:
+        return raw, "", False
+
+    # 1) Yahoo Japanと同じ指数コードをチャートAPIで試す。
+    try:
+        alt, _meta = _yahoo_chart("998407.O", 5)
+        if required_date in alt.index:
+            row = alt.loc[required_date]
+            raw = raw.copy()
+            raw.loc[required_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+                row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+            ]
+            return raw.sort_index(), "Yahoo Finance 998407.Oチャート", True
+    except Exception:
+        pass
+
+    # 2) Yahoo Japanの指数詳細ページから確定四本値を取得する。
+    try:
+        row, source = _yahoo_japan_nikkei_snapshot(required_date)
+        raw = raw.copy()
+        raw.loc[required_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+            row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+        ]
+        return raw.sort_index(), source, True
+    except Exception:
+        pass
+
+    # 3) 最後に分足集約を試す。
+    row, source = _yahoo_intraday_day("^N225", required_date)
+    raw = raw.copy()
+    raw.loc[required_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+        row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+    ]
+    return raw.sort_index(), source, True
+
+
 def _yahoo_chart(symbol, years=5):
     """Yahoo Financeの最新日足を直接取得し、取引時刻メタ情報も返す。"""
     end_ts = int(datetime.now(timezone.utc).timestamp()) + 86400
@@ -483,14 +587,11 @@ def market_data(required_date=None):
         raw, meta = _yahoo_chart("^N225", 5)
         if pd.notna(required_date) and not raw.empty and pd.Timestamp(raw.index.max()).normalize() < required_date:
             try:
-                row, repair_source = _yahoo_intraday_day("^N225", required_date)
-                raw = raw.copy()
-                raw.loc[required_date, ["Open", "High", "Low", "Close", "Volume"]] = [
-                    row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
-                ]
-                meta["source"] = f"{meta.get('source', 'Yahoo Finance')} + {repair_source}"
-                meta["regular_market_date"] = required_date
-                meta["latest_row_repaired"] = True
+                raw, repair_source, repaired = _repair_nikkei_day(raw, required_date)
+                if repaired:
+                    meta["source"] = f"{meta.get('source', 'Yahoo Finance')} + {repair_source}"
+                    meta["regular_market_date"] = required_date
+                    meta["latest_row_repaired"] = True
             except Exception:
                 pass
         out = _market_indicators(raw)
@@ -1265,7 +1366,7 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.2.2では取得経路を多重化し、日足更新が遅い場合は当日の分足から最新四本値を復元します。"
+    "RC6.2.3ではYahoo Japanの998407.Oを含む複数経路で、欠落した日経平均日足を補完します。"
     "それでも古いデータなら売買判定を停止します。"
 )
 st.success("📄 保有銘柄：SBI約定履歴CSV / 💴 購入株数：買付余力連動（スクショ/OCR完全除外）")
@@ -2042,7 +2143,7 @@ st.header("📦 ⑩ 全処理データ")
 st.download_button(
     "📦 Ver.6.0 全処理データをZIPでダウンロード",
     buf.getvalue(),
-    "ver6_0_RC6_2_2_all_analysis.zip",
+    "ver6_0_RC6_2_3_all_analysis.zip",
     "application/zip",
     use_container_width=True
 )

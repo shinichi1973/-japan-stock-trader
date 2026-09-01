@@ -37,8 +37,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.2.3 NIKKEI-MULTISOURCE"
-BUILD = "VER6.0-RC6.2.3-NIKKEI-MULTISOURCE-20260902"
+VERSION = "6.0 RC6.3 NIKKEI-ETF-PROXY-SAFE"
+BUILD = "VER6.0-RC6.3-NIKKEI-ETF-PROXY-SAFE-20260902"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -544,7 +544,17 @@ def _market_indicators(raw):
     return out.dropna()
 
 
-# RC6.2: 既存関数を上書きし、直接API → yfinance個別 → 一括downloadの順で取得する。
+def _market_from_close(close):
+    c = pd.to_numeric(close, errors="coerce").dropna().sort_index()
+    out = pd.DataFrame({"Close": c})
+    out["MA25"] = c.rolling(25).mean()
+    out["MA75"] = c.rolling(75).mean()
+    out["MA200"] = c.rolling(200).mean()
+    out["MA25_Slope"] = out.MA25 - out.MA25.shift(5)
+    return out.dropna()
+
+
+# RC6.3: 直接API → yfinance個別 → 一括download。指数だけ古い場合は1321.Tで安全に補完する。
 @st.cache_data(ttl=1800)
 def stock_data(t, years=5):
     end = datetime.now()
@@ -578,6 +588,49 @@ def stock_data(t, years=5):
     return pd.DataFrame()
 
 
+def _append_1321_proxy_market_row(stale_market, required_date):
+    """1321.Tの当日騰落率を、直近日経平均終値へ連結して市場判定を更新する。"""
+    required_date = pd.Timestamp(required_date).normalize()
+    if stale_market is None or stale_market.empty:
+        raise ValueError("連結元の日経平均履歴がありません")
+    proxy = stock_data("1321.T", 5)
+    if proxy.empty or required_date not in proxy.index:
+        raise ValueError("1321.Tが必要日まで更新されていません")
+
+    market_close = pd.to_numeric(stale_market["Close"], errors="coerce").dropna()
+    proxy_close = pd.to_numeric(proxy["Close"], errors="coerce").dropna()
+    common = market_close.index.intersection(proxy_close.index)
+    common = common[common < required_date]
+    if common.empty:
+        raise ValueError("日経平均と1321.Tの共通基準日がありません")
+    base_date = pd.Timestamp(common.max()).normalize()
+    base_index_close = float(market_close.loc[base_date])
+    base_proxy_close = float(proxy_close.loc[base_date])
+    required_proxy_close = float(proxy_close.loc[required_date])
+    if base_index_close <= 0 or base_proxy_close <= 0 or required_proxy_close <= 0:
+        raise ValueError("1321.T代理計算に使用する価格が不正です")
+
+    proxy_return = required_proxy_close / base_proxy_close
+    converted_close = base_index_close * proxy_return
+    combined = market_close.copy()
+    combined.loc[required_date] = converted_close
+    out = _market_from_close(combined)
+    out.attrs.update({
+        "source": "日経平均履歴 + 1321.T（日経225連動ETF）騰落率代理",
+        "regular_market_date": required_date,
+        "market_mode": "1321_ETF_PROXY",
+        "market_symbol": "1321.T",
+        "market_name": "日経225連動ETFによる市場判定",
+        "proxy_base_date": base_date,
+        "proxy_base_index_close": base_index_close,
+        "proxy_base_close": base_proxy_close,
+        "proxy_required_close": required_proxy_close,
+        "proxy_return_pct": (proxy_return - 1.0) * 100.0,
+        "converted_market_close": converted_close,
+    })
+    return out
+
+
 @st.cache_data(ttl=1800)
 def market_data(required_date=None):
     end = datetime.now()
@@ -597,6 +650,14 @@ def market_data(required_date=None):
         out = _market_indicators(raw)
         if not out.empty:
             out.attrs.update(meta)
+            out.attrs.setdefault("market_mode", "NIKKEI225_DIRECT")
+            out.attrs.setdefault("market_symbol", "^N225")
+            out.attrs.setdefault("market_name", "日経平均")
+            if pd.notna(required_date) and pd.Timestamp(out.index.max()).normalize() < required_date:
+                try:
+                    return _append_1321_proxy_market_row(out, required_date)
+                except Exception:
+                    pass
             return out
     except Exception:
         pass
@@ -606,6 +667,12 @@ def market_data(required_date=None):
         out = _market_indicators(raw)
         if not out.empty:
             out.attrs["source"] = "yfinance Ticker.history"
+            out.attrs.update({"market_mode":"NIKKEI225_DIRECT","market_symbol":"^N225","market_name":"日経平均"})
+            if pd.notna(required_date) and pd.Timestamp(out.index.max()).normalize() < required_date:
+                try:
+                    return _append_1321_proxy_market_row(out, required_date)
+                except Exception:
+                    pass
             return out
     except Exception:
         pass
@@ -615,6 +682,12 @@ def market_data(required_date=None):
         out = _market_indicators(raw)
         if not out.empty:
             out.attrs["source"] = "yfinance download"
+            out.attrs.update({"market_mode":"NIKKEI225_DIRECT","market_symbol":"^N225","market_name":"日経平均"})
+            if pd.notna(required_date) and pd.Timestamp(out.index.max()).normalize() < required_date:
+                try:
+                    return _append_1321_proxy_market_row(out, required_date)
+                except Exception:
+                    pass
             return out
     except Exception:
         pass
@@ -635,8 +708,10 @@ def build_freshness_report(data, market):
             reference_dates.append(pd.Timestamp(ref).normalize())
     required_date = max(reference_dates) if reference_dates else market_latest
     market_stale = bool(market.empty or (pd.notna(required_date) and market_latest < required_date))
+    market_symbol = market.attrs.get("market_symbol", "^N225") if not market.empty else "^N225"
+    market_name = market.attrs.get("market_name", "日経平均") if not market.empty else "日経平均"
     rows.append({
-        "種別": "市場", "コード": "^N225", "銘柄名": "日経平均",
+        "種別": "市場", "コード": market_symbol, "銘柄名": market_name,
         "データ最終日": market_latest, "基準日": required_date,
         "データ元": market.attrs.get("source", "取得失敗") if not market.empty else "取得失敗",
         "鮮度": "🔴 DATA STALE" if market_stale else "🟢 OK",
@@ -1366,8 +1441,9 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.2.3ではYahoo Japanの998407.Oを含む複数経路で、欠落した日経平均日足を補完します。"
-    "それでも古いデータなら売買判定を停止します。"
+    "RC6.3では日経平均を直接取得できない場合に限り、1321.T（日経225連動ETF）の当日騰落率を"
+    "市場判定用の代理データとして使用します。代理使用は画面とCSVに明記し、"
+    "1321.Tも古い場合は売買判定を停止します。"
 )
 st.success("📄 保有銘柄：SBI約定履歴CSV / 💴 購入株数：買付余力連動（スクショ/OCR完全除外）")
 
@@ -1552,8 +1628,11 @@ with st.spinner("📡 株価・市場・海外データを取得中…"):
 freshness_df, market_data_stale, stale_tickers = build_freshness_report(data, market)
 market_latest_date = pd.NaT if market.empty else pd.Timestamp(market.index.max()).normalize()
 market_required_date = pd.to_datetime(
-    freshness_df.loc[freshness_df["コード"] == "^N225", "基準日"], errors="coerce"
+    freshness_df.loc[freshness_df["種別"] == "市場", "基準日"], errors="coerce"
 ).max() if not freshness_df.empty else pd.NaT
+market_mode = market.attrs.get("market_mode", "NIKKEI225_DIRECT") if not market.empty else "NO_DATA"
+market_is_proxy = market_mode == "1321_ETF_PROXY"
+market_source = market.attrs.get("source", "取得失敗") if not market.empty else "取得失敗"
 stale_held_tickers = {c + ".T" for c in held_codes} & stale_tickers
 
 st.success(f"株価データ取得：{len(data)}銘柄")
@@ -1569,7 +1648,13 @@ elif stale_held_tickers:
     )
 else:
     latest_label = market_latest_date.date() if pd.notna(market_latest_date) else "不明"
-    st.success(f"🟢 データ鮮度OK：日経平均・保有銘柄の最終日 {latest_label}")
+    if market_is_proxy:
+        st.warning(
+            f"🟡 データ鮮度OK（代理）：日経平均の直接日足が古いため、"
+            f"1321.Tの騰落率で市場判定を補完しました。最終日 {latest_label}"
+        )
+    else:
+        st.success(f"🟢 データ鮮度OK：日経平均・保有銘柄の最終日 {latest_label}")
 
 with st.expander("🔎 株価データの取得元・最終日"):
     st.dataframe(freshness_df, use_container_width=True, hide_index=True)
@@ -2045,12 +2130,20 @@ latest_market_state = _current_market_state
 st.header("🌎 ⑦ 市場環境 / NO TRADE")
 if market_data_stale:
     st.error("🔴 DATA STALE → 市場判定と新規BUYを停止")
-elif "🔴" in latest_market_state or "🟠" in latest_market_state:
-    st.warning(f"市場環境：{latest_market_state} → 無理な新規BUYを抑制")
-elif latest_market_state == "⚪ 中立":
-    st.info("市場環境：中立 → 銘柄選別を厳格化")
 else:
-    st.success(f"市場環境：{latest_market_state}")
+    if market_is_proxy:
+        proxy_pct = safe_float(market.attrs.get("proxy_return_pct"), np.nan)
+        proxy_label = f"{proxy_pct:+.2f}%" if np.isfinite(proxy_pct) else "取得不可"
+        st.warning(
+            "市場判定データ：1321.T（日経225連動ETF）の騰落率代理 "
+            f"{proxy_label}。日経平均の正確な終値としては使用しません。"
+        )
+    if "🔴" in latest_market_state or "🟠" in latest_market_state:
+        st.warning(f"市場環境：{latest_market_state} → 無理な新規BUYを抑制")
+    elif latest_market_state == "⚪ 中立":
+        st.info("市場環境：中立 → 銘柄選別を厳格化")
+    else:
+        st.success(f"市場環境：{latest_market_state}")
 
 # ------------------------------------------------------------
 # UI：バックテスト成績
@@ -2071,8 +2164,9 @@ summary = pd.DataFrame({
     ]
 })
 summary = pd.concat([summary, pd.DataFrame([
-    {"項目":"日経平均データ最終日", "結果":market_latest_date.date() if pd.notna(market_latest_date) else "取得失敗"},
-    {"項目":"日経平均データ元", "結果":market.attrs.get("source", "取得失敗") if not market.empty else "取得失敗"},
+    {"項目":"市場判定データ最終日", "結果":market_latest_date.date() if pd.notna(market_latest_date) else "取得失敗"},
+    {"項目":"市場判定方式", "結果":"1321.T騰落率代理" if market_is_proxy else "日経平均直接"},
+    {"項目":"市場判定データ元", "結果":market_source},
     {"項目":"データ鮮度安全装置", "結果":"🔴 DATA STALE・売買判定停止" if market_data_stale else "🟢 OK"},
 ])], ignore_index=True)
 st.dataframe(summary, use_container_width=True, hide_index=True)
@@ -2083,7 +2177,10 @@ st.dataframe(summary, use_container_width=True, hide_index=True)
 st.header("🛡️ ⑨ データ品質・AI安全チェック")
 quality = pd.DataFrame([
     {"チェック":"市場データ鮮度","状態":"🔴 DATA STALE" if market_data_stale else "🟢 OK",
-     "内容":f"日経平均最終日: {market_latest_date.date() if pd.notna(market_latest_date) else '取得失敗'} / 古い場合はBUY・SELL・HOLDを停止"},
+     "内容":f"市場判定最終日: {market_latest_date.date() if pd.notna(market_latest_date) else '取得失敗'} / 古い場合はBUY・SELL・HOLDを停止"},
+    {"チェック":"市場判定方式","状態":"🟡 1321.T代理" if market_is_proxy else "🟢 日経平均直接",
+     "内容":("1321.Tの当日騰落率を市場の移動平均・傾向判定だけに使用。日経平均の正確な終値ではありません"
+             if market_is_proxy else "日経平均の直接取得値を使用")},
     {"チェック":"個別株データ鮮度","状態":"🔴 要停止" if stale_held_tickers else "🟢 OK",
      "内容":f"市場最終日より古い保有銘柄: {len(stale_held_tickers)}件 / 該当銘柄は売買判定停止"},
     {"チェック":"未来情報","状態":"🟢 OK","内容":"バックテストのBUY/SELL判定は日付時点の価格データのみ"},
@@ -2109,6 +2206,27 @@ stock_results = (
     if not selltr.empty else pd.DataFrame()
 )
 
+if not market.empty:
+    market_export = market.reset_index()
+    market_export["市場判定方式"] = "1321.T騰落率代理" if market_is_proxy else "日経平均直接"
+    market_export["データ元"] = market_source
+    market_export["代理換算値"] = bool(market_is_proxy)
+else:
+    market_export = pd.DataFrame()
+
+market_proxy_detail = pd.DataFrame([{
+    "市場判定方式": "1321.T騰落率代理" if market_is_proxy else "日経平均直接",
+    "データ元": market_source,
+    "基準日": market.attrs.get("proxy_base_date", pd.NaT) if not market.empty else pd.NaT,
+    "基準日日経平均終値": market.attrs.get("proxy_base_index_close", np.nan) if not market.empty else np.nan,
+    "基準日1321.T終値": market.attrs.get("proxy_base_close", np.nan) if not market.empty else np.nan,
+    "必要日1321.T終値": market.attrs.get("proxy_required_close", np.nan) if not market.empty else np.nan,
+    "1321.T当日騰落率": market.attrs.get("proxy_return_pct", np.nan) if not market.empty else np.nan,
+    "市場判定用換算値": market.attrs.get("converted_market_close", np.nan) if not market.empty else np.nan,
+    "注意": ("市場環境判定専用の代理値。日経平均の正確な終値ではない"
+             if market_is_proxy else "代理値は使用していない"),
+}])
+
 files = {
     "00_summary.csv":summary,
     "00b_buying_power.csv":buying_power_df,
@@ -2129,7 +2247,8 @@ files = {
     "08_liquidity_top50.csv":liq,
     "09_quality_check.csv":quality,
     "09a_data_freshness.csv":freshness_df,
-    "10_market_data.csv":market.reset_index() if not market.empty else pd.DataFrame(),
+    "09b_market_proxy_detail.csv":market_proxy_detail,
+    "10_market_data.csv":market_export,
     "11_overseas_data.csv":overseas.reset_index() if not overseas.empty else pd.DataFrame(),
 }
 
@@ -2143,7 +2262,7 @@ st.header("📦 ⑩ 全処理データ")
 st.download_button(
     "📦 Ver.6.0 全処理データをZIPでダウンロード",
     buf.getvalue(),
-    "ver6_0_RC6_2_3_all_analysis.zip",
+    "ver6_0_RC6_3_all_analysis.zip",
     "application/zip",
     use_container_width=True
 )

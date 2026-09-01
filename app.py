@@ -21,11 +21,12 @@ import math
 import os
 import re
 import plistlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zipfile import ZipFile
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -35,8 +36,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.1 SBI-TRADE-CSV + BUYING-POWER"
-BUILD = "VER6.0-RC6.1-BUYING-POWER-SIZING-20260901"
+VERSION = "6.0 RC6.2 DATA-FRESHNESS-SAFE"
+BUILD = "VER6.0-RC6.2-DATA-FRESHNESS-SAFE-20260902"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -130,7 +131,7 @@ def clamp(x, lo=0, hi=100):
 # 株価データ
 # ------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def stock_data(t, years=5):
+def _stock_data_rc61_fallback(t, years=5):
     end = datetime.now()
     start = end - timedelta(days=365 * years + 300)
 
@@ -191,7 +192,7 @@ def stock_data(t, years=5):
             return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
-def market_data():
+def _market_data_rc61_fallback():
     end = datetime.now()
     start = end - timedelta(days=365 * 5 + 300)
     try:
@@ -212,6 +213,232 @@ def market_data():
         return out.dropna()
     except Exception:
         return pd.DataFrame()
+
+def _yahoo_chart(symbol, years=5):
+    """Yahoo Financeの最新日足を直接取得し、取引時刻メタ情報も返す。"""
+    end_ts = int(datetime.now(timezone.utc).timestamp()) + 86400
+    start_ts = end_ts - int((365 * years + 300) * 86400)
+    encoded = requests.utils.quote(str(symbol), safe="")
+    params = {
+        "period1": start_ts, "period2": end_ts, "interval": "1d",
+        "events": "history", "includeAdjustedClose": "true",
+    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; JPStockAssistant/6.0)"}
+    last_error = None
+
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            url = f"https://{host}/v8/finance/chart/{encoded}"
+            response = requests.get(url, params=params, headers=headers, timeout=12)
+            response.raise_for_status()
+            payload = response.json()
+            result = payload.get("chart", {}).get("result") or []
+            if not result:
+                raise ValueError(payload.get("chart", {}).get("error") or "チャートデータなし")
+
+            item = result[0]
+            stamps = item.get("timestamp") or []
+            quote = ((item.get("indicators") or {}).get("quote") or [{}])[0]
+            if not stamps:
+                raise ValueError("日足タイムスタンプなし")
+            size = len(stamps)
+            frame = pd.DataFrame({
+                "Open": quote.get("open", [np.nan] * size),
+                "High": quote.get("high", [np.nan] * size),
+                "Low": quote.get("low", [np.nan] * size),
+                "Close": quote.get("close", [np.nan] * size),
+                "Volume": quote.get("volume", [np.nan] * size),
+            })
+            meta = item.get("meta") or {}
+            tz_name = meta.get("exchangeTimezoneName") or "UTC"
+            idx = pd.to_datetime(stamps, unit="s", utc=True)
+            try:
+                idx = idx.tz_convert(tz_name)
+            except Exception:
+                pass
+            frame.index = idx.tz_localize(None).normalize()
+            frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+
+            regular_date = pd.NaT
+            if meta.get("regularMarketTime"):
+                ts = pd.Timestamp(meta["regularMarketTime"], unit="s", tz="UTC")
+                try:
+                    ts = ts.tz_convert(tz_name)
+                except Exception:
+                    pass
+                regular_date = ts.tz_localize(None).normalize()
+            return frame, {
+                "source": f"Yahoo Finance Chart API ({host})",
+                "regular_market_date": regular_date,
+            }
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"Yahoo Finance Chart API取得失敗: {last_error}")
+
+
+def _normalize_ohlcv(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(c in df.columns for c in cols):
+        return pd.DataFrame()
+    df = df[cols].copy()
+    idx = pd.DatetimeIndex(pd.to_datetime(df.index, errors="coerce"))
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    df.index = idx.normalize()
+    df = df[~df.index.isna()]
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna(subset=cols)
+
+
+def _add_indicators(df):
+    df = _normalize_ohlcv(df)
+    if len(df) < 220:
+        return pd.DataFrame()
+    df["MA25"] = df.Close.rolling(25).mean()
+    df["MA75"] = df.Close.rolling(75).mean()
+    df["MA200"] = df.Close.rolling(200).mean()
+    df["MA25_Slope"] = df.MA25 - df.MA25.shift(5)
+    df["MA75_Slope"] = df.MA75 - df.MA75.shift(5)
+    df["VOL20"] = df.Volume.rolling(20).mean()
+    df["Turnover"] = df.Close * df.Volume
+    delta = df.Close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["RSI"] = 100 - (100 / (1 + rs))
+    tr = pd.concat([
+        df.High - df.Low,
+        (df.High - df.Close.shift()).abs(),
+        (df.Low - df.Close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR14"] = tr.rolling(14).mean()
+    df["Return_5d"] = df.Close.pct_change(5) * 100
+    df["Return_25d"] = df.Close.pct_change(25) * 100
+    df["Volume_Ratio"] = df.Volume / df.VOL20.replace(0, np.nan)
+    return df.dropna()
+
+
+def _market_indicators(raw):
+    raw = _normalize_ohlcv(raw)
+    if raw.empty:
+        return pd.DataFrame()
+    c = pd.to_numeric(raw["Close"], errors="coerce")
+    out = pd.DataFrame({"Close": c})
+    out["MA25"] = c.rolling(25).mean()
+    out["MA75"] = c.rolling(75).mean()
+    out["MA200"] = c.rolling(200).mean()
+    out["MA25_Slope"] = out.MA25 - out.MA25.shift(5)
+    return out.dropna()
+
+
+# RC6.2: 既存関数を上書きし、直接API → yfinance個別 → 一括downloadの順で取得する。
+@st.cache_data(ttl=1800)
+def stock_data(t, years=5):
+    end = datetime.now()
+    start = end - timedelta(days=365 * years + 300)
+    try:
+        raw, meta = _yahoo_chart(t, years)
+        out = _add_indicators(raw)
+        if not out.empty:
+            out.attrs.update(meta)
+            return out
+    except Exception:
+        pass
+    try:
+        raw = yf.Ticker(t).history(start=start, end=end + timedelta(days=1),
+                                   auto_adjust=False, actions=False)
+        out = _add_indicators(raw)
+        if not out.empty:
+            out.attrs["source"] = "yfinance Ticker.history"
+            return out
+    except Exception:
+        pass
+    try:
+        raw = yf.download(t, start=start, end=end + timedelta(days=1),
+                          auto_adjust=False, progress=False, threads=False)
+        out = _add_indicators(raw)
+        if not out.empty:
+            out.attrs["source"] = "yfinance download"
+            return out
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800)
+def market_data():
+    end = datetime.now()
+    start = end - timedelta(days=365 * 5 + 300)
+    try:
+        raw, meta = _yahoo_chart("^N225", 5)
+        out = _market_indicators(raw)
+        if not out.empty:
+            out.attrs.update(meta)
+            return out
+    except Exception:
+        pass
+    try:
+        raw = yf.Ticker("^N225").history(start=start, end=end + timedelta(days=1),
+                                          auto_adjust=False, actions=False)
+        out = _market_indicators(raw)
+        if not out.empty:
+            out.attrs["source"] = "yfinance Ticker.history"
+            return out
+    except Exception:
+        pass
+    try:
+        raw = yf.download("^N225", start=start, end=end + timedelta(days=1),
+                          auto_adjust=False, progress=False, threads=False)
+        out = _market_indicators(raw)
+        if not out.empty:
+            out.attrs["source"] = "yfinance download"
+            return out
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def build_freshness_report(data, market):
+    """日経平均の確定日を基準に、朝の売買判断に使える鮮度か判定する。"""
+    rows = []
+    market_latest = pd.NaT if market.empty else pd.Timestamp(market.index.max()).normalize()
+    regular_date = market.attrs.get("regular_market_date", pd.NaT) if not market.empty else pd.NaT
+    regular_date = pd.Timestamp(regular_date).normalize() if pd.notna(regular_date) else pd.NaT
+    # 指数メタ情報が取れない場合でも、各銘柄の取引時刻メタ情報を照合に利用する。
+    reference_dates = [regular_date] if pd.notna(regular_date) else []
+    for d in data.values():
+        ref = d.attrs.get("regular_market_date", pd.NaT)
+        if pd.notna(ref):
+            reference_dates.append(pd.Timestamp(ref).normalize())
+    required_date = max(reference_dates) if reference_dates else market_latest
+    market_stale = bool(market.empty or (pd.notna(required_date) and market_latest < required_date))
+    rows.append({
+        "種別": "市場", "コード": "^N225", "銘柄名": "日経平均",
+        "データ最終日": market_latest, "基準日": required_date,
+        "データ元": market.attrs.get("source", "取得失敗") if not market.empty else "取得失敗",
+        "鮮度": "🔴 DATA STALE" if market_stale else "🟢 OK",
+    })
+    stale_tickers = set()
+    for t, d in data.items():
+        latest = pd.Timestamp(d.index.max()).normalize()
+        stale = bool(pd.notna(required_date) and latest < required_date)
+        if stale:
+            stale_tickers.add(t)
+        rows.append({
+            "種別": "個別株", "コード": code(t), "銘柄名": name(t),
+            "データ最終日": latest, "基準日": required_date,
+            "データ元": d.attrs.get("source", "不明"),
+            "鮮度": "🔴 DATA STALE" if stale else "🟢 OK",
+        })
+    return pd.DataFrame(rows), market_stale, stale_tickers
+
 
 @st.cache_data(ttl=3600)
 def overseas_data():
@@ -922,7 +1149,8 @@ st.title("📈 日本株 AI投資アシスタント Ver.6.0")
 st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
-    "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算するVer.6.0 RC6.1です。"
+    "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
+    "RC6.2では日経平均・個別株の取得経路を多重化し、古いデータでは売買判定を停止します。"
 )
 st.success("📄 保有銘柄：SBI約定履歴CSV / 💴 購入株数：買付余力連動（スクショ/OCR完全除外）")
 
@@ -1099,7 +1327,27 @@ with st.spinner("📡 株価・市場・海外データを取得中…"):
     market = market_data()
     overseas = overseas_data()
 
+freshness_df, market_data_stale, stale_tickers = build_freshness_report(data, market)
+market_latest_date = pd.NaT if market.empty else pd.Timestamp(market.index.max()).normalize()
+stale_held_tickers = {c + ".T" for c in held_codes} & stale_tickers
+
 st.success(f"株価データ取得：{len(data)}銘柄")
+if market_data_stale:
+    st.error(
+        "🔴 DATA STALE：日経平均の最新確定データを確認できません。"
+        "安全のため、本日の新規BUYと保有銘柄のSELL/HOLD判定を停止します。"
+    )
+elif stale_held_tickers:
+    st.error(
+        "🔴 DATA STALE：一部の保有銘柄が日経平均の最終日まで更新されていません。"
+        "該当銘柄のSELL/HOLD判定を停止します。"
+    )
+else:
+    latest_label = market_latest_date.date() if pd.notna(market_latest_date) else "不明"
+    st.success(f"🟢 データ鮮度OK：日経平均・保有銘柄の最終日 {latest_label}")
+
+with st.expander("🔎 株価データの取得元・最終日"):
+    st.dataframe(freshness_df, use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------
 # 目標資産 / 複利ロードマップ
@@ -1314,6 +1562,9 @@ pf = gp/gl if gl else 0
 latest_rows = []
 for t,d in data.items():
     r = d.iloc[-1]; p = float(r.Close); c = code(t)
+    # 日経平均より古い個別株データは、現在のBUY候補に使用しない。
+    if market_data_stale or t in stale_tickers:
+        continue
     if p >= 2000:
         continue
     if use_liq and c not in liq_codes and c not in held_codes and c != "6085":
@@ -1339,6 +1590,8 @@ for t,d in data.items():
     )
     latest_rows.append({
         "コード":c,"銘柄名":name(t),"現在株価":p,
+        "データ最終日":pd.Timestamp(d.index[-1]).normalize(),
+        "データ元":d.attrs.get("source", "不明"),"データ鮮度":"🟢 OK",
         "総合AIスコア":float(total),"企業価値スコア":value,
         "成長性スコア":growth,"テンバガー度":ten,
         "テクニカルスコア":ts,"AI信頼度":hp,
@@ -1361,14 +1614,20 @@ if not latest_df.empty:
     latest_df = latest_df.sort_values("総合AIスコア",ascending=False).reset_index(drop=True)
 
 # 「今日のBUY」は最低AIスコアを通過した銘柄だけ。候補一覧とは分離する。
-today_buy_df = latest_df[latest_df["総合AIスコア"] >= minbuy_score].copy() if not latest_df.empty else pd.DataFrame()
+today_buy_df = (
+    latest_df[latest_df["総合AIスコア"] >= minbuy_score].copy()
+    if not latest_df.empty and not market_data_stale else pd.DataFrame()
+)
 if not today_buy_df.empty:
     today_buy_df = today_buy_df.sort_values("総合AIスコア", ascending=False).reset_index(drop=True)
 
 # 現在市場のNO TRADE判定（購入株数計算にも使用）
 _latest_dt_for_market = max(data[next(iter(data))].index) if data else datetime.now()
 _current_market_state = market_info(market, _latest_dt_for_market)[0] if not market.empty and data else "⚪ データなし"
-_market_block = bool(no_trade_on_bad_market and ("🔴" in _current_market_state or "🟠" in _current_market_state))
+_market_block = bool(
+    market_data_stale or
+    (no_trade_on_bad_market and ("🔴" in _current_market_state or "🟠" in _current_market_state))
+)
 
 purchase_plan_df = build_purchase_plan(
     today_buy_df, buying_power, current_assets, held_codes, maxpos, maxbuy, sl,
@@ -1396,6 +1655,22 @@ buying_power_df = pd.DataFrame([{
 holding_rows = []
 for c in held_codes:
     t = c + ".T"
+    if market_data_stale or t in stale_tickers:
+        d = data.get(t, pd.DataFrame())
+        latest = pd.NaT if d.empty else pd.Timestamp(d.index.max()).normalize()
+        holding_rows.append({
+            "コード":c,"銘柄名":name(t),"株数":share_map.get(c, np.nan),
+            "取得単価":entry_map.get(c, np.nan),
+            "保有情報データ元":confirmed.get(c, {}).get("source", "SBI約定履歴CSV自動復元"),
+            "現在価格":np.nan,"含み損益率":np.nan,"企業価値スコア":np.nan,
+            "成長性スコア":np.nan,"テンバガー度":np.nan,"AI参考価値":np.nan,
+            "参考価値上昇余地":np.nan,"テクニカルスコア":np.nan,
+            "判定":"🔴 DATA STALE","売却期限目安":"判定停止・データ更新後に再実行",
+            "警戒理由":f"株価データ最終日 {latest.date() if pd.notna(latest) else '取得不可'} / "
+                       f"市場基準日 {market_latest_date.date() if pd.notna(market_latest_date) else '取得不可'}",
+            "補足":"古いデータではSELL/HOLDを出しません",
+        })
+        continue
     if t not in data:
         holding_rows.append({"コード":c,"銘柄名":name(t),"判定":"データ不足","警戒理由":"株価データ取得不可"})
         continue
@@ -1465,11 +1740,17 @@ else:
     sell_now = holdings_df[holdings_df["判定"]=="🔴 SELL"]
     watch = holdings_df[holdings_df["判定"]=="🟡 WATCH"]
     hold = holdings_df[holdings_df["判定"]=="🟢 HOLD"]
+    stale_holdings = holdings_df[holdings_df["判定"]=="🔴 DATA STALE"]
 
-    c1,c2,c3 = st.columns(3)
+    c1,c2,c3,c4 = st.columns(4)
     c1.metric("🔴 SELL",len(sell_now))
     c2.metric("🟡 WATCH",len(watch))
     c3.metric("🟢 HOLD",len(hold))
+    c4.metric("DATA STALE",len(stale_holdings))
+
+    if not stale_holdings.empty:
+        st.error("🔴 古い株価データの銘柄は売買判定を停止しています。")
+        st.dataframe(stale_holdings, use_container_width=True, hide_index=True)
 
     if not sell_now.empty:
         st.subheader("🔴 早期売却候補")
@@ -1485,7 +1766,9 @@ else:
 # UI：新規BUY / 購入株数 / テンバガー
 # ------------------------------------------------------------
 st.header("🟢 ⑤ 今日の正式BUY / 購入株数 TOP3")
-if today_buy_df.empty:
+if market_data_stale:
+    st.error("🔴 DATA STALEのため、本日の新規BUY判定を停止しています。データ更新後に再実行してください。")
+elif today_buy_df.empty:
     st.info(f"💤 BUY基準（AI {minbuy_score}点以上）を満たす銘柄はありません。今日はNO TRADEです。")
 elif purchase_plan_df.empty:
     st.warning("正式BUY候補はありますが、資金管理条件により購入株数を出せません。最大保有銘柄数などを確認してください。")
@@ -1527,7 +1810,9 @@ else:
 # ------------------------------------------------------------
 latest_market_state = _current_market_state
 st.header("🌎 ⑦ 市場環境 / NO TRADE")
-if "🔴" in latest_market_state or "🟠" in latest_market_state:
+if market_data_stale:
+    st.error("🔴 DATA STALE → 市場判定と新規BUYを停止")
+elif "🔴" in latest_market_state or "🟠" in latest_market_state:
     st.warning(f"市場環境：{latest_market_state} → 無理な新規BUYを抑制")
 elif latest_market_state == "⚪ 中立":
     st.info("市場環境：中立 → 銘柄選別を厳格化")
@@ -1552,6 +1837,11 @@ summary = pd.DataFrame({
         f"¥{int(buying_power):,} ({buying_power_source})","あり","なし","なし"
     ]
 })
+summary = pd.concat([summary, pd.DataFrame([
+    {"項目":"日経平均データ最終日", "結果":market_latest_date.date() if pd.notna(market_latest_date) else "取得失敗"},
+    {"項目":"日経平均データ元", "結果":market.attrs.get("source", "取得失敗") if not market.empty else "取得失敗"},
+    {"項目":"データ鮮度安全装置", "結果":"🔴 DATA STALE・売買判定停止" if market_data_stale else "🟢 OK"},
+])], ignore_index=True)
 st.dataframe(summary, use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------
@@ -1559,6 +1849,10 @@ st.dataframe(summary, use_container_width=True, hide_index=True)
 # ------------------------------------------------------------
 st.header("🛡️ ⑨ データ品質・AI安全チェック")
 quality = pd.DataFrame([
+    {"チェック":"市場データ鮮度","状態":"🔴 DATA STALE" if market_data_stale else "🟢 OK",
+     "内容":f"日経平均最終日: {market_latest_date.date() if pd.notna(market_latest_date) else '取得失敗'} / 古い場合はBUY・SELL・HOLDを停止"},
+    {"チェック":"個別株データ鮮度","状態":"🔴 要停止" if stale_held_tickers else "🟢 OK",
+     "内容":f"市場最終日より古い保有銘柄: {len(stale_held_tickers)}件 / 該当銘柄は売買判定停止"},
     {"チェック":"未来情報","状態":"🟢 OK","内容":"バックテストのBUY/SELL判定は日付時点の価格データのみ"},
     {"チェック":"現在ファンダメンタル","状態":"🟡 現在分析のみ","内容":"Yahoo Financeの現在情報。過去バックテストには混入させない"},
     {"チェック":"SBI約定履歴CSV","状態":"🟢 自動復元","内容":"約定履歴の買付・売却を時系列処理し、現在株数と平均取得単価を自動復元。スクショ/OCRは完全除外"},
@@ -1601,6 +1895,7 @@ files = {
     "07_stock_results.csv":stock_results,
     "08_liquidity_top50.csv":liq,
     "09_quality_check.csv":quality,
+    "09a_data_freshness.csv":freshness_df,
     "10_market_data.csv":market.reset_index() if not market.empty else pd.DataFrame(),
     "11_overseas_data.csv":overseas.reset_index() if not overseas.empty else pd.DataFrame(),
 }
@@ -1615,7 +1910,7 @@ st.header("📦 ⑩ 全処理データ")
 st.download_button(
     "📦 Ver.6.0 全処理データをZIPでダウンロード",
     buf.getvalue(),
-    "ver6_0_RC6_1_all_analysis.zip",
+    "ver6_0_RC6_2_all_analysis.zip",
     "application/zip",
     use_container_width=True
 )

@@ -36,8 +36,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.2 DATA-FRESHNESS-SAFE"
-BUILD = "VER6.0-RC6.2-DATA-FRESHNESS-SAFE-20260902"
+VERSION = "6.0 RC6.2.1 NIKKEI-LATEST-ROW-REPAIR"
+BUILD = "VER6.0-RC6.2.1-NIKKEI-LATEST-ROW-REPAIR-20260902"
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -214,6 +214,28 @@ def _market_data_rc61_fallback():
     except Exception:
         return pd.DataFrame()
 
+def _append_regular_market_row(frame, meta, regular_date):
+    """日足配列だけ更新が遅い場合、同じレスポンスの最新四本値で末尾を補完する。"""
+    if frame is None or frame.empty or pd.isna(regular_date):
+        return frame, False
+    latest = pd.Timestamp(frame.index.max()).normalize()
+    if regular_date <= latest:
+        return frame, False
+
+    close = safe_float(meta.get("regularMarketPrice"), np.nan)
+    if not np.isfinite(close) or close <= 0:
+        return frame, False
+    open_price = safe_float(meta.get("regularMarketOpen"), close)
+    high = safe_float(meta.get("regularMarketDayHigh"), close)
+    low = safe_float(meta.get("regularMarketDayLow"), close)
+    volume = safe_float(meta.get("regularMarketVolume"), 0.0)
+    frame = frame.copy()
+    frame.loc[regular_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+        open_price, high, low, close, max(volume, 0.0)
+    ]
+    return frame.sort_index(), True
+
+
 def _yahoo_chart(symbol, years=5):
     """Yahoo Financeの最新日足を直接取得し、取引時刻メタ情報も返す。"""
     end_ts = int(datetime.now(timezone.utc).timestamp()) + 86400
@@ -267,9 +289,14 @@ def _yahoo_chart(symbol, years=5):
                 except Exception:
                     pass
                 regular_date = ts.tz_localize(None).normalize()
+            frame, repaired = _append_regular_market_row(frame, meta, regular_date)
+            source = f"Yahoo Finance Chart API ({host})"
+            if repaired:
+                source += " + regularMarket最新四本値補完"
             return frame, {
-                "source": f"Yahoo Finance Chart API ({host})",
+                "source": source,
                 "regular_market_date": regular_date,
+                "latest_row_repaired": repaired,
             }
         except Exception as e:
             last_error = e
@@ -1150,7 +1177,8 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.2では日経平均・個別株の取得経路を多重化し、古いデータでは売買判定を停止します。"
+    "RC6.2.1では取得経路を多重化し、日足更新が遅い場合は同一レスポンスの最新四本値で補完します。"
+    "それでも古いデータなら売買判定を停止します。"
 )
 st.success("📄 保有銘柄：SBI約定履歴CSV / 💴 購入株数：買付余力連動（スクショ/OCR完全除外）")
 
@@ -1329,6 +1357,9 @@ with st.spinner("📡 株価・市場・海外データを取得中…"):
 
 freshness_df, market_data_stale, stale_tickers = build_freshness_report(data, market)
 market_latest_date = pd.NaT if market.empty else pd.Timestamp(market.index.max()).normalize()
+market_required_date = pd.to_datetime(
+    freshness_df.loc[freshness_df["コード"] == "^N225", "基準日"], errors="coerce"
+).max() if not freshness_df.empty else pd.NaT
 stale_held_tickers = {c + ".T" for c in held_codes} & stale_tickers
 
 st.success(f"株価データ取得：{len(data)}銘柄")
@@ -1609,7 +1640,15 @@ for t,d in data.items():
         "実保有銘柄":c in held_codes,
     })
 
-latest_df = pd.DataFrame(latest_rows)
+latest_columns = [
+    "コード","銘柄名","現在株価","データ最終日","データ元","データ鮮度",
+    "総合AIスコア","企業価値スコア","成長性スコア","テンバガー度",
+    "テクニカルスコア","AI信頼度","市場判定","海外為替判定",
+    "現在PER","予想PER","PBR","ROE","売上成長率","利益成長率","時価総額",
+    "AI参考価値下限","AI参考価値","AI参考価値上限","参考価値上昇余地",
+    "価値算定根拠","実保有銘柄",
+]
+latest_df = pd.DataFrame(latest_rows, columns=latest_columns)
 if not latest_df.empty:
     latest_df = latest_df.sort_values("総合AIスコア",ascending=False).reset_index(drop=True)
 
@@ -1667,7 +1706,7 @@ for c in held_codes:
             "参考価値上昇余地":np.nan,"テクニカルスコア":np.nan,
             "判定":"🔴 DATA STALE","売却期限目安":"判定停止・データ更新後に再実行",
             "警戒理由":f"株価データ最終日 {latest.date() if pd.notna(latest) else '取得不可'} / "
-                       f"市場基準日 {market_latest_date.date() if pd.notna(market_latest_date) else '取得不可'}",
+                       f"必要データ日 {market_required_date.date() if pd.notna(market_required_date) else '取得不可'}",
             "補足":"古いデータではSELL/HOLDを出しません",
         })
         continue
@@ -1910,7 +1949,7 @@ st.header("📦 ⑩ 全処理データ")
 st.download_button(
     "📦 Ver.6.0 全処理データをZIPでダウンロード",
     buf.getvalue(),
-    "ver6_0_RC6_2_all_analysis.zip",
+    "ver6_0_RC6_2_1_all_analysis.zip",
     "application/zip",
     use_container_width=True
 )

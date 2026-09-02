@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.6.0
-# BUILD: VER6.0-RC6.6-FREE-MULTISOURCE-JAPAN-20260903
+# BUILD: VER6.0-RC6.7-TRADINGVIEW-BATCH-DIAGNOSTIC-20260903
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,10 +39,11 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.6 FREE-MULTISOURCE-JAPAN"
-BUILD = "VER6.0-RC6.6-FREE-MULTISOURCE-JAPAN-20260903"
+VERSION = "6.0 RC6.7 TRADINGVIEW-BATCH-DIAGNOSTIC"
+BUILD = "VER6.0-RC6.7-TRADINGVIEW-BATCH-DIAGNOSTIC-20260903"
 
 JST = ZoneInfo("Asia/Tokyo")
+TRADINGVIEW_QUOTES_CACHE = {}
 
 
 def tokyo_now():
@@ -698,6 +699,107 @@ def _stooq_stock_day(symbol, target_date):
     return values, "Stooq日本株日足CSV（無料）"
 
 
+@st.cache_data(ttl=900)
+def tradingview_batch_quotes(tickers_tuple):
+    """TradingView公開スキャナーから東証銘柄を1回でまとめて取得する。"""
+    requested = [str(t) for t in tickers_tuple if str(t).endswith(".T")]
+    tv_symbols = [f"TSE:{t[:-2]}" for t in requested]
+    columns = ["open", "high", "low", "close", "volume"]
+    payload = {
+        "symbols": {"tickers": tv_symbols, "query": {"types": []}},
+        "columns": columns,
+        "range": [0, max(len(tv_symbols), 1)],
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.tradingview.com",
+        "Referer": "https://www.tradingview.com/",
+        "User-Agent": "Mozilla/5.0 (compatible; JPStockAssistant/6.0)",
+    }
+    diagnostics = []
+    quotes = {}
+    for endpoint in (
+        "https://scanner.tradingview.com/japan/scan",
+        "https://scanner.tradingview.com/global/scan",
+    ):
+        try:
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=20)
+            diagnostics.append({
+                "段階":"TradingView一括取得", "対象":"全銘柄", "取得先":endpoint,
+                "HTTP状態":response.status_code, "結果":"応答受信" if response.ok else "HTTPエラー",
+                "詳細":f"応答サイズ {len(response.content):,} bytes",
+            })
+            response.raise_for_status()
+            body = response.json()
+            for item in body.get("data") or []:
+                symbol = str(item.get("s", ""))
+                values = list(item.get("d") or [])
+                if len(values) < len(columns) or ":" not in symbol:
+                    continue
+                stock_code = symbol.split(":", 1)[1]
+                parsed = dict(zip(columns, values))
+                row = {
+                    "Open": safe_float(parsed.get("open"), np.nan),
+                    "High": safe_float(parsed.get("high"), np.nan),
+                    "Low": safe_float(parsed.get("low"), np.nan),
+                    "Close": safe_float(parsed.get("close"), np.nan),
+                    "Volume": safe_float(parsed.get("volume"), 0.0),
+                }
+                valid = (
+                    all(np.isfinite(row[k]) and row[k] > 0 for k in ["Open", "High", "Low", "Close"])
+                    and row["Low"] <= min(row["Open"], row["Close"])
+                    and row["High"] >= max(row["Open"], row["Close"])
+                )
+                if valid:
+                    quotes[f"{stock_code}.T"] = row
+            if quotes:
+                diagnostics.append({
+                    "段階":"TradingView一括取得", "対象":"全銘柄", "取得先":endpoint,
+                    "HTTP状態":response.status_code, "結果":"成功", "詳細":f"有効OHLCV {len(quotes)}銘柄",
+                })
+                break
+            diagnostics.append({
+                "段階":"TradingView一括取得", "対象":"全銘柄", "取得先":endpoint,
+                "HTTP状態":response.status_code, "結果":"データなし", "詳細":"有効な東証OHLCVを確認できません",
+            })
+        except Exception as exc:
+            diagnostics.append({
+                "段階":"TradingView一括取得", "対象":"全銘柄", "取得先":endpoint,
+                "HTTP状態":"取得不可", "結果":"失敗", "詳細":f"{type(exc).__name__}: {str(exc)[:240]}",
+            })
+    return quotes, diagnostics
+
+
+def _merge_tradingview_snapshot(frame, ticker):
+    """Yahoo履歴の欠落した確定日だけTradingViewの東証OHLCVで補う。"""
+    quote = TRADINGVIEW_QUOTES_CACHE.get(str(ticker))
+    if frame is None or frame.empty or not quote:
+        return frame, False, "一括価格なし"
+    required_date = frame.attrs.get("regular_market_date", pd.NaT)
+    required_date = pd.Timestamp(required_date).normalize() if pd.notna(required_date) else pd.NaT
+    latest = pd.Timestamp(frame.index.max()).normalize()
+    if pd.isna(required_date):
+        return frame, False, "必要日を確認できないため不採用"
+    if latest >= required_date:
+        return frame, False, "既存日足が最新"
+    hour = tokyo_now().hour
+    if 9 <= hour < 16:
+        return frame, False, "取引時間中の未確定日足は不採用"
+    attrs = dict(frame.attrs)
+    raw = frame[["Open", "High", "Low", "Close", "Volume"]].copy()
+    raw.loc[required_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+        quote["Open"], quote["High"], quote["Low"], quote["Close"], max(quote["Volume"], 0.0)
+    ]
+    repaired = _add_indicators(raw.sort_index())
+    if repaired.empty or pd.Timestamp(repaired.index.max()).normalize() < required_date:
+        return frame, False, "指標再計算後も必要日に届かない"
+    repaired.attrs.update(attrs)
+    repaired.attrs["source"] = "TradingView東証スキャナー一括取得（無料） + 既存履歴"
+    repaired.attrs["latest_row_repaired"] = True
+    return repaired, True, "TradingView一括OHLCVを採用"
+
+
 def _yahoo_japan_stock_snapshot(symbol, target_date):
     """Yahoo!ファイナンス日本版から東証の最新確定OHLCVを取得する。"""
     symbol = str(symbol).strip()
@@ -831,7 +933,7 @@ def _market_from_close(close):
     return out.dropna()
 
 
-# RC6.6: 欠落日は、みんかぶ→Stooq→Yahoo系の順で無料補完する。
+# RC6.7: TradingView一括取得を最優先にし、個別サイトは予備経路にする。
 @st.cache_data(ttl=1800)
 def stock_data(t, years=5):
     start, end = yahoo_history_window(years)
@@ -840,6 +942,7 @@ def stock_data(t, years=5):
         out = _add_indicators(raw)
         if not out.empty:
             out.attrs.update(meta)
+            out, _, _ = _merge_tradingview_snapshot(out, t)
             return out
     except Exception:
         pass
@@ -849,6 +952,7 @@ def stock_data(t, years=5):
         out = _add_indicators(raw)
         if not out.empty:
             out.attrs["source"] = "yfinance Ticker.history"
+            out, _, _ = _merge_tradingview_snapshot(out, t)
             return out
     except Exception:
         pass
@@ -858,6 +962,7 @@ def stock_data(t, years=5):
         out = _add_indicators(raw)
         if not out.empty:
             out.attrs["source"] = "yfinance download"
+            out, _, _ = _merge_tradingview_snapshot(out, t)
             return out
     except Exception:
         pass
@@ -1715,8 +1820,9 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.6では有料APIを使わず、最新日が欠けた場合は、みんかぶ国内株時系列、Stooq無料CSV、"
-    "Yahoo系予備経路の順で東証確定値を補完します。日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"
+    "RC6.7では有料APIを使わず、TradingView公開スキャナーから東証銘柄を一括取得します。"
+    "個別サイトへの連続アクセスを避け、みんかぶ・Stooq・Yahoo系は予備経路として残します。"
+    "日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"
     "市場判定用の代理データとして使用します。代理使用は画面とCSVに明記し、"
     "1321.Tも古い場合は売買判定を停止します。"
 )
@@ -1890,7 +1996,11 @@ bp_c3.metric("1日使用上限", f"{daily_deploy_pct}%")
 # ------------------------------------------------------------
 analysis_codes = list(dict.fromkeys(parse_codes(universe_text) + held_codes))
 with st.spinner("📡 株価・市場・海外データを取得中…"):
-    data = {t: stock_data(t) for t in tickers(",".join(analysis_codes))}
+    analysis_tickers = tickers(",".join(analysis_codes))
+    tv_quotes, tv_endpoint_diagnostics = tradingview_batch_quotes(tuple(analysis_tickers + ["1321.T"]))
+    TRADINGVIEW_QUOTES_CACHE.clear()
+    TRADINGVIEW_QUOTES_CACHE.update(tv_quotes)
+    data = {t: stock_data(t) for t in analysis_tickers}
     data = {t:d for t,d in data.items() if not d.empty}
     individual_dates = [
         pd.Timestamp(d.attrs.get("regular_market_date")).normalize()
@@ -1899,6 +2009,20 @@ with st.spinner("📡 株価・市場・海外データを取得中…"):
     expected_market_date = max(individual_dates) if individual_dates else pd.NaT
     market = market_data(expected_market_date)
     overseas = overseas_data()
+
+diagnostic_rows = list(tv_endpoint_diagnostics)
+for ticker in analysis_tickers:
+    frame = data.get(ticker, pd.DataFrame())
+    latest = pd.NaT if frame.empty else pd.Timestamp(frame.index.max()).normalize()
+    required = pd.NaT if frame.empty else frame.attrs.get("regular_market_date", pd.NaT)
+    required = pd.Timestamp(required).normalize() if pd.notna(required) else pd.NaT
+    source = "取得失敗" if frame.empty else frame.attrs.get("source", "不明")
+    diagnostic_rows.append({
+        "段階":"銘柄別採用結果", "対象":f"{code(ticker)} {name(ticker)}", "取得先":source,
+        "HTTP状態":"-", "結果":("最新" if pd.notna(latest) and pd.notna(required) and latest >= required else "未更新"),
+        "詳細":f"最終日={latest.date() if pd.notna(latest) else 'なし'} / 必要日={required.date() if pd.notna(required) else '不明'} / TV一括={'あり' if ticker in tv_quotes else 'なし'}",
+    })
+data_source_diagnostics_df = pd.DataFrame(diagnostic_rows)
 
 freshness_df, market_data_stale, stale_tickers = build_freshness_report(data, market)
 market_latest_date = pd.NaT if market.empty else pd.Timestamp(market.index.max()).normalize()
@@ -1933,6 +2057,8 @@ else:
 
 with st.expander("🔎 株価データの取得元・最終日"):
     st.dataframe(freshness_df, use_container_width=True, hide_index=True)
+with st.expander("🧪 無料データ取得診断"):
+    st.dataframe(data_source_diagnostics_df, use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------
 # 目標資産 / 複利ロードマップ
@@ -2523,6 +2649,7 @@ files = {
     "09_quality_check.csv":quality,
     "09a_data_freshness.csv":freshness_df,
     "09b_market_proxy_detail.csv":market_proxy_detail,
+    "09c_data_source_diagnostics.csv":data_source_diagnostics_df,
     "10_market_data.csv":market_export,
     "11_overseas_data.csv":overseas.reset_index() if not overseas.empty else pd.DataFrame(),
 }
@@ -2537,7 +2664,7 @@ st.header("📦 ⑩ 全処理データ")
 st.download_button(
     "📦 Ver.6.0 全処理データをZIPでダウンロード",
     buf.getvalue(),
-    "ver6_0_RC6_3_all_analysis.zip",
+    "ver6_0_RC6_7_all_analysis.zip",
     "application/zip",
     use_container_width=True
 )

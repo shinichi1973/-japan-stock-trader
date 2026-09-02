@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.6.0
-# BUILD: VER6.0-RC6.4-JST-EARLY-MORNING-SAFE-20260903
+# BUILD: VER6.0-RC6.5-JAPAN-QUOTE-FALLBACK-SAFE-20260903
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -38,8 +38,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.4 JST-EARLY-MORNING-SAFE"
-BUILD = "VER6.0-RC6.4-JST-EARLY-MORNING-SAFE-20260903"
+VERSION = "6.0 RC6.5 JAPAN-QUOTE-FALLBACK-SAFE"
+BUILD = "VER6.0-RC6.5-JAPAN-QUOTE-FALLBACK-SAFE-20260903"
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -490,7 +490,7 @@ def _yahoo_chart(symbol, years=5):
             latest = pd.Timestamp(frame.index.max()).normalize() if not frame.empty else pd.NaT
             if pd.notna(regular_date) and (pd.isna(latest) or latest < regular_date):
                 try:
-                    row, repair_method = _yahoo_recent_day(symbol, regular_date)
+                    row, repair_method = _yahoo_japan_stock_snapshot(symbol, regular_date)
                     frame = frame.copy()
                     frame.loc[regular_date, ["Open", "High", "Low", "Close", "Volume"]] = [
                         row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
@@ -499,7 +499,7 @@ def _yahoo_chart(symbol, years=5):
                     repaired = True
                 except Exception:
                     try:
-                        row, repair_method = _yahoo_intraday_day(symbol, regular_date)
+                        row, repair_method = _yahoo_recent_day(symbol, regular_date)
                         frame = frame.copy()
                         frame.loc[regular_date, ["Open", "High", "Low", "Close", "Volume"]] = [
                             row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
@@ -507,7 +507,16 @@ def _yahoo_chart(symbol, years=5):
                         frame = frame.sort_index()
                         repaired = True
                     except Exception:
-                        pass
+                        try:
+                            row, repair_method = _yahoo_intraday_day(symbol, regular_date)
+                            frame = frame.copy()
+                            frame.loc[regular_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+                                row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+                            ]
+                            frame = frame.sort_index()
+                            repaired = True
+                        except Exception:
+                            pass
             source = f"Yahoo Finance Chart API ({host})"
             if repaired:
                 source += f" + {repair_method}"
@@ -574,6 +583,67 @@ def _yahoo_recent_day(symbol, target_date):
         except Exception as e:
             last_error = e
     raise RuntimeError(f"短期日足再取得失敗: {last_error}")
+
+
+def _yahoo_japan_stock_snapshot(symbol, target_date):
+    """Yahoo!ファイナンス日本版から東証の最新確定OHLCVを取得する。"""
+    symbol = str(symbol).strip()
+    if not symbol.endswith(".T"):
+        raise ValueError("日本株以外は日本版補完の対象外です")
+    url = f"https://finance.yahoo.co.jp/quote/{symbol}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                      "AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"
+    }
+    response = requests.get(url, headers=headers, timeout=15)
+    response.raise_for_status()
+    html = response.text
+    visible = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.I | re.S)
+    visible = html_unescape(re.sub(r"<[^>]+>", " ", visible))
+    visible = re.sub(r"\s+", " ", visible)
+
+    target_date = pd.Timestamp(target_date).normalize()
+    timestamp = _json_number_from_html(html, "regularMarketTime")
+    page_date = pd.NaT
+    if np.isfinite(timestamp) and timestamp > 1_000_000_000:
+        page_date = (
+            pd.Timestamp(int(timestamp), unit="s", tz="UTC")
+            .tz_convert("Asia/Tokyo").tz_localize(None).normalize()
+        )
+    if pd.isna(page_date):
+        tokens = {
+            f"{target_date.month}/{target_date.day}",
+            f"{target_date.month:02d}/{target_date.day:02d}",
+            target_date.strftime("%Y/%m/%d"),
+        }
+        if any(token in visible for token in tokens):
+            page_date = target_date
+    if pd.isna(page_date) or page_date != target_date:
+        raise ValueError(f"日本版株価ページの日付不一致: {page_date}")
+
+    values = {
+        "Open": _json_number_from_html(html, "regularMarketOpen"),
+        "High": _json_number_from_html(html, "regularMarketDayHigh"),
+        "Low": _json_number_from_html(html, "regularMarketDayLow"),
+        "Close": _json_number_from_html(html, "regularMarketPrice"),
+        "Volume": _json_number_from_html(html, "regularMarketVolume"),
+    }
+    label_patterns = {
+        "Open": r"始値\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*\(",
+        "High": r"高値\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*\(",
+        "Low": r"安値\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*\(",
+        "Volume": r"出来高\s*([0-9][0-9,]*)株\s*\(",
+    }
+    for key, pattern in label_patterns.items():
+        if not np.isfinite(values[key]):
+            match = re.search(pattern, visible)
+            if match:
+                values[key] = safe_float(match.group(1).replace(",", ""), np.nan)
+    if not all(np.isfinite(values[k]) and values[k] > 0 for k in ["Open", "High", "Low", "Close"]):
+        raise ValueError("日本版株価ページから確定OHLCを取得できません")
+    if not np.isfinite(values["Volume"]):
+        values["Volume"] = 0.0
+    return values, "Yahoo!ファイナンス日本版（東証）"
 
 
 def _normalize_ohlcv(df):
@@ -648,7 +718,7 @@ def _market_from_close(close):
     return out.dropna()
 
 
-# RC6.4: 日本時間基準の直接API → yfinance個別 → download。欠落日は短期日足/分足で安全に補完する。
+# RC6.5: 日本時間基準。欠落日は日本版東証ページ→短期日足→分足の順で安全に補完する。
 @st.cache_data(ttl=1800)
 def stock_data(t, years=5):
     start, end = yahoo_history_window(years)
@@ -1532,8 +1602,9 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.4では日本時間の早朝取得に対応し、日足配列の更新が遅い場合は短期日足または分足から"
-    "必要日の確定値を補完します。日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"
+    "RC6.5では日本時間の早朝取得に対応し、日足配列の更新が遅い場合はYahoo!ファイナンス日本版の"
+    "東証確定値を最優先で補完します。日本側でも取れない場合だけ短期日足・分足を試します。"
+    "日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"
     "市場判定用の代理データとして使用します。代理使用は画面とCSVに明記し、"
     "1321.Tも古い場合は売買判定を停止します。"
 )

@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.6.0
-# BUILD: VER6.0-RC6.5-JAPAN-QUOTE-FALLBACK-SAFE-20260903
+# BUILD: VER6.0-RC6.6-FREE-MULTISOURCE-JAPAN-20260903
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -24,6 +24,7 @@ import plistlib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from html import unescape as html_unescape
+from html.parser import HTMLParser
 from zipfile import ZipFile
 
 import numpy as np
@@ -38,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.5 JAPAN-QUOTE-FALLBACK-SAFE"
-BUILD = "VER6.0-RC6.5-JAPAN-QUOTE-FALLBACK-SAFE-20260903"
+VERSION = "6.0 RC6.6 FREE-MULTISOURCE-JAPAN"
+BUILD = "VER6.0-RC6.6-FREE-MULTISOURCE-JAPAN-20260903"
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -489,34 +490,24 @@ def _yahoo_chart(symbol, years=5):
             repair_method = "regularMarket最新四本値補完" if repaired else ""
             latest = pd.Timestamp(frame.index.max()).normalize() if not frame.empty else pd.NaT
             if pd.notna(regular_date) and (pd.isna(latest) or latest < regular_date):
-                try:
-                    row, repair_method = _yahoo_japan_stock_snapshot(symbol, regular_date)
-                    frame = frame.copy()
-                    frame.loc[regular_date, ["Open", "High", "Low", "Close", "Volume"]] = [
-                        row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
-                    ]
-                    frame = frame.sort_index()
-                    repaired = True
-                except Exception:
+                for provider in (
+                    _minkabu_stock_day,
+                    _stooq_stock_day,
+                    _yahoo_japan_stock_snapshot,
+                    _yahoo_recent_day,
+                    _yahoo_intraday_day,
+                ):
                     try:
-                        row, repair_method = _yahoo_recent_day(symbol, regular_date)
+                        row, repair_method = provider(symbol, regular_date)
                         frame = frame.copy()
                         frame.loc[regular_date, ["Open", "High", "Low", "Close", "Volume"]] = [
                             row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
                         ]
                         frame = frame.sort_index()
                         repaired = True
+                        break
                     except Exception:
-                        try:
-                            row, repair_method = _yahoo_intraday_day(symbol, regular_date)
-                            frame = frame.copy()
-                            frame.loc[regular_date, ["Open", "High", "Low", "Close", "Volume"]] = [
-                                row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
-                            ]
-                            frame = frame.sort_index()
-                            repaired = True
-                        except Exception:
-                            pass
+                        continue
             source = f"Yahoo Finance Chart API ({host})"
             if repaired:
                 source += f" + {repair_method}"
@@ -583,6 +574,128 @@ def _yahoo_recent_day(symbol, target_date):
         except Exception as e:
             last_error = e
     raise RuntimeError(f"短期日足再取得失敗: {last_error}")
+
+
+class _SimpleTableParser(HTMLParser):
+    """外部ライブラリを追加せずHTML表を読み取る最小パーサー。"""
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self._table = None
+        self._row = None
+        self._cell = None
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "table":
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in ("th", "td") and self._row is not None:
+            self._cell = []
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("th", "td") and self._cell is not None:
+            self._row.append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self._row:
+                self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            if self._table:
+                self.tables.append(self._table)
+            self._table = None
+
+
+def _page_number(value):
+    text = str(value).replace(",", "").replace("円", "").replace("株", "").strip()
+    match = re.search(r"-?[0-9]+(?:\.[0-9]+)?", text)
+    return safe_float(match.group(0), np.nan) if match else np.nan
+
+
+def _minkabu_stock_day(symbol, target_date):
+    """みんかぶ国内株の公開時系列表から指定日の東証OHLCVを取得する。"""
+    symbol = str(symbol).strip()
+    if not symbol.endswith(".T"):
+        raise ValueError("日本株以外はみんかぶ補完の対象外です")
+    stock_code = symbol[:-2]
+    if not re.fullmatch(r"[0-9A-Za-z]{4,5}", stock_code):
+        raise ValueError("銘柄コード形式が不正です")
+    url = f"https://minkabu.jp/stock/{stock_code}/daily_bar"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                      "AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"
+    }
+    response = requests.get(url, headers=headers, timeout=15)
+    response.raise_for_status()
+    parser = _SimpleTableParser()
+    parser.feed(response.text)
+    target_date = pd.Timestamp(target_date).normalize()
+
+    aliases = {
+        "Date": ("日時", "日付"), "Open": ("始値",), "High": ("高値",),
+        "Low": ("安値",), "Close": ("終値",), "Volume": ("出来高", "出来高(株)"),
+    }
+    for table in parser.tables:
+        for header_pos, header in enumerate(table):
+            positions = {}
+            for key, names in aliases.items():
+                for i, cell in enumerate(header):
+                    if any(name in cell for name in names):
+                        positions[key] = i
+                        break
+            if set(positions) != set(aliases):
+                continue
+            for cells in table[header_pos + 1:]:
+                if max(positions.values()) >= len(cells):
+                    continue
+                row_date = pd.to_datetime(cells[positions["Date"]], errors="coerce")
+                if pd.isna(row_date) or pd.Timestamp(row_date).normalize() != target_date:
+                    continue
+                values = {k: _page_number(cells[positions[k]]) for k in ["Open", "High", "Low", "Close", "Volume"]}
+                if not all(np.isfinite(values[k]) and values[k] > 0 for k in ["Open", "High", "Low", "Close"]):
+                    raise ValueError("みんかぶ時系列のOHLCが不正です")
+                if not np.isfinite(values["Volume"]):
+                    values["Volume"] = 0.0
+                return values, "みんかぶ国内株・東証時系列（無料）"
+    raise ValueError(f"みんかぶに{target_date.date()}の時系列データがありません")
+
+
+def _stooq_stock_day(symbol, target_date):
+    """Stooqの無料日足CSVから指定日のOHLCVを取得する。"""
+    symbol = str(symbol).strip()
+    if not symbol.endswith(".T"):
+        raise ValueError("日本株以外はStooq補完の対象外です")
+    stock_code = symbol[:-2].lower()
+    target_date = pd.Timestamp(target_date).normalize()
+    d1 = (target_date - pd.Timedelta(days=10)).strftime("%Y%m%d")
+    d2 = target_date.strftime("%Y%m%d")
+    url = f"https://stooq.com/q/d/l/?s={stock_code}.jp&i=d&d1={d1}&d2={d2}"
+    response = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+    response.raise_for_status()
+    if not response.text.strip() or "No data" in response.text:
+        raise ValueError("Stooq日足なし")
+    frame = pd.read_csv(io.StringIO(response.text))
+    required = {"Date", "Open", "High", "Low", "Close", "Volume"}
+    if not required.issubset(frame.columns):
+        raise ValueError("Stooq CSV列不足")
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce").dt.normalize()
+    selected = frame.loc[frame["Date"] == target_date]
+    if selected.empty:
+        raise ValueError(f"Stooqに{target_date.date()}の日足がありません")
+    row = selected.iloc[-1]
+    values = {k: safe_float(row[k], np.nan) for k in ["Open", "High", "Low", "Close", "Volume"]}
+    if not all(np.isfinite(values[k]) and values[k] > 0 for k in ["Open", "High", "Low", "Close"]):
+        raise ValueError("Stooq OHLC不正")
+    if not np.isfinite(values["Volume"]):
+        values["Volume"] = 0.0
+    return values, "Stooq日本株日足CSV（無料）"
 
 
 def _yahoo_japan_stock_snapshot(symbol, target_date):
@@ -718,7 +831,7 @@ def _market_from_close(close):
     return out.dropna()
 
 
-# RC6.5: 日本時間基準。欠落日は日本版東証ページ→短期日足→分足の順で安全に補完する。
+# RC6.6: 欠落日は、みんかぶ→Stooq→Yahoo系の順で無料補完する。
 @st.cache_data(ttl=1800)
 def stock_data(t, years=5):
     start, end = yahoo_history_window(years)
@@ -1602,9 +1715,8 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.5では日本時間の早朝取得に対応し、日足配列の更新が遅い場合はYahoo!ファイナンス日本版の"
-    "東証確定値を最優先で補完します。日本側でも取れない場合だけ短期日足・分足を試します。"
-    "日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"
+    "RC6.6では有料APIを使わず、最新日が欠けた場合は、みんかぶ国内株時系列、Stooq無料CSV、"
+    "Yahoo系予備経路の順で東証確定値を補完します。日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"
     "市場判定用の代理データとして使用します。代理使用は画面とCSVに明記し、"
     "1321.Tも古い場合は売買判定を停止します。"
 )

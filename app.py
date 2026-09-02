@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.6.0
-# BUILD: VER6.0-RC6.7-TRADINGVIEW-BATCH-DIAGNOSTIC-20260903
+# BUILD: VER6.0-RC6.8-SINGLE-INDICATOR-PASS-20260903
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.7 TRADINGVIEW-BATCH-DIAGNOSTIC"
-BUILD = "VER6.0-RC6.7-TRADINGVIEW-BATCH-DIAGNOSTIC-20260903"
+VERSION = "6.0 RC6.8 SINGLE-INDICATOR-PASS"
+BUILD = "VER6.0-RC6.8-SINGLE-INDICATOR-PASS-20260903"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -771,33 +771,31 @@ def tradingview_batch_quotes(tickers_tuple):
     return quotes, diagnostics
 
 
-def _merge_tradingview_snapshot(frame, ticker):
-    """Yahoo履歴の欠落した確定日だけTradingViewの東証OHLCVで補う。"""
+def _merge_tradingview_raw(raw, ticker, regular_market_date=pd.NaT):
+    """指標計算前の生OHLCVへTradingViewの確定日を追加する。"""
     quote = TRADINGVIEW_QUOTES_CACHE.get(str(ticker))
-    if frame is None or frame.empty or not quote:
-        return frame, False, "一括価格なし"
-    required_date = frame.attrs.get("regular_market_date", pd.NaT)
+    if raw is None or raw.empty or not quote:
+        return raw, False, "一括価格なし"
+    required_date = regular_market_date
     required_date = pd.Timestamp(required_date).normalize() if pd.notna(required_date) else pd.NaT
-    latest = pd.Timestamp(frame.index.max()).normalize()
+    normalized = _normalize_ohlcv(raw)
+    if normalized.empty:
+        return raw, False, "元OHLCVを正規化できない"
+    latest = pd.Timestamp(normalized.index.max()).normalize()
     if pd.isna(required_date):
-        return frame, False, "必要日を確認できないため不採用"
+        return raw, False, "必要日を確認できないため不採用"
     if latest >= required_date:
-        return frame, False, "既存日足が最新"
+        return raw, False, "既存日足が最新"
     hour = tokyo_now().hour
     if 9 <= hour < 16:
-        return frame, False, "取引時間中の未確定日足は不採用"
-    attrs = dict(frame.attrs)
-    raw = frame[["Open", "High", "Low", "Close", "Volume"]].copy()
-    raw.loc[required_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+        return raw, False, "取引時間中の未確定日足は不採用"
+    attrs = dict(raw.attrs)
+    normalized.loc[required_date, ["Open", "High", "Low", "Close", "Volume"]] = [
         quote["Open"], quote["High"], quote["Low"], quote["Close"], max(quote["Volume"], 0.0)
     ]
-    repaired = _add_indicators(raw.sort_index())
-    if repaired.empty or pd.Timestamp(repaired.index.max()).normalize() < required_date:
-        return frame, False, "指標再計算後も必要日に届かない"
-    repaired.attrs.update(attrs)
-    repaired.attrs["source"] = "TradingView東証スキャナー一括取得（無料） + 既存履歴"
-    repaired.attrs["latest_row_repaired"] = True
-    return repaired, True, "TradingView一括OHLCVを採用"
+    normalized = normalized.sort_index()
+    normalized.attrs.update(attrs)
+    return normalized, True, "TradingView一括OHLCVを生データへ追加"
 
 
 def _yahoo_japan_stock_snapshot(symbol, target_date):
@@ -933,16 +931,19 @@ def _market_from_close(close):
     return out.dropna()
 
 
-# RC6.7: TradingView一括取得を最優先にし、個別サイトは予備経路にする。
+# RC6.8: TradingView行を生OHLCVへ追加した後、指標を一度だけ計算する。
 @st.cache_data(ttl=1800)
 def stock_data(t, years=5):
     start, end = yahoo_history_window(years)
     try:
         raw, meta = _yahoo_chart(t, years)
+        raw, tv_repaired, _ = _merge_tradingview_raw(raw, t, meta.get("regular_market_date", pd.NaT))
         out = _add_indicators(raw)
         if not out.empty:
             out.attrs.update(meta)
-            out, _, _ = _merge_tradingview_snapshot(out, t)
+            if tv_repaired:
+                out.attrs["source"] = "TradingView東証スキャナー一括取得（無料） + 既存履歴"
+                out.attrs["latest_row_repaired"] = True
             return out
     except Exception:
         pass
@@ -952,7 +953,6 @@ def stock_data(t, years=5):
         out = _add_indicators(raw)
         if not out.empty:
             out.attrs["source"] = "yfinance Ticker.history"
-            out, _, _ = _merge_tradingview_snapshot(out, t)
             return out
     except Exception:
         pass
@@ -962,7 +962,6 @@ def stock_data(t, years=5):
         out = _add_indicators(raw)
         if not out.empty:
             out.attrs["source"] = "yfinance download"
-            out, _, _ = _merge_tradingview_snapshot(out, t)
             return out
     except Exception:
         pass
@@ -1820,8 +1819,9 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.7では有料APIを使わず、TradingView公開スキャナーから東証銘柄を一括取得します。"
+    "RC6.8では有料APIを使わず、TradingView公開スキャナーから東証銘柄を一括取得します。"
     "個別サイトへの連続アクセスを避け、みんかぶ・Stooq・Yahoo系は予備経路として残します。"
+    "最新日は元のOHLCV履歴へ追加し、テクニカル指標は一度だけ計算します。"
     "日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"
     "市場判定用の代理データとして使用します。代理使用は画面とCSVに明記し、"
     "1321.Tも古い場合は売買判定を停止します。"
@@ -2664,7 +2664,7 @@ st.header("📦 ⑩ 全処理データ")
 st.download_button(
     "📦 Ver.6.0 全処理データをZIPでダウンロード",
     buf.getvalue(),
-    "ver6_0_RC6_7_all_analysis.zip",
+    "ver6_0_RC6_8_all_analysis.zip",
     "application/zip",
     use_container_width=True
 )

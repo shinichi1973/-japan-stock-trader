@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.6.0
-# BUILD: VER6.0-RC6.8-SINGLE-INDICATOR-PASS-20260903
+# BUILD: VER6.0-RC6.9-MARKET-SINGLE-PASS-20260903
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.8 SINGLE-INDICATOR-PASS"
-BUILD = "VER6.0-RC6.8-SINGLE-INDICATOR-PASS-20260903"
+VERSION = "6.0 RC6.9 MARKET-SINGLE-PASS"
+BUILD = "VER6.0-RC6.9-MARKET-SINGLE-PASS-20260903"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -931,7 +931,7 @@ def _market_from_close(close):
     return out.dropna()
 
 
-# RC6.8: TradingView行を生OHLCVへ追加した後、指標を一度だけ計算する。
+# RC6.8以降: TradingView行を生OHLCVへ追加した後、指標を一度だけ計算する。
 @st.cache_data(ttl=1800)
 def stock_data(t, years=5):
     start, end = yahoo_history_window(years)
@@ -968,16 +968,19 @@ def stock_data(t, years=5):
     return pd.DataFrame()
 
 
-def _append_1321_proxy_market_row(stale_market, required_date):
+def _append_1321_proxy_market_row(raw_market, required_date):
     """1321.Tの当日騰落率を、直近日経平均終値へ連結して市場判定を更新する。"""
     required_date = pd.Timestamp(required_date).normalize()
-    if stale_market is None or stale_market.empty:
+    if raw_market is None or raw_market.empty:
         raise ValueError("連結元の日経平均履歴がありません")
     proxy = stock_data("1321.T", 5)
     if proxy.empty or required_date not in proxy.index:
         raise ValueError("1321.Tが必要日まで更新されていません")
 
-    market_close = pd.to_numeric(stale_market["Close"], errors="coerce").dropna()
+    # 指標計算済みデータではなく生の終値履歴へ代理値を追加する。
+    # 計算済みデータを再投入すると、MA200分が二重に欠落してしまう。
+    raw_market = _normalize_ohlcv(raw_market)
+    market_close = pd.to_numeric(raw_market["Close"], errors="coerce").dropna()
     proxy_close = pd.to_numeric(proxy["Close"], errors="coerce").dropna()
     common = market_close.index.intersection(proxy_close.index)
     common = common[common < required_date]
@@ -1034,7 +1037,7 @@ def market_data(required_date=None):
             out.attrs.setdefault("market_name", "日経平均")
             if pd.notna(required_date) and pd.Timestamp(out.index.max()).normalize() < required_date:
                 try:
-                    return _append_1321_proxy_market_row(out, required_date)
+                    return _append_1321_proxy_market_row(raw, required_date)
                 except Exception:
                     pass
             return out
@@ -1049,7 +1052,7 @@ def market_data(required_date=None):
             out.attrs.update({"market_mode":"NIKKEI225_DIRECT","market_symbol":"^N225","market_name":"日経平均"})
             if pd.notna(required_date) and pd.Timestamp(out.index.max()).normalize() < required_date:
                 try:
-                    return _append_1321_proxy_market_row(out, required_date)
+                    return _append_1321_proxy_market_row(raw, required_date)
                 except Exception:
                     pass
             return out
@@ -1064,7 +1067,7 @@ def market_data(required_date=None):
             out.attrs.update({"market_mode":"NIKKEI225_DIRECT","market_symbol":"^N225","market_name":"日経平均"})
             if pd.notna(required_date) and pd.Timestamp(out.index.max()).normalize() < required_date:
                 try:
-                    return _append_1321_proxy_market_row(out, required_date)
+                    return _append_1321_proxy_market_row(raw, required_date)
                 except Exception:
                     pass
             return out
@@ -1819,7 +1822,7 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.8では有料APIを使わず、TradingView公開スキャナーから東証銘柄を一括取得します。"
+    "RC6.9では有料APIを使わず、TradingView公開スキャナーから東証銘柄を一括取得します。"
     "個別サイトへの連続アクセスを避け、みんかぶ・Stooq・Yahoo系は予備経路として残します。"
     "最新日は元のOHLCV履歴へ追加し、テクニカル指標は一度だけ計算します。"
     "日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"

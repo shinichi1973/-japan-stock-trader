@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.6.0
-# BUILD: VER6.0-FOUNDATION-20260831
+# BUILD: VER6.0-RC6.4-JST-EARLY-MORNING-SAFE-20260903
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -22,6 +22,7 @@ import os
 import re
 import plistlib
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from html import unescape as html_unescape
 from zipfile import ZipFile
 
@@ -37,8 +38,25 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.3 NIKKEI-ETF-PROXY-SAFE"
-BUILD = "VER6.0-RC6.3-NIKKEI-ETF-PROXY-SAFE-20260902"
+VERSION = "6.0 RC6.4 JST-EARLY-MORNING-SAFE"
+BUILD = "VER6.0-RC6.4-JST-EARLY-MORNING-SAFE-20260903"
+
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def tokyo_now():
+    """Streamlit CloudのUTC設定に依存せず、日本時間を返す。"""
+    return datetime.now(timezone.utc).astimezone(JST)
+
+
+def yahoo_history_window(years=5):
+    """Yahooのend日が排他的であることを考慮した日本時間基準の取得範囲。"""
+    now_jst = tokyo_now()
+    end_jst = datetime.combine(
+        now_jst.date() + timedelta(days=1), datetime.min.time(), tzinfo=JST
+    )
+    start_jst = end_jst - timedelta(days=365 * years + 300)
+    return start_jst, end_jst
 
 # ------------------------------------------------------------
 # 銘柄名（既存システムの主要銘柄＋実保有/監視銘柄）
@@ -133,8 +151,7 @@ def clamp(x, lo=0, hi=100):
 # ------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def _stock_data_rc61_fallback(t, years=5):
-    end = datetime.now()
-    start = end - timedelta(days=365 * years + 300)
+    start, end = yahoo_history_window(years)
 
     def normalize(df):
         if df is None or df.empty:
@@ -179,14 +196,14 @@ def _stock_data_rc61_fallback(t, years=5):
 
     try:
         raw = yf.download(
-            t, start=start, end=end + timedelta(days=1),
+            t, start=start, end=end,
             auto_adjust=False, progress=False, threads=False
         )
         return normalize(raw)
     except Exception:
         try:
             return normalize(yf.Ticker(t).history(
-                start=start, end=end + timedelta(days=1),
+                start=start, end=end,
                 auto_adjust=False, actions=False
             ))
         except Exception:
@@ -194,11 +211,10 @@ def _stock_data_rc61_fallback(t, years=5):
 
 @st.cache_data(ttl=3600)
 def _market_data_rc61_fallback():
-    end = datetime.now()
-    start = end - timedelta(days=365 * 5 + 300)
+    start, end = yahoo_history_window(5)
     try:
         df = yf.download(
-            "^N225", start=start, end=end + timedelta(days=1),
+            "^N225", start=start, end=end,
             auto_adjust=False, progress=False, threads=False
         )
         if df.empty:
@@ -417,8 +433,9 @@ def _repair_nikkei_day(raw, required_date):
 
 def _yahoo_chart(symbol, years=5):
     """Yahoo Financeの最新日足を直接取得し、取引時刻メタ情報も返す。"""
-    end_ts = int(datetime.now(timezone.utc).timestamp()) + 86400
-    start_ts = end_ts - int((365 * years + 300) * 86400)
+    start_jst, end_jst = yahoo_history_window(years)
+    end_ts = int(end_jst.timestamp())
+    start_ts = int(start_jst.timestamp())
     encoded = requests.utils.quote(str(symbol), safe="")
     params = {
         "period1": start_ts, "period2": end_ts, "interval": "1d",
@@ -469,9 +486,31 @@ def _yahoo_chart(symbol, years=5):
                     pass
                 regular_date = ts.tz_localize(None).normalize()
             frame, repaired = _append_regular_market_row(frame, meta, regular_date)
+            repair_method = "regularMarket最新四本値補完" if repaired else ""
+            latest = pd.Timestamp(frame.index.max()).normalize() if not frame.empty else pd.NaT
+            if pd.notna(regular_date) and (pd.isna(latest) or latest < regular_date):
+                try:
+                    row, repair_method = _yahoo_recent_day(symbol, regular_date)
+                    frame = frame.copy()
+                    frame.loc[regular_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+                        row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+                    ]
+                    frame = frame.sort_index()
+                    repaired = True
+                except Exception:
+                    try:
+                        row, repair_method = _yahoo_intraday_day(symbol, regular_date)
+                        frame = frame.copy()
+                        frame.loc[regular_date, ["Open", "High", "Low", "Close", "Volume"]] = [
+                            row["Open"], row["High"], row["Low"], row["Close"], row["Volume"]
+                        ]
+                        frame = frame.sort_index()
+                        repaired = True
+                    except Exception:
+                        pass
             source = f"Yahoo Finance Chart API ({host})"
             if repaired:
-                source += " + regularMarket最新四本値補完"
+                source += f" + {repair_method}"
             return frame, {
                 "source": source,
                 "regular_market_date": regular_date,
@@ -480,6 +519,61 @@ def _yahoo_chart(symbol, years=5):
         except Exception as e:
             last_error = e
     raise RuntimeError(f"Yahoo Finance Chart API取得失敗: {last_error}")
+
+
+def _yahoo_recent_day(symbol, target_date):
+    """短期チャートから指定日の確定OHLCVを取得する。"""
+    encoded = requests.utils.quote(str(symbol), safe="")
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; JPStockAssistant/6.0)"}
+    target_date = pd.Timestamp(target_date).normalize()
+    last_error = None
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            url = f"https://{host}/v8/finance/chart/{encoded}"
+            response = requests.get(
+                url,
+                params={"range":"1mo", "interval":"1d", "events":"history", "includeAdjustedClose":"true"},
+                headers=headers,
+                timeout=12,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            result = payload.get("chart", {}).get("result") or []
+            if not result:
+                raise ValueError(payload.get("chart", {}).get("error") or "短期日足なし")
+            item = result[0]
+            stamps = item.get("timestamp") or []
+            quote = ((item.get("indicators") or {}).get("quote") or [{}])[0]
+            tz_name = (item.get("meta") or {}).get("exchangeTimezoneName") or "Asia/Tokyo"
+            if not stamps:
+                raise ValueError("短期日足タイムスタンプなし")
+            size = len(stamps)
+            idx = pd.to_datetime(stamps, unit="s", utc=True)
+            try:
+                idx = idx.tz_convert(tz_name)
+            except Exception:
+                pass
+            idx = idx.tz_localize(None).normalize()
+            recent = pd.DataFrame({
+                "Open": (list(quote.get("open") or []) + [np.nan] * size)[:size],
+                "High": (list(quote.get("high") or []) + [np.nan] * size)[:size],
+                "Low": (list(quote.get("low") or []) + [np.nan] * size)[:size],
+                "Close": (list(quote.get("close") or []) + [np.nan] * size)[:size],
+                "Volume": (list(quote.get("volume") or []) + [np.nan] * size)[:size],
+            }, index=idx)
+            recent = recent[~recent.index.duplicated(keep="last")]
+            if target_date not in recent.index:
+                raise ValueError(f"{target_date.date()}の短期日足なし")
+            row = recent.loc[target_date]
+            values = {k: safe_float(row[k], np.nan) for k in ["Open", "High", "Low", "Close", "Volume"]}
+            if not all(np.isfinite(values[k]) and values[k] > 0 for k in ["Open", "High", "Low", "Close"]):
+                raise ValueError("短期日足OHLC不正")
+            if not np.isfinite(values["Volume"]):
+                values["Volume"] = 0.0
+            return values, f"短期日足再取得 ({host})"
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"短期日足再取得失敗: {last_error}")
 
 
 def _normalize_ohlcv(df):
@@ -554,11 +648,10 @@ def _market_from_close(close):
     return out.dropna()
 
 
-# RC6.3: 直接API → yfinance個別 → 一括download。指数だけ古い場合は1321.Tで安全に補完する。
+# RC6.4: 日本時間基準の直接API → yfinance個別 → download。欠落日は短期日足/分足で安全に補完する。
 @st.cache_data(ttl=1800)
 def stock_data(t, years=5):
-    end = datetime.now()
-    start = end - timedelta(days=365 * years + 300)
+    start, end = yahoo_history_window(years)
     try:
         raw, meta = _yahoo_chart(t, years)
         out = _add_indicators(raw)
@@ -568,7 +661,7 @@ def stock_data(t, years=5):
     except Exception:
         pass
     try:
-        raw = yf.Ticker(t).history(start=start, end=end + timedelta(days=1),
+        raw = yf.Ticker(t).history(start=start, end=end,
                                    auto_adjust=False, actions=False)
         out = _add_indicators(raw)
         if not out.empty:
@@ -577,7 +670,7 @@ def stock_data(t, years=5):
     except Exception:
         pass
     try:
-        raw = yf.download(t, start=start, end=end + timedelta(days=1),
+        raw = yf.download(t, start=start, end=end,
                           auto_adjust=False, progress=False, threads=False)
         out = _add_indicators(raw)
         if not out.empty:
@@ -633,8 +726,7 @@ def _append_1321_proxy_market_row(stale_market, required_date):
 
 @st.cache_data(ttl=1800)
 def market_data(required_date=None):
-    end = datetime.now()
-    start = end - timedelta(days=365 * 5 + 300)
+    start, end = yahoo_history_window(5)
     required_date = pd.Timestamp(required_date).normalize() if pd.notna(required_date) else pd.NaT
     try:
         raw, meta = _yahoo_chart("^N225", 5)
@@ -662,7 +754,7 @@ def market_data(required_date=None):
     except Exception:
         pass
     try:
-        raw = yf.Ticker("^N225").history(start=start, end=end + timedelta(days=1),
+        raw = yf.Ticker("^N225").history(start=start, end=end,
                                           auto_adjust=False, actions=False)
         out = _market_indicators(raw)
         if not out.empty:
@@ -677,7 +769,7 @@ def market_data(required_date=None):
     except Exception:
         pass
     try:
-        raw = yf.download("^N225", start=start, end=end + timedelta(days=1),
+        raw = yf.download("^N225", start=start, end=end,
                           auto_adjust=False, progress=False, threads=False)
         out = _market_indicators(raw)
         if not out.empty:
@@ -733,8 +825,7 @@ def build_freshness_report(data, market):
 
 @st.cache_data(ttl=3600)
 def overseas_data():
-    end = datetime.now()
-    start = end - timedelta(days=365 * 5 + 300)
+    start, end = yahoo_history_window(5)
     symbols = {
         "S&P500":"^GSPC","NASDAQ":"^IXIC","NYダウ":"^DJI",
         "SOX":"^SOX","USDJPY":"USDJPY=X","米10年金利":"^TNX"
@@ -743,7 +834,7 @@ def overseas_data():
     for label, symbol in symbols.items():
         try:
             df = yf.download(
-                symbol, start=start, end=end + timedelta(days=1),
+                symbol, start=start, end=end,
                 auto_adjust=False, progress=False, threads=False
             )
             if not df.empty:
@@ -1441,7 +1532,8 @@ st.caption(f"BUILD: {BUILD}")
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.3では日経平均を直接取得できない場合に限り、1321.T（日経225連動ETF）の当日騰落率を"
+    "RC6.4では日本時間の早朝取得に対応し、日足配列の更新が遅い場合は短期日足または分足から"
+    "必要日の確定値を補完します。日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"
     "市場判定用の代理データとして使用します。代理使用は画面とCSVに明記し、"
     "1321.Tも古い場合は売買判定を停止します。"
 )

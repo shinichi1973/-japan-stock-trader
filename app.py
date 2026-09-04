@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.6.0
-# BUILD: VER6.0-RC6.10-FATHER-UI-DEMO-20260903
+# BUILD: VER6.0-RC6.11-CORE-20260904
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.10 FATHER-UI-DEMO"
-BUILD = "VER6.0-RC6.10-FATHER-UI-DEMO-20260903"
+VERSION = "6.0 RC6.11"
+BUILD = "VER6.0-RC6.11-CORE-20260904"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -49,163 +49,6 @@ TRADINGVIEW_QUOTES_CACHE = {}
 def tokyo_now():
     """Streamlit CloudのUTC設定に依存せず、日本時間を返す。"""
     return datetime.now(timezone.utc).astimezone(JST)
-
-
-def show_father_demo():
-    """機種を問わず見やすい、読み取り専用のかんたん画面見本。"""
-    st.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] {
-            display: none !important;
-        }
-        .stApp { background: #f7f7f4; }
-        .block-container {
-            max-width: 760px;
-            padding: 1rem 0.8rem 3rem;
-        }
-        .easy-title {
-            color: #17202a;
-            font-size: clamp(2rem, 8vw, 3.3rem);
-            font-weight: 900;
-            line-height: 1.25;
-            text-align: center;
-            margin: 0.3rem 0 0.8rem;
-        }
-        .easy-note {
-            background: #fff3cd;
-            border: 4px solid #b7791f;
-            border-radius: 18px;
-            color: #4a2c00;
-            font-size: clamp(1.25rem, 5vw, 1.8rem);
-            font-weight: 800;
-            line-height: 1.5;
-            padding: 1rem;
-            text-align: center;
-            margin-bottom: 1rem;
-        }
-        .easy-card {
-            background: white;
-            border: 4px solid #4a5568;
-            border-radius: 22px;
-            box-shadow: 0 4px 12px rgba(0,0,0,.08);
-            color: #111827;
-            margin: 1rem 0;
-            padding: 1.3rem 1rem;
-            text-align: center;
-        }
-        .easy-card.none { border-color: #4a5568; }
-        .easy-card.buy { border-color: #087f23; background: #f0fff4; }
-        .easy-card.sell { border-color: #c62828; background: #fff5f5; }
-        .easy-card.error { border-color: #b45309; background: #fffaf0; }
-        .easy-main {
-            font-size: clamp(2rem, 9vw, 3.5rem);
-            font-weight: 900;
-            line-height: 1.3;
-            margin-bottom: 0.8rem;
-        }
-        .easy-stock {
-            font-size: clamp(1.8rem, 7vw, 2.8rem);
-            font-weight: 900;
-            line-height: 1.4;
-        }
-        .easy-sub {
-            font-size: clamp(1.25rem, 5vw, 1.8rem);
-            font-weight: 700;
-            line-height: 1.65;
-            margin-top: 0.8rem;
-        }
-        .easy-list {
-            background: white;
-            border: 3px solid #087f23;
-            border-radius: 20px;
-            color: #111827;
-            font-size: clamp(1.25rem, 5vw, 1.7rem);
-            font-weight: 800;
-            line-height: 1.9;
-            padding: 1rem 1.2rem;
-            margin-top: 1rem;
-        }
-        div[data-testid="stRadio"] label,
-        div[data-testid="stButton"] button {
-            font-size: 1.25rem !important;
-            min-height: 3.5rem;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown('<div class="easy-title">かんたん株式案内</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="easy-note">これは画面の見本です<br>実際の売買指示ではありません</div>',
-        unsafe_allow_html=True,
-    )
-
-    sample = st.radio(
-        "確認したい表示を選んでください",
-        ["取引なし", "買う日", "売る日", "データを確認できない日"],
-        horizontal=False,
-        key="father_demo_state",
-    )
-
-    if sample == "買う日":
-        main_card = """
-        <div class="easy-card buy">
-          <div class="easy-main">🟢 今日は買います</div>
-          <div class="easy-stock">日本製鉄<br>10株</div>
-          <div class="easy-sub">朝7時までに<br>SBI証券で注文してください</div>
-        </div>
-        """
-    elif sample == "売る日":
-        main_card = """
-        <div class="easy-card sell">
-          <div class="easy-main">🔴 今日は売ります</div>
-          <div class="easy-stock">テスト銘柄<br>20株</div>
-          <div class="easy-sub">できるだけ早く<br>SBI証券で注文してください</div>
-        </div>
-        """
-    elif sample == "データを確認できない日":
-        main_card = """
-        <div class="easy-card error">
-          <div class="easy-main">⚠️ 注文しないでください</div>
-          <div class="easy-sub">新しいデータを確認できません<br>今日は売買しないでください</div>
-        </div>
-        """
-    else:
-        main_card = """
-        <div class="easy-card none">
-          <div class="easy-main">⚪ 今日は売買しません</div>
-          <div class="easy-sub">注文は何もしなくて大丈夫です</div>
-        </div>
-        """
-    st.markdown(main_card, unsafe_allow_html=True)
-
-    st.markdown(
-        """
-        <div class="easy-list">
-          🟢 そのまま保有してください<br>
-          ・NTT<br>
-          ・日立製作所<br>
-          ・富士通<br>
-          ・ソニーグループ<br>
-          ・日本製鉄<br>
-          ・ホンダ<br>
-          ・ジーデップ・アドバンス
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.caption(f"見本の更新表示：{tokyo_now():%Y年%m月%d日 %H:%M}（日本時間）")
-    st.info("実運用版では、この表示選択欄はなくなり、その日の正式な指示だけが表示されます。")
-    if st.button("← 通常の管理画面に戻る", use_container_width=True):
-        st.query_params.clear()
-        st.rerun()
-
-
-if str(st.query_params.get("view", "")).lower() == "father":
-    show_father_demo()
-    st.stop()
 
 
 def yahoo_history_window(years=5):
@@ -1976,15 +1819,10 @@ with st.sidebar:
 # ------------------------------------------------------------
 st.title("📈 日本株 AI投資アシスタント Ver.6.0")
 st.caption(f"BUILD: {BUILD}")
-st.link_button(
-    "👴 お父様用・かんたん画面の見本を開く",
-    "?view=father",
-    use_container_width=True,
-)
 st.info(
     "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
     "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-    "RC6.10ではRC6.9の分析ロジックを維持し、機種を問わず見やすいお父様用画面の見本を追加しています。"
+    "RC6.11ではRC6.10の分析ロジックを維持し、通常の管理・分析画面に一本化しています。"
     "有料APIを使わず、TradingView公開スキャナーから東証銘柄を一括取得します。"
     "個別サイトへの連続アクセスを避け、みんかぶ・Stooq・Yahoo系は予備経路として残します。"
     "最新日は元のOHLCV履歴へ追加し、テクニカル指標は一度だけ計算します。"

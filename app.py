@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.13 STOCH TEST"
-BUILD = "VER6.0-RC6.13-STOCH-GC-ONLY-20260911"
+VERSION = "6.0 RC6.13 STOCH LEVEL TEST"
+BUILD = "VER6.0-RC6.13-STOCH-GC-LEVELS-20260911"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1847,7 +1847,7 @@ def _next_trading_date(df, dt):
 
 def _stoch_backtest(data_map, exit_mode, initial_cash=600000.0, max_positions=5,
                     max_buy=120000.0, tp_pct=15.0, sl_pct=7.0, hold_days=10,
-                    k_period=14, k_smooth=3, d_period=3):
+                    k_period=14, k_smooth=3, d_period=3, entry_k_max=None):
     """
     Entry: Slow Stoch GC確定日の次営業日寄付。
     Exit : DC / TP-SL / 固定保有日数のいずれか。
@@ -1943,6 +1943,9 @@ def _stoch_backtest(data_map, exit_mode, initial_cash=600000.0, max_positions=5,
                 continue
             r = df.loc[dt]
             if not bool(r.get("STOCH_GC",False)) or not np.isfinite(r.get("STOCH_K",np.nan)):
+                continue
+            # 比較検証用：GC発生時のSlow %K位置だけを切り分ける。Noneは制限なし。
+            if entry_k_max is not None and float(r["STOCH_K"]) > float(entry_k_max):
                 continue
             nd = _next_trading_date(df, dt)
             if nd is None:
@@ -2908,6 +2911,70 @@ with tab_stoch:
         st.download_button("📦 ストキャス単独検証結果ZIPをダウンロード",out.getvalue(),
                            "RC6_13_STOCH_GC_ONLY_BACKTEST.zip","application/zip",use_container_width=True)
 
+    st.divider()
+    st.subheader("🧪 GC発生位置 4パターン比較")
+    st.caption("出口条件を同じ +15%利確 / -7%損切りに固定し、GC発生時のSlow %Kが 20以下・30以下・50以下・制限なし の4条件だけを比較します。")
+    st.info("GC発生位置だけの効果を切り分けます。RSI・移動平均・出来高・AI・市場環境などは追加しません。")
+
+    if st.button("▶️ GC位置4パターンを比較", type="primary", key="run_stoch_level_test"):
+        if not data:
+            st.error("日足OHLCデータがありません。通常運用タブのデータ取得状態を確認してください。")
+        else:
+            level_specs=[("%K≤20",20.0),("%K≤30",30.0),("%K≤50",50.0),("制限なし",None)]
+            rows2=[]
+            payload2={}
+            prog2=st.progress(0,text="GC発生位置4パターンを計算中…")
+            for i,(label2,kmax2) in enumerate(level_specs):
+                tr2,eq2=_stoch_backtest(
+                    data,"TP/SL",float(stoch_initial),int(stoch_maxpos),float(stoch_maxbuy),
+                    float(stoch_tp),float(stoch_sl),int(stoch_hold),14,3,3,entry_k_max=kmax2
+                )
+                met2=_stoch_metrics(tr2,eq2,float(stoch_initial))
+                rows2.append({"GC発生位置":label2,"%K上限":kmax2 if kmax2 is not None else "なし",**met2})
+                payload2[label2]=(tr2,eq2)
+                prog2.progress((i+1)/len(level_specs),text=f"{i+1}/{len(level_specs)} {label2}")
+            prog2.empty()
+            level_result=pd.DataFrame(rows2).sort_values("損益率%",ascending=False).reset_index(drop=True)
+            st.session_state["stoch_level_results"]=level_result
+            st.session_state["stoch_level_payload"]=payload2
+            st.session_state["stoch_level_params"]={
+                "initial":float(stoch_initial),"maxpos":int(stoch_maxpos),"maxbuy":float(stoch_maxbuy),
+                "tp":float(stoch_tp),"sl":float(stoch_sl),"k_period":14,"k_smooth":3,"d_period":3,
+                "entry_levels":"K<=20 / K<=30 / K<=50 / no limit"
+            }
+
+    if "stoch_level_results" in st.session_state:
+        lr=st.session_state["stoch_level_results"]
+        st.subheader("📊 GC発生位置別の比較結果")
+        lshow=lr.copy()
+        for c in ["初期資金","最終資産","損益"]:
+            lshow[c]=lshow[c].round(0).astype(int)
+        for c in ["損益率%","勝率%","最大DD%","平均1トレード%"]:
+            lshow[c]=lshow[c].round(2)
+        lshow["PF"]=lshow["PF"].round(2)
+        st.dataframe(lshow,use_container_width=True,hide_index=True)
+        best2=lr.iloc[0]
+        st.success(
+            f"4条件では **{best2['GC発生位置']}** が最高：最終資産 {best2['最終資産']:,.0f}円 / "
+            f"損益率 {best2['損益率%']:+.2f}% / PF {best2['PF']:.2f} / 最大DD {best2['最大DD%']:.2f}% / "
+            f"決済 {int(best2['決済数'])}回"
+        )
+        st.caption("利益率だけでなく、PF・最大DD・決済数のバランスを比較してください。サンプル数が少なすぎる条件は過剰評価しません。")
+        out2=io.BytesIO()
+        with ZipFile(out2,"w") as z:
+            z.writestr("00_stoch_gc_level_comparison.csv",csv_bytes(lr))
+            z.writestr("01_stoch_gc_level_parameters.csv",csv_bytes(pd.DataFrame([st.session_state.get("stoch_level_params",{})])))
+            safe_map={"%K≤20":"k20","%K≤30":"k30","%K≤50":"k50","制限なし":"no_limit"}
+            for label2,(tr2,eq2) in st.session_state.get("stoch_level_payload",{}).items():
+                safe2=safe_map.get(label2,"other")
+                z.writestr(f"10_{safe2}_trades.csv",csv_bytes(tr2))
+                z.writestr(f"11_{safe2}_equity.csv",csv_bytes(eq2))
+        out2.seek(0)
+        st.download_button(
+            "📦 GC位置4パターン比較ZIPをダウンロード",out2.getvalue(),
+            "RC6_13_STOCH_GC_LEVEL_COMPARISON.zip","application/zip",use_container_width=True
+        )
+
 
 with tab_normal:
     # ------------------------------------------------------------
@@ -3332,6 +3399,17 @@ with tab_normal:
             ssafe_ = {"DC":"dc","TP/SL":"tpsl","10日保有":"fixed_hold"}.get(smode_, "other")
             files[f"22_stoch_{ssafe_}_trades.csv"] = strades_
             files[f"23_stoch_{ssafe_}_equity.csv"] = sequity_
+
+    # GC発生位置4パターン比較も、実行済みなら全処理ZIPへ収録する。
+    if "stoch_level_results" in st.session_state:
+        files["24_stoch_gc_level_comparison.csv"] = st.session_state["stoch_level_results"]
+        files["25_stoch_gc_level_parameters.csv"] = pd.DataFrame([st.session_state.get("stoch_level_params", {})])
+        level_safe_ = {"%K≤20":"k20", "%K≤30":"k30", "%K≤50":"k50", "制限なし":"no_limit"}
+        for level_label_, payload_ in st.session_state.get("stoch_level_payload", {}).items():
+            ltrades_, lequity_ = payload_
+            lsafe_ = level_safe_.get(level_label_, "other")
+            files[f"26_stoch_level_{lsafe_}_trades.csv"] = ltrades_
+            files[f"27_stoch_level_{lsafe_}_equity.csv"] = lequity_
 
     buf = io.BytesIO()
     with ZipFile(buf,"w") as z:

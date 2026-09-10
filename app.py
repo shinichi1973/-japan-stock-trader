@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.14 STOCH LEVEL OOS TEST"
-BUILD = "VER6.0-RC6.13-STOCH-GC-LEVELS-20260911"
+VERSION = "6.0 RC6.15 ENTRY COMPARISON TEST"
+BUILD = "VER6.0-RC6.15-RC-vs-STOCH-vs-COMBINED-20260911"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2029,6 +2029,197 @@ def _stoch_metrics(tr, eq, initial_cash):
             "決済数":n,"勝率%":winrate,"PF":pf,"最大DD%":maxdd,"平均1トレード%":avg}
 
 
+
+# ------------------------------------------------------------
+# RC6.15 TEST：BUY入口3方式の同条件直接比較
+# ① RC6.12 BUYシグナル ② Stoch %K<=20 GC ③ 両方一致
+# 出口・資金条件は共通化して「入口の差」だけを見る。
+# ------------------------------------------------------------
+def _entry_signal_comparison_backtest(
+    data_map, mode, market_df, overseas_df, liq_codes_set, held_codes_set,
+    initial_cash=600000.0, max_positions=5, max_buy=120000.0,
+    take_profit_pct=15.0, stop_loss_pct=7.0,
+    rsi_low=40, rsi_high=70, min_tech=75, min_ai=80,
+    max_gap_pct=5.0, use_liquidity=True, no_trade_bad_market=True,
+    cooldown_days=10, risk_cooldown_days=15, severe_cooldown_days=20,
+    stoch_k_max=20.0,
+):
+    """BUY入口だけを変え、出口と資金配分を共通化した比較用バックテスト。"""
+    mode = str(mode)
+    if mode not in {"RC6.12", "STOCH20", "COMBINED"}:
+        raise ValueError(f"unknown comparison mode: {mode}")
+
+    prepared = {t: _stoch_prepare(df, 14, 3, 3) for t, df in data_map.items() if df is not None and not df.empty}
+    dates = sorted(set(dt for df in prepared.values() for dt in df.index))
+    cash = float(initial_cash)
+    pos = {}
+    trades = []
+    equity = []
+    pending = {}
+    pending_tickers = set()
+
+    stats_cmp = {t:{"trades":0,"wins":0,"gp":0.0,"gl":0.0,"recent_losses":0} for t in prepared}
+    losses_cmp = 0
+    block_until_cmp = None
+    severe_block_until_cmp = None
+
+    for dt in dates:
+        # 前営業日終値で確定したBUYを翌営業日寄付で約定。
+        for order in pending.pop(dt, []):
+            t = order["ticker"]
+            pending_tickers.discard(t)
+            if t not in prepared or dt not in prepared[t].index or t in pos:
+                continue
+            r = prepared[t].loc[dt]
+            open_px = safe_float(r.get("Open"))
+            signal_close = float(order.get("signal_close", np.nan))
+            gap = (open_px/signal_close-1.0)*100 if np.isfinite(open_px) and signal_close > 0 else 999.0
+            if not np.isfinite(open_px) or open_px <= 0 or abs(gap) > float(max_gap_pct):
+                continue
+            if len(pos) >= int(max_positions):
+                continue
+            # 全3方式で同じ1銘柄上限を使用し、AI点数によるサイズ差を作らない。
+            budget = min(float(max_buy), cash)
+            shares = int(budget / open_px)
+            if shares <= 0:
+                continue
+            cost = shares * open_px
+            if cost > cash:
+                continue
+            cash -= cost
+            pos[t] = {"entry":open_px,"shares":shares,"entry_date":dt}
+            trades.append({
+                "日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":open_px,"株数":shares,
+                "損益":0.0,"損益率":0.0,"理由":order["reason"],"シグナル日":order["signal_date"],
+                "寄付ギャップ率":gap,"未来情報使用":False,
+                "テクニカルスコア":order.get("ts",np.nan),"総合AIスコア":order.get("score",np.nan),
+                "STOCH_K":order.get("stoch_k",np.nan),"STOCH_D":order.get("stoch_d",np.nan),
+            })
+
+        # 共通出口：+TP / -SL。両方同日到達時は保守的にSL優先。
+        for t in list(pos):
+            if dt not in prepared[t].index:
+                continue
+            r = prepared[t].loc[dt]
+            q = pos[t]
+            entry = float(q["entry"])
+            sh = int(q["shares"])
+            hi = safe_float(r.get("High"))
+            lo = safe_float(r.get("Low"))
+            close_px = safe_float(r.get("Close"))
+            tp_px = entry * (1.0 + float(take_profit_pct)/100.0)
+            sl_px = entry * (1.0 - float(stop_loss_pct)/100.0)
+            hit_sl = np.isfinite(lo) and lo <= sl_px
+            hit_tp = np.isfinite(hi) and hi >= tp_px
+            exit_px = None
+            exit_reason = None
+            if hit_sl:
+                exit_px = sl_px
+                exit_reason = f"共通SL -{float(stop_loss_pct):g}%"
+            elif hit_tp:
+                exit_px = tp_px
+                exit_reason = f"共通TP +{float(take_profit_pct):g}%"
+            if exit_px is not None:
+                pnl = (exit_px-entry)*sh
+                pct = (exit_px/entry-1.0)*100.0
+                cash += exit_px*sh
+                s0 = stats_cmp[t]
+                s0["trades"] += 1
+                if pnl > 0:
+                    s0["wins"] += 1; s0["gp"] += pnl; s0["recent_losses"] = 0; losses_cmp = 0
+                else:
+                    s0["gl"] += abs(pnl); s0["recent_losses"] += 1; losses_cmp += 1
+                    if losses_cmp >= 10:
+                        severe_block_until_cmp = dt + pd.tseries.offsets.BDay(int(severe_cooldown_days))
+                    elif losses_cmp >= 9:
+                        block_until_cmp = dt + pd.tseries.offsets.BDay(int(risk_cooldown_days))
+                    elif losses_cmp >= 4:
+                        block_until_cmp = dt + pd.tseries.offsets.BDay(int(cooldown_days))
+                trades.append({
+                    "日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":exit_px,"株数":sh,
+                    "損益":pnl,"損益率":pct,"理由":exit_reason,"未来情報使用":False,"連敗数":losses_cmp,
+                })
+                del pos[t]
+
+        # 当日終値でBUY入口を判定。
+        candidates = []
+        blocked_cmp = is_blocked(dt, block_until_cmp, severe_block_until_cmp)
+        for t,d in prepared.items():
+            if dt not in d.index or t in pos or t in pending_tickers:
+                continue
+            r = d.loc[dt]
+            close_px = safe_float(r.get("Close"))
+            if not np.isfinite(close_px) or close_px <= 0:
+                continue
+
+            stoch_gc = bool(r.get("STOCH_GC", False)) and np.isfinite(r.get("STOCH_K", np.nan)) and float(r["STOCH_K"]) <= float(stoch_k_max)
+
+            # RC6.12 BUY判定（現在コードの既存BUYシグナル部分を比較用に再現）。
+            c = code(t)
+            rc_ok = True
+            ts = np.nan; score = np.nan; ms = ""; os_state = ""
+            # 現在のRC6.12比較基準をそのまま再現。通常運用側の条件はこの検証では変更しない。
+            if close_px >= 2000:
+                rc_ok = False
+            if use_liquidity and c not in liq_codes_set and c not in held_codes_set and c != "6085":
+                rc_ok = False
+            if rc_ok:
+                try:
+                    ts = tech(r, int(rsi_low), int(rsi_high))
+                except Exception:
+                    ts = 0.0
+                if ts < float(min_tech):
+                    rc_ok = False
+            if rc_ok:
+                hc = confidence(stats_cmp[t]) * recent_loss_penalty(stats_cmp[t])
+                hp = conf_points(hc)
+                ms, mp, mf = market_info(market_df, dt)
+                os0 = overseas_snapshot(overseas_df, dt)
+                qfactor, qblock, _, _, _, _ = stock_quality(stats_cmp[t])
+                base = ts*.55 + hp*.30 + mp*.15
+                raw = float(np.clip(base*qfactor,0,100))
+                score = raw * os0["海外為替係数"]
+                os_state = os0["海外為替判定"]
+                threshold = 86 if ms in ["⚪ 中立","🟠 やや弱気","🔴 弱気"] else 82 if ms == "🟡 やや強気" else 80
+                if qblock or score < float(min_ai) or score < threshold or os0["海外為替係数"] < .50:
+                    rc_ok = False
+                if no_trade_bad_market and mf <= 0:
+                    rc_ok = False
+                if blocked_cmp:
+                    rc_ok = False
+
+            signal_ok = rc_ok if mode == "RC6.12" else stoch_gc if mode == "STOCH20" else (rc_ok and stoch_gc)
+            if not signal_ok:
+                continue
+            # 共通出口なので候補順位だけは、RC系はAI点数、ストキャス単独は売られ過ぎの強さで並べる。
+            priority = float(score) if mode in {"RC6.12","COMBINED"} and np.isfinite(score) else (100.0-float(r["STOCH_K"]))
+            candidates.append((priority,t,ts,score,float(r.get("STOCH_K",np.nan)),float(r.get("STOCH_D",np.nan))))
+
+        candidates.sort(key=lambda x:x[0], reverse=True)
+        free_slots = max(int(max_positions)-len(pos)-len(pending_tickers), 0)
+        for _,t,ts,score,sk,sd in candidates[:free_slots]:
+            nxt = _next_trading_date(prepared[t], dt)
+            if nxt is None:
+                continue
+            label = {"RC6.12":"RC6.12 BUYシグナル","STOCH20":"Stoch GC %K≤20","COMBINED":"RC6.12 + Stoch GC %K≤20"}[mode]
+            pending.setdefault(nxt,[]).append({
+                "ticker":t,"signal_date":dt,"signal_close":float(prepared[t].loc[dt,"Close"]),
+                "reason":label+"（翌営業日寄付）","ts":ts,"score":score,"stoch_k":sk,"stoch_d":sd,
+            })
+            pending_tickers.add(t)
+
+        hv = 0.0
+        for t,q in pos.items():
+            if dt in prepared[t].index:
+                cp = safe_float(prepared[t].loc[dt].get("Close"))
+                if np.isfinite(cp):
+                    hv += cp*int(q["shares"])
+        equity.append({"日付":dt,"現金":cash,"保有株評価額":hv,"総資産":cash+hv,"保有銘柄数":len(pos)})
+
+    tr = pd.DataFrame(trades)
+    eq = pd.DataFrame(equity)
+    return tr, eq
+
 # ------------------------------------------------------------
 # 画面タブ：通常運用と1億円逆算検証を完全分離
 # ------------------------------------------------------------
@@ -3085,6 +3276,89 @@ with tab_stoch:
         )
 
 
+    st.divider()
+    st.subheader("⚔️ BUY入口 3方式・同条件直接対決")
+    st.caption("①RC6.12 BUYシグナル ②Stoch %K≤20 GC ③RC6.12＋Stoch一致。出口と資金条件を共通化し、BUY入口の差だけを比較します。")
+    st.info("共通条件：翌営業日寄付で買付、利確 +15% / 損切り -7%（画面設定可）、同一日TP/SL到達時はSL優先。既存RC6.12通常運用ロジック自体は変更しません。")
+
+    ec1,ec2,ec3=st.columns(3)
+    cmp_initial=ec1.number_input("比較 初期資金（円）",100000,10000000,600000,50000,key="entry_cmp_initial")
+    cmp_maxpos=ec2.number_input("比較 最大同時保有数",1,20,5,1,key="entry_cmp_maxpos")
+    cmp_maxbuy=ec3.number_input("比較 1銘柄上限（円）",10000,1000000,120000,10000,key="entry_cmp_maxbuy")
+    ex1,ex2=st.columns(2)
+    cmp_tp=ex1.number_input("比較 共通利確%",1.0,50.0,15.0,1.0,key="entry_cmp_tp")
+    cmp_sl=ex2.number_input("比較 共通損切り%",1.0,30.0,7.0,1.0,key="entry_cmp_sl")
+
+    if st.button("▶️ 3方式を同条件で比較",type="primary",key="run_entry_3way_compare"):
+        if not data:
+            st.error("日足OHLCデータがありません。通常運用タブのデータ取得状態を確認してください。")
+        else:
+            modes_cmp=[("RC6.12","RC6.12 BUY"),("STOCH20","Stoch %K≤20 GC"),("COMBINED","RC6.12＋Stoch %K≤20")]
+            cmp_rows=[]; cmp_payload={}
+            pc=st.progress(0,text="3方式の同条件バックテストを計算中…")
+            for i,(mode_cmp,label_cmp) in enumerate(modes_cmp):
+                trc,eqc=_entry_signal_comparison_backtest(
+                    data,mode_cmp,market,overseas,set(liq_codes),set(held_codes),
+                    initial_cash=float(cmp_initial),max_positions=int(cmp_maxpos),max_buy=float(cmp_maxbuy),
+                    take_profit_pct=float(cmp_tp),stop_loss_pct=float(cmp_sl),
+                    rsi_low=int(rlo),rsi_high=int(rhi),min_tech=float(mintech),min_ai=float(minbuy_score),
+                    max_gap_pct=float(max_gap),use_liquidity=bool(use_liq),no_trade_bad_market=bool(no_trade_on_bad_market),
+                    cooldown_days=int(cooldown),risk_cooldown_days=int(risk_cooldown),severe_cooldown_days=int(severe_cooldown),
+                    stoch_k_max=20.0,
+                )
+                metc=_stoch_metrics(trc,eqc,float(cmp_initial))
+                cmp_rows.append({"方式":label_cmp,**metc})
+                cmp_payload[mode_cmp]=(trc,eqc)
+                pc.progress((i+1)/3,text=f"{i+1}/3 {label_cmp}")
+            pc.empty()
+            cmp_df=pd.DataFrame(cmp_rows).sort_values("損益率%",ascending=False).reset_index(drop=True)
+            st.session_state["entry_3way_results"]=cmp_df
+            st.session_state["entry_3way_payload"]=cmp_payload
+            st.session_state["entry_3way_params"]={
+                "initial":float(cmp_initial),"maxpos":int(cmp_maxpos),"maxbuy":float(cmp_maxbuy),
+                "tp":float(cmp_tp),"sl":float(cmp_sl),"stoch_k_max":20.0,
+                "stoch":"Slow 14,3,3","execution":"signal close -> next trading day open",
+                "same_day_tp_sl":"SL first (conservative)",
+                "comparison_purpose":"same exits and sizing; compare BUY entries only",
+            }
+
+    if "entry_3way_results" in st.session_state:
+        cdf=st.session_state["entry_3way_results"]
+        st.subheader("📊 3方式 直接比較結果")
+        cshow=cdf.copy()
+        for c in ["初期資金","最終資産","損益"]:
+            if c in cshow.columns: cshow[c]=cshow[c].round(0).astype(int)
+        for c in ["損益率%","勝率%","PF","最大DD%","平均1トレード%"]:
+            if c in cshow.columns: cshow[c]=cshow[c].round(2)
+        st.dataframe(cshow,use_container_width=True,hide_index=True)
+        b=cdf.iloc[0]
+        st.success(f"同条件比較の1位：**{b['方式']}**｜最終資産 {b['最終資産']:,.0f}円｜損益率 {b['損益率%']:+.2f}%｜PF {b['PF']:.2f}｜最大DD {b['最大DD%']:.2f}%｜決済 {int(b['決済数'])}回")
+
+        # 現行RC6.12通常バックテストは出口まで異なるため、参考値として別枠表示。
+        ref=pd.DataFrame([{
+            "参考":"現行RC6.12通常バックテスト（出口条件も現行のまま）",
+            "初期資金":float(initial),"最終資産":float(final),
+            "損益率%":((float(final)/float(initial)-1)*100 if float(initial) else 0.0),
+            "PF":float(pf),"最大DD%":float(maxddrate),"決済数":int(len(selltr)),
+        }])
+        st.caption("参考：下段は現行RC6.12そのもの。上の3方式とは出口条件が違うため、順位判定には混ぜません。")
+        st.dataframe(ref,use_container_width=True,hide_index=True)
+
+        bout=io.BytesIO()
+        with ZipFile(bout,"w") as z:
+            z.writestr("00_entry_3way_comparison.csv",csv_bytes(cdf))
+            z.writestr("01_entry_3way_parameters.csv",csv_bytes(pd.DataFrame([st.session_state.get("entry_3way_params",{})])))
+            z.writestr("02_rc612_current_reference.csv",csv_bytes(ref))
+            safe_cmp={"RC6.12":"rc612","STOCH20":"stoch_k20","COMBINED":"combined"}
+            for mc,(tc,ec) in st.session_state.get("entry_3way_payload",{}).items():
+                nm=safe_cmp.get(mc,mc.lower())
+                z.writestr(f"10_{nm}_trades.csv",csv_bytes(tc))
+                z.writestr(f"11_{nm}_equity.csv",csv_bytes(ec))
+        bout.seek(0)
+        st.download_button("📦 3方式直接比較ZIPをダウンロード",bout.getvalue(),
+                           "RC6_15_ENTRY_3WAY_COMPARISON.zip","application/zip",use_container_width=True)
+
+
 with tab_normal:
     # ------------------------------------------------------------
     # 現在の新規BUY + 現在ファンダメンタル
@@ -3503,4 +3777,42 @@ with tab_normal:
     if "stoch_results" in st.session_state:
         files["20_stoch_gc_comparison.csv"] = st.session_state["stoch_results"]
         files["21_stoch_gc_parameters.csv"] = pd.DataFrame([st.session_state.get("stoch_params", {})])
-     
+        for smode_, payload_ in st.session_state.get("stoch_payload", {}).items():
+            strades_, sequity_ = payload_
+            ssafe_ = {"DC":"dc","TP/SL":"tpsl","10日保有":"fixed_hold"}.get(smode_, "other")
+            files[f"22_stoch_{ssafe_}_trades.csv"] = strades_
+            files[f"23_stoch_{ssafe_}_equity.csv"] = sequity_
+
+    # ストキャスGC 5段階＋70/30 OOS検証も、実行済みなら全処理ZIPへ収録する。
+    if "stoch_level5_train_results" in st.session_state:
+        files["24_stoch_gc_level5_train_comparison.csv"] = st.session_state["stoch_level5_train_results"]
+        files["25_stoch_gc_level5_parameters.csv"] = pd.DataFrame([st.session_state.get("stoch_level5_params", {})])
+        files["26_stoch_gc_level5_oos_summary.csv"] = st.session_state.get("stoch_level5_oos_summary", pd.DataFrame())
+        level5_safe_ = {"%K≤10":"k10", "%K≤15":"k15", "%K≤20":"k20", "%K≤25":"k25", "%K≤30":"k30"}
+        for level_label_, payload_ in st.session_state.get("stoch_level5_train_payload", {}).items():
+            ltrades_, lequity_ = payload_
+            lsafe_ = level5_safe_.get(level_label_, "other")
+            files[f"27_stoch_level5_train_{lsafe_}_trades.csv"] = ltrades_
+            files[f"28_stoch_level5_train_{lsafe_}_equity.csv"] = lequity_
+        files["29_stoch_level5_oos_selected_trades.csv"] = st.session_state.get("stoch_level5_oos_trades", pd.DataFrame())
+        files["30_stoch_level5_oos_selected_equity.csv"] = st.session_state.get("stoch_level5_oos_equity", pd.DataFrame())
+
+    buf = io.BytesIO()
+    with ZipFile(buf,"w") as z:
+        for fn,df in files.items():
+            z.writestr(fn,csv_bytes(df))
+    buf.seek(0)
+
+    st.header("📦 ⑩ 全処理データ")
+    st.download_button(
+        "📦 Ver.6.0 全処理データをZIPでダウンロード",
+        buf.getvalue(),
+        "ver6_0_RC6_8_all_analysis.zip",
+        "application/zip",
+        use_container_width=True
+    )
+
+    st.caption(
+        "※本版は投資判断補助・検証用です。月利10%・1億円到達・テンバガー化・"
+        "AI適正株価・購入株数による利益を保証するものではありません。SBIへの自動発注は行いません。"
+    )

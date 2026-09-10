@@ -3489,4 +3489,18 @@ with tab_normal:
             "1銘柄上限円": bp_zip.get("maxbuy"),
             "市場条件": " / ".join(bp_zip.get("market_states", ())),
             "海外条件": " / ".join(bp_zip.get("overseas_states", ())),
-            "学習月利CAGR%": bm_zip.get("monthly_cagr_pct
+            "学習月利CAGR%": bm_zip.get("monthly_cagr_pct"), "学習PF": bm_zip.get("pf"),
+            "学習最大DD%": bm_zip.get("maxdd_pct"), "学習決済数": bm_zip.get("sells"),
+            "OOS月利CAGR%": om_zip.get("monthly_cagr_pct"), "OOS総損益%": om_zip.get("return_pct"),
+            "OOS_PF": om_zip.get("pf"), "OOS最大DD%": om_zip.get("maxdd_pct"),
+            "OOS決済数": om_zip.get("sells"),
+        }])
+        files["14_reverse_oos_result.csv"] = pd.DataFrame([om_zip])
+        files["15_reverse_best_trades.csv"] = st.session_state.get("reverse_best_trades", pd.DataFrame())
+        files["16_reverse_best_equity.csv"] = st.session_state.get("reverse_best_equity", pd.DataFrame())
+
+    # ストキャスGC単独検証を実行済みなら、通常の全処理ZIPにも収録する。
+    if "stoch_results" in st.session_state:
+        files["20_stoch_gc_comparison.csv"] = st.session_state["stoch_results"]
+        files["21_stoch_gc_parameters.csv"] = pd.DataFrame([st.session_state.get("stoch_params", {})])
+     

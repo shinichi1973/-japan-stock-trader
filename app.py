@@ -39,7 +39,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.13 STOCH LEVEL TEST"
+VERSION = "6.0 RC6.14 STOCH LEVEL OOS TEST"
 BUILD = "VER6.0-RC6.13-STOCH-GC-LEVELS-20260911"
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -1847,7 +1847,8 @@ def _next_trading_date(df, dt):
 
 def _stoch_backtest(data_map, exit_mode, initial_cash=600000.0, max_positions=5,
                     max_buy=120000.0, tp_pct=15.0, sl_pct=7.0, hold_days=10,
-                    k_period=14, k_smooth=3, d_period=3, entry_k_max=None):
+                    k_period=14, k_smooth=3, d_period=3, entry_k_max=None,
+                    signal_start_date=None, signal_end_date=None):
     """
     Entry: Slow Stoch GC確定日の次営業日寄付。
     Exit : DC / TP-SL / 固定保有日数のいずれか。
@@ -1947,6 +1948,11 @@ def _stoch_backtest(data_map, exit_mode, initial_cash=600000.0, max_positions=5,
             # 比較検証用：GC発生時のSlow %K位置だけを切り分ける。Noneは制限なし。
             if entry_k_max is not None and float(r["STOCH_K"]) > float(entry_k_max):
                 continue
+            # OOS検証用：シグナル発生日を期間内に限定する。
+            if signal_start_date is not None and pd.Timestamp(dt) < pd.Timestamp(signal_start_date):
+                continue
+            if signal_end_date is not None and pd.Timestamp(dt) > pd.Timestamp(signal_end_date):
+                continue
             nd = _next_trading_date(df, dt)
             if nd is None:
                 continue
@@ -1968,6 +1974,36 @@ def _stoch_backtest(data_map, exit_mode, initial_cash=600000.0, max_positions=5,
     tr = pd.DataFrame(trades)
     eq = pd.DataFrame(equity_rows)
     return tr,eq
+
+
+def _slice_stoch_data(data_map, start_date=None, end_date=None, warmup_calendar_days=120):
+    """ストキャスOOS用。開始前にウォームアップ期間を残し、終了日は切る。"""
+    out = {}
+    start_ts = pd.Timestamp(start_date) if start_date is not None else None
+    end_ts = pd.Timestamp(end_date) if end_date is not None else None
+    warm_start = start_ts - pd.Timedelta(days=int(warmup_calendar_days)) if start_ts is not None else None
+    for t, df in data_map.items():
+        if df is None or df.empty:
+            continue
+        d = df.copy()
+        if warm_start is not None:
+            d = d[d.index >= warm_start]
+        if end_ts is not None:
+            d = d[d.index <= end_ts]
+        if not d.empty:
+            d.attrs.update(getattr(df, "attrs", {}))
+            out[t] = d
+    return out
+
+
+def _stoch_rank_score(metrics):
+    """学習期間だけで順位付けする保守的スコア。OOS値は一切使用しない。"""
+    pf_ = min(float(metrics.get("PF", 0.0)), 3.0)
+    ret_ = float(metrics.get("損益率%", 0.0))
+    dd_ = abs(float(metrics.get("最大DD%", 0.0)))
+    n_ = int(metrics.get("決済数", 0))
+    sample_penalty = 0.0 if n_ >= 80 else (80 - n_) * 0.25
+    return ret_ + (pf_ - 1.0) * 35.0 - dd_ * 0.6 - sample_penalty
 
 
 def _stoch_metrics(tr, eq, initial_cash):
@@ -2912,67 +2948,140 @@ with tab_stoch:
                            "RC6_13_STOCH_GC_ONLY_BACKTEST.zip","application/zip",use_container_width=True)
 
     st.divider()
-    st.subheader("🧪 GC発生位置 4パターン比較")
-    st.caption("出口条件を同じ +15%利確 / -7%損切りに固定し、GC発生時のSlow %Kが 20以下・30以下・50以下・制限なし の4条件だけを比較します。")
-    st.info("GC発生位置だけの効果を切り分けます。RSI・移動平均・出来高・AI・市場環境などは追加しません。")
+    st.subheader("🧪 GC発生位置 5段階＋OOS検証")
+    st.caption("出口条件は同じ +15%利確 / -7%損切り。GC発生時のSlow %K上限を 10 / 15 / 20 / 25 / 30 で比較します。")
+    st.info("まず70%の学習期間だけで5条件を順位付けし、1位条件を固定してから残り30%のOOSを開封します。OOS成績を見て条件を選び直しません。")
 
-    if st.button("▶️ GC位置4パターンを比較", type="primary", key="run_stoch_level_test"):
+    if st.button("▶️ 5段階比較＋70/30 OOSを実行", type="primary", key="run_stoch_level_oos_test"):
         if not data:
             st.error("日足OHLCデータがありません。通常運用タブのデータ取得状態を確認してください。")
         else:
-            level_specs=[("%K≤20",20.0),("%K≤30",30.0),("%K≤50",50.0),("制限なし",None)]
-            rows2=[]
-            payload2={}
-            prog2=st.progress(0,text="GC発生位置4パターンを計算中…")
-            for i,(label2,kmax2) in enumerate(level_specs):
-                tr2,eq2=_stoch_backtest(
-                    data,"TP/SL",float(stoch_initial),int(stoch_maxpos),float(stoch_maxbuy),
-                    float(stoch_tp),float(stoch_sl),int(stoch_hold),14,3,3,entry_k_max=kmax2
-                )
-                met2=_stoch_metrics(tr2,eq2,float(stoch_initial))
-                rows2.append({"GC発生位置":label2,"%K上限":kmax2 if kmax2 is not None else "なし",**met2})
-                payload2[label2]=(tr2,eq2)
-                prog2.progress((i+1)/len(level_specs),text=f"{i+1}/{len(level_specs)} {label2}")
-            prog2.empty()
-            level_result=pd.DataFrame(rows2).sort_values("損益率%",ascending=False).reset_index(drop=True)
-            st.session_state["stoch_level_results"]=level_result
-            st.session_state["stoch_level_payload"]=payload2
-            st.session_state["stoch_level_params"]={
-                "initial":float(stoch_initial),"maxpos":int(stoch_maxpos),"maxbuy":float(stoch_maxbuy),
-                "tp":float(stoch_tp),"sl":float(stoch_sl),"k_period":14,"k_smooth":3,"d_period":3,
-                "entry_levels":"K<=20 / K<=30 / K<=50 / no limit"
-            }
+            all_dates2 = sorted(set(pd.Timestamp(dt) for df in data.values() if df is not None and not df.empty for dt in df.index))
+            if len(all_dates2) < 200:
+                st.error("OOS検証に必要な日足データが不足しています。")
+            else:
+                split_idx = max(1, min(len(all_dates2)-2, int(len(all_dates2)*0.70)-1))
+                train_end = all_dates2[split_idx]
+                oos_start = all_dates2[split_idx+1]
+                full_end = all_dates2[-1]
+                train_data = _slice_stoch_data(data, None, train_end)
+                oos_data = _slice_stoch_data(data, oos_start, full_end, warmup_calendar_days=120)
 
-    if "stoch_level_results" in st.session_state:
-        lr=st.session_state["stoch_level_results"]
-        st.subheader("📊 GC発生位置別の比較結果")
-        lshow=lr.copy()
+                level_specs = [("%K≤10",10.0),("%K≤15",15.0),("%K≤20",20.0),("%K≤25",25.0),("%K≤30",30.0)]
+                train_rows=[]
+                train_payload={}
+                prog3=st.progress(0,text="学習70%：5条件を比較中…")
+                for i,(label3,kmax3) in enumerate(level_specs):
+                    tr3,eq3=_stoch_backtest(
+                        train_data,"TP/SL",float(stoch_initial),int(stoch_maxpos),float(stoch_maxbuy),
+                        float(stoch_tp),float(stoch_sl),int(stoch_hold),14,3,3,
+                        entry_k_max=kmax3, signal_end_date=train_end
+                    )
+                    met3=_stoch_metrics(tr3,eq3,float(stoch_initial))
+                    score3=_stoch_rank_score(met3)
+                    train_rows.append({"GC発生位置":label3,"%K上限":kmax3,"学習評価点":score3,**met3})
+                    train_payload[label3]=(tr3,eq3)
+                    prog3.progress((i+1)/len(level_specs)*0.65,text=f"学習70% {i+1}/{len(level_specs)} {label3}")
+
+                train_result=pd.DataFrame(train_rows).sort_values("学習評価点",ascending=False).reset_index(drop=True)
+                best_label=str(train_result.iloc[0]["GC発生位置"])
+                best_k=float(train_result.iloc[0]["%K上限"])
+
+                # OOSは学習1位だけを固定して1回だけ計算する。
+                prog3.progress(0.80,text=f"OOS30%：学習1位 {best_label} を固定して検証中…")
+                oos_tr,oos_eq=_stoch_backtest(
+                    oos_data,"TP/SL",float(stoch_initial),int(stoch_maxpos),float(stoch_maxbuy),
+                    float(stoch_tp),float(stoch_sl),int(stoch_hold),14,3,3,
+                    entry_k_max=best_k, signal_start_date=oos_start, signal_end_date=full_end
+                )
+                oos_met=_stoch_metrics(oos_tr,oos_eq,float(stoch_initial))
+                prog3.progress(1.0,text="OOS検証完了")
+                prog3.empty()
+
+                best_train=train_result.iloc[0].to_dict()
+                oos_summary=pd.DataFrame([{
+                    "学習選定条件":best_label,
+                    "%K上限":best_k,
+                    "学習開始":all_dates2[0].date(),
+                    "学習終了":pd.Timestamp(train_end).date(),
+                    "OOS開始":pd.Timestamp(oos_start).date(),
+                    "OOS終了":pd.Timestamp(full_end).date(),
+                    "学習最終資産":best_train.get("最終資産"),
+                    "学習損益率%":best_train.get("損益率%"),
+                    "学習PF":best_train.get("PF"),
+                    "学習最大DD%":best_train.get("最大DD%"),
+                    "学習勝率%":best_train.get("勝率%"),
+                    "学習決済数":best_train.get("決済数"),
+                    "OOS最終資産":oos_met.get("最終資産"),
+                    "OOS損益率%":oos_met.get("損益率%"),
+                    "OOS_PF":oos_met.get("PF"),
+                    "OOS最大DD%":oos_met.get("最大DD%"),
+                    "OOS勝率%":oos_met.get("勝率%"),
+                    "OOS決済数":oos_met.get("決済数"),
+                }])
+
+                st.session_state["stoch_level5_train_results"] = train_result
+                st.session_state["stoch_level5_train_payload"] = train_payload
+                st.session_state["stoch_level5_oos_summary"] = oos_summary
+                st.session_state["stoch_level5_oos_trades"] = oos_tr
+                st.session_state["stoch_level5_oos_equity"] = oos_eq
+                st.session_state["stoch_level5_params"] = {
+                    "initial":float(stoch_initial),"maxpos":int(stoch_maxpos),"maxbuy":float(stoch_maxbuy),
+                    "tp":float(stoch_tp),"sl":float(stoch_sl),"k_period":14,"k_smooth":3,"d_period":3,
+                    "entry_levels":"K<=10 / 15 / 20 / 25 / 30","train_ratio":0.70,"oos_ratio":0.30,
+                    "train_end":str(pd.Timestamp(train_end).date()),"oos_start":str(pd.Timestamp(oos_start).date()),
+                    "selected_by":"train_only_rank_score"
+                }
+
+    if "stoch_level5_train_results" in st.session_state:
+        trr=st.session_state["stoch_level5_train_results"]
+        st.subheader("📊 学習70%：5条件の順位")
+        tsh=trr.copy()
         for c in ["初期資金","最終資産","損益"]:
-            lshow[c]=lshow[c].round(0).astype(int)
-        for c in ["損益率%","勝率%","最大DD%","平均1トレード%"]:
-            lshow[c]=lshow[c].round(2)
-        lshow["PF"]=lshow["PF"].round(2)
-        st.dataframe(lshow,use_container_width=True,hide_index=True)
-        best2=lr.iloc[0]
+            if c in tsh.columns: tsh[c]=tsh[c].round(0).astype(int)
+        for c in ["学習評価点","損益率%","勝率%","最大DD%","平均1トレード%","PF"]:
+            if c in tsh.columns: tsh[c]=tsh[c].round(2)
+        st.dataframe(tsh,use_container_width=True,hide_index=True)
+        best_train_row=trr.iloc[0]
         st.success(
-            f"4条件では **{best2['GC発生位置']}** が最高：最終資産 {best2['最終資産']:,.0f}円 / "
-            f"損益率 {best2['損益率%']:+.2f}% / PF {best2['PF']:.2f} / 最大DD {best2['最大DD%']:.2f}% / "
-            f"決済 {int(best2['決済数'])}回"
+            f"学習70%だけで選んだ1位は **{best_train_row['GC発生位置']}**："
+            f"損益率 {best_train_row['損益率%']:+.2f}% / PF {best_train_row['PF']:.2f} / "
+            f"最大DD {best_train_row['最大DD%']:.2f}% / 決済 {int(best_train_row['決済数'])}回"
         )
-        st.caption("利益率だけでなく、PF・最大DD・決済数のバランスを比較してください。サンプル数が少なすぎる条件は過剰評価しません。")
-        out2=io.BytesIO()
-        with ZipFile(out2,"w") as z:
-            z.writestr("00_stoch_gc_level_comparison.csv",csv_bytes(lr))
-            z.writestr("01_stoch_gc_level_parameters.csv",csv_bytes(pd.DataFrame([st.session_state.get("stoch_level_params",{})])))
-            safe_map={"%K≤20":"k20","%K≤30":"k30","%K≤50":"k50","制限なし":"no_limit"}
-            for label2,(tr2,eq2) in st.session_state.get("stoch_level_payload",{}).items():
-                safe2=safe_map.get(label2,"other")
-                z.writestr(f"10_{safe2}_trades.csv",csv_bytes(tr2))
-                z.writestr(f"11_{safe2}_equity.csv",csv_bytes(eq2))
-        out2.seek(0)
+
+    if "stoch_level5_oos_summary" in st.session_state:
+        oo=st.session_state["stoch_level5_oos_summary"]
+        r0=oo.iloc[0]
+        st.subheader("🔒 未学習30% OOS答え合わせ")
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("OOS損益率",f"{float(r0['OOS損益率%']):+.2f}%")
+        c2.metric("OOS PF",f"{float(r0['OOS_PF']):.2f}")
+        c3.metric("OOS 最大DD",f"{float(r0['OOS最大DD%']):.2f}%")
+        c4.metric("OOS 決済数",f"{int(r0['OOS決済数'])}")
+        st.dataframe(oo,use_container_width=True,hide_index=True)
+        if float(r0['OOS_PF']) >= 1.5 and float(r0['OOS損益率%']) > 0 and int(r0['OOS決済数']) >= 30:
+            st.success("OOSでも利益とPFが残っています。次段階としてRC6.12のBUY候補へストキャス条件を重ねる比較検証に進める水準です。")
+        elif float(r0['OOS_PF']) > 1.0 and float(r0['OOS損益率%']) > 0:
+            st.info("OOSでもプラスですが、強い優位性と断定するにはまだ弱めです。追加期間・銘柄群で再検証します。")
+        else:
+            st.warning("学習期間では強くてもOOSで優位性が残っていません。通常運用へは組み込みません。")
+
+        out3=io.BytesIO()
+        with ZipFile(out3,"w") as z:
+            z.writestr("00_stoch_gc_level5_train_comparison.csv",csv_bytes(st.session_state["stoch_level5_train_results"]))
+            z.writestr("01_stoch_gc_level5_parameters.csv",csv_bytes(pd.DataFrame([st.session_state.get("stoch_level5_params",{})])))
+            z.writestr("02_stoch_gc_level5_oos_summary.csv",csv_bytes(oo))
+            safe5={"%K≤10":"k10","%K≤15":"k15","%K≤20":"k20","%K≤25":"k25","%K≤30":"k30"}
+            for label5,(tr5,eq5) in st.session_state.get("stoch_level5_train_payload",{}).items():
+                s5=safe5.get(label5,"other")
+                z.writestr(f"10_train_{s5}_trades.csv",csv_bytes(tr5))
+                z.writestr(f"11_train_{s5}_equity.csv",csv_bytes(eq5))
+            z.writestr("20_oos_selected_trades.csv",csv_bytes(st.session_state.get("stoch_level5_oos_trades",pd.DataFrame())))
+            z.writestr("21_oos_selected_equity.csv",csv_bytes(st.session_state.get("stoch_level5_oos_equity",pd.DataFrame())))
+        out3.seek(0)
         st.download_button(
-            "📦 GC位置4パターン比較ZIPをダウンロード",out2.getvalue(),
-            "RC6_13_STOCH_GC_LEVEL_COMPARISON.zip","application/zip",use_container_width=True
+            "📦 5段階＋OOS検証ZIPをダウンロード",out3.getvalue(),
+            "RC6_14_STOCH_GC_LEVEL5_OOS_BACKTEST.zip","application/zip",use_container_width=True
         )
 
 
@@ -3380,53 +3489,4 @@ with tab_normal:
             "1銘柄上限円": bp_zip.get("maxbuy"),
             "市場条件": " / ".join(bp_zip.get("market_states", ())),
             "海外条件": " / ".join(bp_zip.get("overseas_states", ())),
-            "学習月利CAGR%": bm_zip.get("monthly_cagr_pct"), "学習PF": bm_zip.get("pf"),
-            "学習最大DD%": bm_zip.get("maxdd_pct"), "学習決済数": bm_zip.get("sells"),
-            "OOS月利CAGR%": om_zip.get("monthly_cagr_pct"), "OOS総損益%": om_zip.get("return_pct"),
-            "OOS_PF": om_zip.get("pf"), "OOS最大DD%": om_zip.get("maxdd_pct"),
-            "OOS決済数": om_zip.get("sells"),
-        }])
-        files["14_reverse_oos_result.csv"] = pd.DataFrame([om_zip])
-        files["15_reverse_best_trades.csv"] = st.session_state.get("reverse_best_trades", pd.DataFrame())
-        files["16_reverse_best_equity.csv"] = st.session_state.get("reverse_best_equity", pd.DataFrame())
-
-    # ストキャスGC単独検証を実行済みなら、通常の全処理ZIPにも収録する。
-    if "stoch_results" in st.session_state:
-        files["20_stoch_gc_comparison.csv"] = st.session_state["stoch_results"]
-        files["21_stoch_gc_parameters.csv"] = pd.DataFrame([st.session_state.get("stoch_params", {})])
-        for smode_, payload_ in st.session_state.get("stoch_payload", {}).items():
-            strades_, sequity_ = payload_
-            ssafe_ = {"DC":"dc","TP/SL":"tpsl","10日保有":"fixed_hold"}.get(smode_, "other")
-            files[f"22_stoch_{ssafe_}_trades.csv"] = strades_
-            files[f"23_stoch_{ssafe_}_equity.csv"] = sequity_
-
-    # GC発生位置4パターン比較も、実行済みなら全処理ZIPへ収録する。
-    if "stoch_level_results" in st.session_state:
-        files["24_stoch_gc_level_comparison.csv"] = st.session_state["stoch_level_results"]
-        files["25_stoch_gc_level_parameters.csv"] = pd.DataFrame([st.session_state.get("stoch_level_params", {})])
-        level_safe_ = {"%K≤20":"k20", "%K≤30":"k30", "%K≤50":"k50", "制限なし":"no_limit"}
-        for level_label_, payload_ in st.session_state.get("stoch_level_payload", {}).items():
-            ltrades_, lequity_ = payload_
-            lsafe_ = level_safe_.get(level_label_, "other")
-            files[f"26_stoch_level_{lsafe_}_trades.csv"] = ltrades_
-            files[f"27_stoch_level_{lsafe_}_equity.csv"] = lequity_
-
-    buf = io.BytesIO()
-    with ZipFile(buf,"w") as z:
-        for fn,df in files.items():
-            z.writestr(fn,csv_bytes(df))
-    buf.seek(0)
-
-    st.header("📦 ⑩ 全処理データ")
-    st.download_button(
-        "📦 Ver.6.0 全処理データをZIPでダウンロード",
-        buf.getvalue(),
-        "ver6_0_RC6_8_all_analysis.zip",
-        "application/zip",
-        use_container_width=True
-    )
-
-    st.caption(
-        "※本版は投資判断補助・検証用です。月利10%・1億円到達・テンバガー化・"
-        "AI適正株価・購入株数による利益を保証するものではありません。SBIへの自動発注は行いません。"
-    )
+            "学習月利CAGR%": bm_zip.get("monthly_cagr_pct

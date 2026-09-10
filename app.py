@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.12 FAST TEST"
-BUILD = "VER6.0-RC6.12-FAST-2STAGE-1OKU-20260908"
+VERSION = "6.0 RC6.13 STOCH TEST"
+BUILD = "VER6.0-RC6.13-STOCH-GC-ONLY-20260911"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1820,12 +1820,183 @@ with st.sidebar:
 st.title("📈 日本株 AI投資アシスタント Ver.6.0")
 st.caption(f"BUILD: {BUILD}")
 
+
+
+# ------------------------------------------------------------
+# RC6.13 TEST：ストキャスティクスGC単独バックテスト
+# ------------------------------------------------------------
+def _stoch_prepare(df, k_period=14, k_smooth=3, d_period=3):
+    """Slow Stochastic %K/%D とGC/DCを、当日までのOHLCだけで計算する。"""
+    x = df.copy().sort_index()
+    low_n = x["Low"].rolling(int(k_period), min_periods=int(k_period)).min()
+    high_n = x["High"].rolling(int(k_period), min_periods=int(k_period)).max()
+    den = (high_n - low_n).replace(0, np.nan)
+    fast_k = (x["Close"] - low_n) / den * 100.0
+    x["STOCH_K"] = fast_k.rolling(int(k_smooth), min_periods=int(k_smooth)).mean()
+    x["STOCH_D"] = x["STOCH_K"].rolling(int(d_period), min_periods=int(d_period)).mean()
+    x["STOCH_GC"] = (x["STOCH_K"] > x["STOCH_D"]) & (x["STOCH_K"].shift(1) <= x["STOCH_D"].shift(1))
+    x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
+    return x
+
+
+def _next_trading_date(df, dt):
+    idx = df.index
+    pos = idx.searchsorted(pd.Timestamp(dt), side="right")
+    return idx[pos] if pos < len(idx) else None
+
+
+def _stoch_backtest(data_map, exit_mode, initial_cash=600000.0, max_positions=5,
+                    max_buy=120000.0, tp_pct=15.0, sl_pct=7.0, hold_days=10,
+                    k_period=14, k_smooth=3, d_period=3):
+    """
+    Entry: Slow Stoch GC確定日の次営業日寄付。
+    Exit : DC / TP-SL / 固定保有日数のいずれか。
+    BUY選定には他のAI・RSI・MA・市場環境を一切使用しない。
+    """
+    prepared = {t:_stoch_prepare(df, k_period, k_smooth, d_period) for t,df in data_map.items() if not df.empty}
+    all_dates = sorted(set(dt for df in prepared.values() for dt in df.index))
+    cash = float(initial_cash)
+    pos = {}
+    pending_buy = {}
+    pending_sell = {}
+    trades = []
+    equity_rows = []
+
+    for dt in all_dates:
+        # 予約SELLを寄付で執行（DC・固定保有）
+        for t, reason in list(pending_sell.pop(dt, [])):
+            if t not in pos or t not in prepared or dt not in prepared[t].index:
+                continue
+            row = prepared[t].loc[dt]
+            px = float(row["Open"])
+            q = pos[t]["shares"]
+            pnl = (px-pos[t]["entry"])*q
+            pnl_pct = (px/pos[t]["entry"]-1)*100
+            cash += px*q
+            trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":px,"株数":q,
+                           "損益":pnl,"損益率":pnl_pct,"理由":reason,"シグナル日":pos[t].get("exit_signal_date",pd.NaT),
+                           "%K":float(row.get("STOCH_K",np.nan)),"%D":float(row.get("STOCH_D",np.nan))})
+            del pos[t]
+
+        # 予約BUYを寄付で執行
+        todays = sorted(pending_buy.pop(dt, []), key=lambda z:(z["k"], z["ticker"]))
+        for order in todays:
+            t = order["ticker"]
+            if t in pos or t not in prepared or dt not in prepared[t].index or len(pos) >= int(max_positions):
+                continue
+            px = float(prepared[t].loc[dt,"Open"])
+            budget = min(float(max_buy), cash)
+            q = int(budget/px)
+            if q <= 0:
+                continue
+            cost = q*px
+            cash -= cost
+            pos[t] = {"entry":px,"shares":q,"entry_date":dt,"bars":0,"exit_signal_date":pd.NaT}
+            trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":px,"株数":q,
+                           "損益":0.0,"損益率":0.0,"理由":"Slow Stochastic GC（翌営業日寄付）",
+                           "シグナル日":order["signal_date"],"%K":order["k"],"%D":order["d"]})
+
+        # 保有中を評価
+        for t in list(pos):
+            if t not in prepared or dt not in prepared[t].index:
+                continue
+            row = prepared[t].loc[dt]
+            if dt < pos[t]["entry_date"]:
+                continue
+            pos[t]["bars"] += 1
+            entry = pos[t]["entry"]
+            q = pos[t]["shares"]
+
+            if exit_mode == "TP/SL":
+                stop_px = entry*(1-float(sl_pct)/100)
+                take_px = entry*(1+float(tp_pct)/100)
+                hit_sl = float(row["Low"]) <= stop_px
+                hit_tp = float(row["High"]) >= take_px
+                if hit_sl or hit_tp:
+                    # 同一日に両方到達した場合は保守的に損切り優先
+                    px = stop_px if hit_sl else take_px
+                    reason = (f"損切り -{sl_pct:.1f}%" if hit_sl else f"利確 +{tp_pct:.1f}%")
+                    pnl = (px-entry)*q
+                    pnl_pct = (px/entry-1)*100
+                    cash += px*q
+                    trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":px,"株数":q,
+                                   "損益":pnl,"損益率":pnl_pct,"理由":reason,"シグナル日":dt,
+                                   "%K":float(row.get("STOCH_K",np.nan)),"%D":float(row.get("STOCH_D",np.nan))})
+                    del pos[t]
+                    continue
+
+            elif exit_mode == "DC" and bool(row.get("STOCH_DC",False)):
+                nd = _next_trading_date(prepared[t], dt)
+                if nd is not None:
+                    pos[t]["exit_signal_date"] = dt
+                    pending_sell.setdefault(nd,[]).append((t,"Slow Stochastic DC（翌営業日寄付）"))
+
+            elif exit_mode == "10日保有" and pos[t]["bars"] >= int(hold_days):
+                nd = _next_trading_date(prepared[t], dt)
+                if nd is not None:
+                    pos[t]["exit_signal_date"] = dt
+                    pending_sell.setdefault(nd,[]).append((t,f"{int(hold_days)}営業日保有後（翌営業日寄付）"))
+
+        # GC検出 → 次営業日BUY予約
+        for t,df in prepared.items():
+            if t in pos or dt not in df.index:
+                continue
+            r = df.loc[dt]
+            if not bool(r.get("STOCH_GC",False)) or not np.isfinite(r.get("STOCH_K",np.nan)):
+                continue
+            nd = _next_trading_date(df, dt)
+            if nd is None:
+                continue
+            pending_buy.setdefault(nd,[]).append({"ticker":t,"signal_date":dt,
+                                                  "k":float(r["STOCH_K"]),"d":float(r["STOCH_D"])})
+
+        # 時価評価
+        mv = 0.0
+        for t,p0 in pos.items():
+            df = prepared[t]
+            if dt in df.index:
+                px = float(df.loc[dt,"Close"])
+            else:
+                prev = df.loc[df.index<=dt]
+                px = float(prev.iloc[-1]["Close"]) if not prev.empty else p0["entry"]
+            mv += px*p0["shares"]
+        equity_rows.append({"日付":dt,"現金":cash,"保有時価":mv,"総資産":cash+mv})
+
+    tr = pd.DataFrame(trades)
+    eq = pd.DataFrame(equity_rows)
+    return tr,eq
+
+
+def _stoch_metrics(tr, eq, initial_cash):
+    sells = tr[tr["売買"]=="SELL"].copy() if not tr.empty else pd.DataFrame()
+    final = float(eq.iloc[-1]["総資産"]) if not eq.empty else float(initial_cash)
+    profit = final-float(initial_cash)
+    ret = profit/float(initial_cash)*100 if initial_cash else 0.0
+    wins = int((sells["損益"]>0).sum()) if not sells.empty else 0
+    n = len(sells)
+    winrate = wins/n*100 if n else 0.0
+    gp = float(sells.loc[sells["損益"]>0,"損益"].sum()) if n else 0.0
+    gl = abs(float(sells.loc[sells["損益"]<0,"損益"].sum())) if n else 0.0
+    pf = gp/gl if gl>0 else (9.99 if gp>0 else 0.0)
+    if not eq.empty:
+        curve = eq["総資産"].astype(float)
+        peak = curve.cummax()
+        dd = (curve/peak-1)*100
+        maxdd = float(dd.min())
+    else:
+        maxdd = 0.0
+    avg = float(sells["損益率"].mean()) if n else 0.0
+    return {"初期資金":float(initial_cash),"最終資産":final,"損益":profit,"損益率%":ret,
+            "決済数":n,"勝率%":winrate,"PF":pf,"最大DD%":maxdd,"平均1トレード%":avg}
+
+
 # ------------------------------------------------------------
 # 画面タブ：通常運用と1億円逆算検証を完全分離
 # ------------------------------------------------------------
-tab_normal, tab_reverse = st.tabs([
+tab_normal, tab_reverse, tab_stoch = st.tabs([
     "📈 通常運用・RC6.12",
     "🧬 1億円逆算・検証",
+    "📉 ストキャスGC単独検証",
 ])
 
 with tab_normal:
@@ -2667,6 +2838,77 @@ with tab_reverse:
                            "RC6_12_reverse_best_equity.csv","text/csv")
 
 
+with tab_stoch:
+    st.header("📉 ストキャスティクスGCだけで5年バックテスト")
+    st.caption("BUY条件は Slow Stochastic (14,3,3) のゴールデンクロスだけ。RC6.12のAI・RSI・移動平均・出来高・市場環境・海外環境・ファンダはBUY判定に使いません。")
+    st.info("GCは終値確定後に判定し、翌営業日寄付で買うため未来情報を使いません。TP/SLが同一日に両方到達した場合は、保守的に損切りを先に約定したものとして計算します。")
+
+    sc1,sc2,sc3 = st.columns(3)
+    stoch_initial = sc1.number_input("初期資金（円）",100000,10000000,600000,50000,key="stoch_initial")
+    stoch_maxpos = sc2.number_input("最大同時保有数",1,20,5,1,key="stoch_maxpos")
+    stoch_maxbuy = sc3.number_input("1銘柄上限（円）",10000,1000000,120000,10000,key="stoch_maxbuy")
+
+    sp1,sp2,sp3 = st.columns(3)
+    stoch_tp = sp1.number_input("TP/SL方式 利確%",1.0,50.0,15.0,1.0,key="stoch_tp")
+    stoch_sl = sp2.number_input("TP/SL方式 損切り%",1.0,30.0,7.0,1.0,key="stoch_sl")
+    stoch_hold = sp3.number_input("固定保有営業日",1,60,10,1,key="stoch_hold")
+
+    st.write("**検証する3方式**：①GC買い→DC売り　②GC買い→+15%/-7%（設定変更可）　③GC買い→10営業日保有（設定変更可）")
+
+    if st.button("▶️ ストキャスGC単独バックテストを実行",type="primary",key="run_stoch_test"):
+        if not data:
+            st.error("日足OHLCデータがありません。通常運用タブのデータ取得状態を確認してください。")
+        else:
+            modes=["DC","TP/SL","10日保有"]
+            rows=[]
+            payload={}
+            prog=st.progress(0,text="ストキャスGC単独バックテストを計算中…")
+            for i,m in enumerate(modes):
+                tr_,eq_=_stoch_backtest(data,m,float(stoch_initial),int(stoch_maxpos),float(stoch_maxbuy),
+                                        float(stoch_tp),float(stoch_sl),int(stoch_hold),14,3,3)
+                met_=_stoch_metrics(tr_,eq_,float(stoch_initial))
+                label={"DC":"GC→DC","TP/SL":f"GC→+{stoch_tp:g}%/-{stoch_sl:g}%",
+                       "10日保有":f"GC→{int(stoch_hold)}営業日"}[m]
+                rows.append({"方式":label,**met_})
+                payload[m]=(tr_,eq_)
+                prog.progress((i+1)/len(modes),text=f"{i+1}/{len(modes)} {label}")
+            prog.empty()
+            result_=pd.DataFrame(rows).sort_values("損益率%",ascending=False).reset_index(drop=True)
+            st.session_state["stoch_results"]=result_
+            st.session_state["stoch_payload"]=payload
+            st.session_state["stoch_params"]={"initial":float(stoch_initial),"maxpos":int(stoch_maxpos),
+                                                "maxbuy":float(stoch_maxbuy),"tp":float(stoch_tp),
+                                                "sl":float(stoch_sl),"hold":int(stoch_hold),
+                                                "k_period":14,"k_smooth":3,"d_period":3}
+
+    if "stoch_results" in st.session_state:
+        sr=st.session_state["stoch_results"]
+        st.subheader("📊 3方式の比較結果")
+        show=sr.copy()
+        for c in ["初期資金","最終資産","損益"]:
+            show[c]=show[c].round(0).astype(int)
+        for c in ["損益率%","勝率%","最大DD%","平均1トレード%"]:
+            show[c]=show[c].round(2)
+        show["PF"]=show["PF"].round(2)
+        st.dataframe(show,use_container_width=True,hide_index=True)
+        best=sr.iloc[0]
+        st.success(f"ストキャス単独の3方式では **{best['方式']}** が最高：最終資産 {best['最終資産']:,.0f}円 / 損益率 {best['損益率%']:+.2f}% / PF {best['PF']:.2f} / 最大DD {best['最大DD%']:.2f}%")
+        st.caption("RC6.12現行ロジックとは別検証です。結果が良くても、そのまま通常運用へ採用せずOOS・期間分割で再検証してください。")
+
+        out=io.BytesIO()
+        with ZipFile(out,"w") as z:
+            z.writestr("00_stoch_comparison.csv",csv_bytes(sr))
+            prm=st.session_state.get("stoch_params",{})
+            z.writestr("01_stoch_parameters.csv",csv_bytes(pd.DataFrame([prm])))
+            for m,(tr_,eq_) in st.session_state.get("stoch_payload",{}).items():
+                safe={"DC":"dc","TP/SL":"tpsl","10日保有":"fixed_hold"}[m]
+                z.writestr(f"10_{safe}_trades.csv",csv_bytes(tr_))
+                z.writestr(f"11_{safe}_equity.csv",csv_bytes(eq_))
+        out.seek(0)
+        st.download_button("📦 ストキャス単独検証結果ZIPをダウンロード",out.getvalue(),
+                           "RC6_13_STOCH_GC_ONLY_BACKTEST.zip","application/zip",use_container_width=True)
+
+
 with tab_normal:
     # ------------------------------------------------------------
     # 現在の新規BUY + 現在ファンダメンタル
@@ -3080,6 +3322,16 @@ with tab_normal:
         files["14_reverse_oos_result.csv"] = pd.DataFrame([om_zip])
         files["15_reverse_best_trades.csv"] = st.session_state.get("reverse_best_trades", pd.DataFrame())
         files["16_reverse_best_equity.csv"] = st.session_state.get("reverse_best_equity", pd.DataFrame())
+
+    # ストキャスGC単独検証を実行済みなら、通常の全処理ZIPにも収録する。
+    if "stoch_results" in st.session_state:
+        files["20_stoch_gc_comparison.csv"] = st.session_state["stoch_results"]
+        files["21_stoch_gc_parameters.csv"] = pd.DataFrame([st.session_state.get("stoch_params", {})])
+        for smode_, payload_ in st.session_state.get("stoch_payload", {}).items():
+            strades_, sequity_ = payload_
+            ssafe_ = {"DC":"dc","TP/SL":"tpsl","10日保有":"fixed_hold"}.get(smode_, "other")
+            files[f"22_stoch_{ssafe_}_trades.csv"] = strades_
+            files[f"23_stoch_{ssafe_}_equity.csv"] = sequity_
 
     buf = io.BytesIO()
     with ZipFile(buf,"w") as z:

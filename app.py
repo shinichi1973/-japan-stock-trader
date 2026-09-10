@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.15 ENTRY COMPARISON TEST"
-BUILD = "VER6.0-RC6.15-RC-vs-STOCH-vs-COMBINED-20260911"
+VERSION = "6.0 RC6.16 STOCH FORMAL CANDIDATE"
+BUILD = "VER6.0-RC6.16-STOCH-K20-SELL-OPT-OOS-20260911"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2030,6 +2030,118 @@ def _stoch_metrics(tr, eq, initial_cash):
 
 
 
+
+# ------------------------------------------------------------
+# RC6.16 TEST：ストキャスSELL深掘り + 70/30 OOS
+# BUYは %K<=20 GC に固定。SELLはDC発生時の%K下限を探索する。
+# ------------------------------------------------------------
+def _stoch_sell_threshold_backtest(
+    data_map, initial_cash=600000.0, max_positions=5, max_buy=120000.0,
+    entry_k_max=20.0, sell_k_min=0.0,
+    k_period=14, k_smooth=3, d_period=3,
+    signal_start_date=None, signal_end_date=None, force_close_end=True,
+):
+    """
+    Entry: Slow Stoch GC かつ %K<=entry_k_max を終値で確認し、翌営業日寄付でBUY。
+    Exit : Slow Stoch DC かつ %K>=sell_k_min を終値で確認し、翌営業日寄付でSELL。
+    sell_k_min=0 は「DCなら位置を問わず売却」。
+    BUY/SELLの判定にAI・MA・RSI・出来高・市場/海外フィルターは使わない。
+    """
+    prepared={t:_stoch_prepare(df,k_period,k_smooth,d_period) for t,df in data_map.items() if df is not None and not df.empty}
+    all_dates=sorted(set(dt for df in prepared.values() for dt in df.index))
+    cash=float(initial_cash); pos={}; pending_buy={}; pending_sell={}; trades=[]; equity_rows=[]
+
+    for dt in all_dates:
+        # 前日までに確定したSELLを寄付で執行
+        for t,reason,sig_k,sig_d,sig_dt in list(pending_sell.pop(dt, [])):
+            if t not in pos or t not in prepared or dt not in prepared[t].index:
+                continue
+            row=prepared[t].loc[dt]; px=float(row["Open"]); q=pos[t]["shares"]
+            pnl=(px-pos[t]["entry"])*q; pnl_pct=(px/pos[t]["entry"]-1.0)*100.0
+            cash += px*q
+            trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":px,"株数":q,
+                           "損益":pnl,"損益率":pnl_pct,"理由":reason,"シグナル日":sig_dt,
+                           "%K":sig_k,"%D":sig_d,"未来情報使用":False})
+            del pos[t]
+
+        # 前日までに確定したBUYを寄付で執行
+        todays=sorted(pending_buy.pop(dt, []), key=lambda z:(z["k"],z["ticker"]))
+        for order in todays:
+            t=order["ticker"]
+            if t in pos or t not in prepared or dt not in prepared[t].index or len(pos)>=int(max_positions):
+                continue
+            px=float(prepared[t].loc[dt,"Open"]); budget=min(float(max_buy),cash); q=int(budget/px)
+            if q<=0: continue
+            cash -= q*px
+            pos[t]={"entry":px,"shares":q,"entry_date":dt}
+            trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":px,"株数":q,
+                           "損益":0.0,"損益率":0.0,"理由":f"Stoch GC %K<={entry_k_max:g}（翌営業日寄付）",
+                           "シグナル日":order["signal_date"],"%K":order["k"],"%D":order["d"],"未来情報使用":False})
+
+        # 当日終値でSELLシグナル判定
+        for t in list(pos):
+            if t not in prepared or dt not in prepared[t].index: continue
+            r=prepared[t].loc[dt]; sk=safe_float(r.get("STOCH_K")); sd=safe_float(r.get("STOCH_D"))
+            if not bool(r.get("STOCH_DC",False)) or not np.isfinite(sk):
+                continue
+            if float(sk) < float(sell_k_min):
+                continue
+            if signal_start_date is not None and pd.Timestamp(dt)<pd.Timestamp(signal_start_date):
+                continue
+            if signal_end_date is not None and pd.Timestamp(dt)>pd.Timestamp(signal_end_date):
+                continue
+            nd=_next_trading_date(prepared[t],dt)
+            if nd is not None:
+                reason=("Stoch DC（位置制限なし）" if float(sell_k_min)<=0 else f"Stoch DC %K>={float(sell_k_min):g}") + "（翌営業日寄付）"
+                pending_sell.setdefault(nd,[]).append((t,reason,float(sk),float(sd) if np.isfinite(sd) else np.nan,dt))
+
+        # 当日終値でBUYシグナル判定
+        for t,df in prepared.items():
+            if t in pos or dt not in df.index: continue
+            r=df.loc[dt]; sk=safe_float(r.get("STOCH_K")); sd=safe_float(r.get("STOCH_D"))
+            if not bool(r.get("STOCH_GC",False)) or not np.isfinite(sk) or float(sk)>float(entry_k_max):
+                continue
+            if signal_start_date is not None and pd.Timestamp(dt)<pd.Timestamp(signal_start_date):
+                continue
+            if signal_end_date is not None and pd.Timestamp(dt)>pd.Timestamp(signal_end_date):
+                continue
+            nd=_next_trading_date(df,dt)
+            if nd is not None:
+                pending_buy.setdefault(nd,[]).append({"ticker":t,"signal_date":dt,"k":float(sk),"d":float(sd) if np.isfinite(sd) else np.nan})
+
+        mv=0.0
+        for t,p0 in pos.items():
+            df=prepared[t]
+            prev=df.loc[df.index<=dt]
+            px=float(prev.iloc[-1]["Close"]) if not prev.empty else p0["entry"]
+            mv += px*p0["shares"]
+        equity_rows.append({"日付":dt,"現金":cash,"保有時価":mv,"総資産":cash+mv})
+
+    # 比較時に未決済ポジションが成績を歪めないよう期間末終値で評価決済
+    if force_close_end and all_dates and pos:
+        last_dt=all_dates[-1]
+        for t in list(pos):
+            df=prepared[t]; prev=df.loc[df.index<=last_dt]
+            if prev.empty: continue
+            px=float(prev.iloc[-1]["Close"]); q=pos[t]["shares"]; pnl=(px-pos[t]["entry"])*q; pct=(px/pos[t]["entry"]-1)*100
+            cash += px*q
+            trades.append({"日付":last_dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":px,"株数":q,
+                           "損益":pnl,"損益率":pct,"理由":"期間末評価決済","シグナル日":last_dt,
+                           "%K":safe_float(prev.iloc[-1].get("STOCH_K")),"%D":safe_float(prev.iloc[-1].get("STOCH_D")),"未来情報使用":False})
+            del pos[t]
+        if equity_rows:
+            equity_rows[-1]["現金"]=cash; equity_rows[-1]["保有時価"]=0.0; equity_rows[-1]["総資産"]=cash
+
+    return pd.DataFrame(trades),pd.DataFrame(equity_rows)
+
+
+def _sell_rank_for_profit(metrics):
+    """学習期間の利益を最優先。極端に少ない決済数には罰則を付ける。"""
+    ret=float(metrics.get("損益率%",0.0)); pf_=float(metrics.get("PF",0.0)); dd=abs(float(metrics.get("最大DD%",0.0))); n=int(metrics.get("決済数",0))
+    sample_penalty=max(0,40-n)*0.75
+    return ret + min(pf_,3.0)*2.0 - dd*0.05 - sample_penalty
+
+
 # ------------------------------------------------------------
 # RC6.15 TEST：BUY入口3方式の同条件直接比較
 # ① RC6.12 BUYシグナル ② Stoch %K<=20 GC ③ 両方一致
@@ -3357,6 +3469,98 @@ with tab_stoch:
         bout.seek(0)
         st.download_button("📦 3方式直接比較ZIPをダウンロード",bout.getvalue(),
                            "RC6_15_ENTRY_3WAY_COMPARISON.zip","application/zip",use_container_width=True)
+
+
+    st.divider()
+    st.subheader("🔻 RC6.16 SELL条件：ストキャス深掘り＋OOS")
+    st.caption("BUYは Slow Stochastic (14,3,3) の %K≤20 ゴールデンクロスに固定。SELLだけをデッドクロス発生時の%K位置で比較します。")
+    st.info("比較するSELL：DC位置制限なし / %K≥20 / 30 / 40 / 50 / 60 / 70 / 80 / 90。70%学習期間で利益を中心に1位を選び、そのSELL条件を固定して30%OOSへ投入します。")
+
+    sv1,sv2,sv3=st.columns(3)
+    sell_initial=sv1.number_input("SELL探索 初期資金（円）",100000,10000000,600000,50000,key="sellopt_initial")
+    sell_maxpos=sv2.number_input("SELL探索 最大同時保有数",1,20,5,1,key="sellopt_maxpos")
+    sell_maxbuy=sv3.number_input("SELL探索 1銘柄上限（円）",10000,1000000,120000,10000,key="sellopt_maxbuy")
+
+    if st.button("▶️ SELL 9条件＋70/30 OOSを実行",type="primary",key="run_stoch_sell_oos"):
+        if not data:
+            st.error("日足OHLCデータがありません。通常運用タブのデータ取得状態を確認してください。")
+        else:
+            dts=sorted(set(pd.Timestamp(dt) for df in data.values() if df is not None and not df.empty for dt in df.index))
+            if len(dts)<200:
+                st.error("OOS検証に必要な日足データが不足しています。")
+            else:
+                spidx=max(1,min(len(dts)-2,int(len(dts)*0.70)-1)); train_end2=dts[spidx]; oos_start2=dts[spidx+1]; full_end2=dts[-1]
+                train_data2=_slice_stoch_data(data,None,train_end2); oos_data2=_slice_stoch_data(data,oos_start2,full_end2,120)
+                sell_levels=[0.0,20.0,30.0,40.0,50.0,60.0,70.0,80.0,90.0]
+                srows=[]; spayload={}
+                ps=st.progress(0,text="学習70%：SELL 9条件を比較中…")
+                for i,lv in enumerate(sell_levels):
+                    trs,eqs=_stoch_sell_threshold_backtest(train_data2,float(sell_initial),int(sell_maxpos),float(sell_maxbuy),20.0,lv,14,3,3,None,train_end2,True)
+                    mets=_stoch_metrics(trs,eqs,float(sell_initial)); score_s=_sell_rank_for_profit(mets)
+                    label_s="DC制限なし" if lv<=0 else f"DC %K≥{lv:g}"
+                    srows.append({"SELL条件":label_s,"SELL_%K下限":lv,"学習評価点":score_s,**mets}); spayload[label_s]=(trs,eqs)
+                    ps.progress((i+1)/len(sell_levels)*0.70,text=f"学習70% {i+1}/{len(sell_levels)} {label_s}")
+                sdf=pd.DataFrame(srows).sort_values(["学習評価点","損益率%","PF"],ascending=False).reset_index(drop=True)
+                selected_label=str(sdf.iloc[0]["SELL条件"]); selected_k=float(sdf.iloc[0]["SELL_%K下限"])
+                ps.progress(0.82,text=f"OOS30%：{selected_label} を固定して検証中…")
+                otr,oeq=_stoch_sell_threshold_backtest(oos_data2,float(sell_initial),int(sell_maxpos),float(sell_maxbuy),20.0,selected_k,14,3,3,oos_start2,full_end2,True)
+                omet=_stoch_metrics(otr,oeq,float(sell_initial)); ps.progress(1.0,text="SELL OOS検証完了"); ps.empty()
+                osum=pd.DataFrame([{
+                    "BUY正式候補":"Stoch GC %K≤20","学習選定SELL":selected_label,"SELL_%K下限":selected_k,
+                    "学習開始":dts[0].date(),"学習終了":pd.Timestamp(train_end2).date(),"OOS開始":pd.Timestamp(oos_start2).date(),"OOS終了":pd.Timestamp(full_end2).date(),
+                    "学習損益率%":float(sdf.iloc[0]["損益率%"]),"学習PF":float(sdf.iloc[0]["PF"]),"学習最大DD%":float(sdf.iloc[0]["最大DD%"]),"学習決済数":int(sdf.iloc[0]["決済数"]),
+                    "OOS損益率%":omet["損益率%"],"OOS_PF":omet["PF"],"OOS最大DD%":omet["最大DD%"],"OOS勝率%":omet["勝率%"],"OOS決済数":omet["決済数"]
+                }])
+                st.session_state["stoch_sell_train_results"]=sdf; st.session_state["stoch_sell_train_payload"]=spayload
+                st.session_state["stoch_sell_oos_summary"]=osum; st.session_state["stoch_sell_oos_trades"]=otr; st.session_state["stoch_sell_oos_equity"]=oeq
+                st.session_state["stoch_formal_sell_k_min"]=selected_k
+                st.session_state["stoch_sell_params"]={"stoch":"Slow 14,3,3","entry":"GC and K<=20","sell_grid":"DC any / K>=20,30,40,50,60,70,80,90","train_ratio":0.70,"oos_ratio":0.30,"selected_by":"TRAIN return-centered score only","execution":"signal close -> next trading day open"}
+
+    if "stoch_sell_train_results" in st.session_state:
+        sdf=st.session_state["stoch_sell_train_results"]; st.subheader("📊 学習70%：SELL 9条件ランキング")
+        sdsp=sdf.copy()
+        for c in ["初期資金","最終資産","損益"]:
+            if c in sdsp: sdsp[c]=sdsp[c].round(0).astype(int)
+        for c in ["学習評価点","損益率%","勝率%","PF","最大DD%","平均1トレード%"]:
+            if c in sdsp: sdsp[c]=sdsp[c].round(2)
+        st.dataframe(sdsp,use_container_width=True,hide_index=True)
+        br=sdf.iloc[0]
+        st.success(f"学習70%で選んだSELLは **{br['SELL条件']}**｜損益率 {br['損益率%']:+.2f}%｜PF {br['PF']:.2f}｜最大DD {br['最大DD%']:.2f}%｜決済 {int(br['決済数'])}回")
+
+    if "stoch_sell_oos_summary" in st.session_state:
+        so=st.session_state["stoch_sell_oos_summary"]; rr=so.iloc[0]; st.subheader("🔒 SELL条件 OOS30%答え合わせ")
+        a,b,c,d=st.columns(4); a.metric("OOS損益率",f"{float(rr['OOS損益率%']):+.2f}%"); b.metric("OOS PF",f"{float(rr['OOS_PF']):.2f}"); c.metric("OOS最大DD",f"{float(rr['OOS最大DD%']):.2f}%"); d.metric("OOS決済",f"{int(rr['OOS決済数'])}回")
+        st.dataframe(so,use_container_width=True,hide_index=True)
+        selected=float(rr["SELL_%K下限"]); sell_text="DCなら位置を問わずSELL" if selected<=0 else f"%K≥{selected:g}の位置でデッドクロスしたらSELL"
+        st.warning(f"RC6.16 正式候補ロジック：BUY = %K≤20でGC → 翌営業日寄付。SELL = {sell_text} → 翌営業日寄付。※最終採用はこのOOS結果を確認して固定します。")
+
+        # 現在日のRC6.16候補シグナルを表示
+        latest_signals=[]
+        for t,df0 in data.items():
+            if df0 is None or df0.empty: continue
+            sx=_stoch_prepare(df0,14,3,3); r=sx.iloc[-1]; sk=safe_float(r.get("STOCH_K")); sd=safe_float(r.get("STOCH_D"))
+            if bool(r.get("STOCH_GC",False)) and np.isfinite(sk) and sk<=20:
+                latest_signals.append({"コード":code(t),"銘柄名":name(t),"判定":"買い候補","%K":sk,"%D":sd,"条件":"%K≤20 GC"})
+            if code(t) in set(held_codes) and bool(r.get("STOCH_DC",False)) and np.isfinite(sk) and sk>=selected:
+                latest_signals.append({"コード":code(t),"銘柄名":name(t),"判定":"売り候補","%K":sk,"%D":sd,"条件":sell_text})
+        st.subheader("🧭 RC6.16 現在シグナル（検証候補）")
+        if latest_signals:
+            ls=pd.DataFrame(latest_signals); ls["%K"]=ls["%K"].round(2); ls["%D"]=ls["%D"].round(2); st.dataframe(ls,use_container_width=True,hide_index=True)
+        else:
+            st.info("現在はRC6.16ストキャス条件に一致する買い・売りシグナルはありません。")
+
+        sout=io.BytesIO()
+        with ZipFile(sout,"w") as z:
+            z.writestr("00_stoch_sell_train_comparison.csv",csv_bytes(st.session_state["stoch_sell_train_results"]))
+            z.writestr("01_stoch_sell_parameters.csv",csv_bytes(pd.DataFrame([st.session_state.get("stoch_sell_params",{})])))
+            z.writestr("02_stoch_sell_oos_summary.csv",csv_bytes(so))
+            for lab,(tt,ee) in st.session_state.get("stoch_sell_train_payload",{}).items():
+                nm=lab.replace("DC ","").replace("%K≥","k").replace("制限なし","any").replace(".","_")
+                z.writestr(f"10_train_sell_{nm}_trades.csv",csv_bytes(tt)); z.writestr(f"11_train_sell_{nm}_equity.csv",csv_bytes(ee))
+            z.writestr("20_oos_selected_sell_trades.csv",csv_bytes(st.session_state.get("stoch_sell_oos_trades",pd.DataFrame())))
+            z.writestr("21_oos_selected_sell_equity.csv",csv_bytes(st.session_state.get("stoch_sell_oos_equity",pd.DataFrame())))
+        sout.seek(0)
+        st.download_button("📦 RC6.16 SELL深掘り＋OOS ZIPをダウンロード",sout.getvalue(),"RC6_16_STOCH_SELL_OPT_OOS.zip","application/zip",use_container_width=True)
 
 
 with tab_normal:

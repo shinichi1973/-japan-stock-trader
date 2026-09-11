@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.6.0
-# BUILD: VER6.0-RC6.12-FAST-2STAGE-1OKU-20260908
+# 日本株 AI投資アシスタント Ver.7
+# BUILD: VER7-STOCH-MAIN-LIGHT-20260911
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.6.0",
+    page_title="日本株 AI投資アシスタント Ver.7",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "6.0 RC6.17 STOCH MAIN"
-BUILD = "VER6.0-RC6.17-STOCH-MAIN-LIGHT-20260911"
+VERSION = "7.0 STOCH MAIN"
+BUILD = "VER7-STOCH-MAIN-LIGHT-20260911"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1795,10 +1795,10 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
     return x
 
-st.title("📉 日本株 AI投資アシスタント Ver.6.17")
+st.title("📉 日本株 AI投資アシスタント Ver.7")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("メインロジック：AI選定TOP50 × Slow Stochastic 14,3,3｜BUY=%K≤20のGC｜SELL=DC＋損切りセンサー")
-st.caption("旧ロジック一式はRC6.16として別ファイル保存。Ver.6.17では実トレードに必要な処理だけを優先し、重い逆算探索・旧バックテスト画面は実行しません。")
+st.caption("旧ロジック一式はVer.6.16として別ファイル保存。Ver.7では実トレードに必要な処理だけを優先し、重い逆算探索・旧バックテスト画面は実行しません。")
 
 # ------------------------------------------------------------
 # ① 実トレード入力を最上部に集約
@@ -1921,7 +1921,7 @@ if st.button("▶️ ストキャス判定を更新", type="primary", use_contai
         tv_quotes, _tv_diag = tradingview_batch_quotes(tuple(analysis_tickers))
         TRADINGVIEW_QUOTES_CACHE.clear()
         TRADINGVIEW_QUOTES_CACHE.update(tv_quotes)
-        # Ver.17は5年分を毎回取らず、ストキャス判定に十分な1年だけ取得。
+        # Ver.7は5年分を毎回取らず、ストキャス判定に十分な1年だけ取得。
         data = {t: stock_data(t, years=1) for t in analysis_tickers}
         data = {t:d for t,d in data.items() if d is not None and not d.empty}
     st.session_state["v617_data"] = data
@@ -2020,7 +2020,103 @@ else:
     else:
         st.info("現在、%K≤20のゴールデンクロスに一致する買い候補はありません。")
 
-    st.caption(f"取得成功：{len(data)}/{len(analysis_tickers)}銘柄。Ver.17では市場・海外・ファンダメンタル・逆算探索を毎回走らせず、ストキャス実運用へ処理を集中しています。")
+    # 全処理ZIP用に、今回画面へ表示した結果を保存
+    st.session_state["v7_buy_view"] = buy_view.copy() if buy_signal_rows else pd.DataFrame()
+    st.session_state["v7_sell_view"] = sell_view.copy() if sell_signal_rows else pd.DataFrame()
+
+    latest_stoch_rows = []
+    for t, df0 in data.items():
+        sx = stoch_prepare_light(df0, 14, 3, 3)
+        if sx.empty:
+            continue
+        r = sx.iloc[-1]
+        px = safe_float(r.get("Close"))
+        sk = safe_float(r.get("STOCH_K"))
+        sd = safe_float(r.get("STOCH_D"))
+        c = code(t)
+        latest_stoch_rows.append({
+            "コード": c,
+            "銘柄名": name(t),
+            "現在株価": px,
+            "%K": sk,
+            "%D": sd,
+            "GC": bool(r.get("STOCH_GC", False)),
+            "DC": bool(r.get("STOCH_DC", False)),
+            "保有中": c in held_code_set,
+        })
+    st.session_state["v7_latest_stoch"] = pd.DataFrame(latest_stoch_rows)
+
+    st.caption(f"取得成功：{len(data)}/{len(analysis_tickers)}銘柄。Ver.7では市場・海外・ファンダメンタル・逆算探索を毎回走らせず、ストキャス実運用へ処理を集中しています。")
+
+# ------------------------------------------------------------
+# ③ 全処理結果ZIP
+# ------------------------------------------------------------
+st.header("③ 📦 全処理結果ZIP")
+
+holdings_export_rows = []
+for c, v in confirmed.items():
+    holdings_export_rows.append({
+        "コード": c,
+        "銘柄名": STOCK_NAMES.get(c, c),
+        "株数": int(v.get("shares", 0)),
+        "取得単価": safe_float(v.get("avg_price", np.nan)),
+        "口座": str(v.get("account_types", "")),
+        "データ元": str(v.get("source", "SBI約定履歴CSV")),
+    })
+holdings_export_df = pd.DataFrame(holdings_export_rows)
+
+summary_export_df = pd.DataFrame([{
+    "バージョン": VERSION,
+    "ビルド": BUILD,
+    "処理日時JST": tokyo_now().strftime("%Y-%m-%d %H:%M:%S"),
+    "買付余力円": int(buying_power),
+    "現在保有銘柄数": len(held_codes),
+    "約定明細件数": len(sbi_trades_df),
+    "分析対象銘柄数": len(analysis_tickers),
+    "取得成功銘柄数": len(data),
+    "BUY条件": "Slow Stochastic 14,3,3 / %K<=20 GC",
+    "SELL条件": f"Stochastic DC + 損切りセンサー -{float(sl):.1f}%",
+}])
+
+settings_export_df = pd.DataFrame([{
+    "現在資産円": int(current_assets),
+    "1銘柄最大購入額円": int(maxbuy),
+    "損切りセンサー%": float(sl),
+    "最大保有銘柄数": int(maxpos),
+    "現金温存率%": int(reserve_pct),
+    "1日使用上限%": int(daily_deploy_pct),
+    "1銘柄許容損失_資産比%": float(risk_per_trade_pct),
+    "価格上振れバッファ%": float(price_buffer_pct),
+    "保有銘柄買い増し許可": bool(allow_addon),
+}])
+
+zip_files = {
+    "00_summary.csv": summary_export_df,
+    "01_buy_candidates.csv": st.session_state.get("v7_buy_view", pd.DataFrame()),
+    "02_sell_candidates.csv": st.session_state.get("v7_sell_view", pd.DataFrame()),
+    "03_holdings.csv": holdings_export_df,
+    "04_sbi_trade_history.csv": sbi_trades_df.drop(columns=["_dedupe_key", "_source_order"], errors="ignore"),
+    "05_sbi_history_warnings.csv": sbi_warning_df,
+    "06_latest_stochastic.csv": st.session_state.get("v7_latest_stoch", pd.DataFrame()),
+    "07_settings.csv": settings_export_df,
+    "08_analysis_universe.csv": pd.DataFrame({"コード": analysis_codes}),
+}
+
+zip_buf = io.BytesIO()
+with ZipFile(zip_buf, "w") as zf:
+    for fn, df in zip_files.items():
+        zf.writestr(fn, csv_bytes(df if isinstance(df, pd.DataFrame) else pd.DataFrame()))
+zip_buf.seek(0)
+
+st.download_button(
+    "📦 Ver.7 全処理結果ZIPをダウンロード",
+    zip_buf.getvalue(),
+    "ver7_all_analysis.zip",
+    "application/zip",
+    use_container_width=True,
+    key="v7_all_results_zip",
+)
+st.caption("朝の入力・現在保有・BUY/SELL候補・参考S株数・最新ストキャス値・設定値をまとめて保存します。")
 
 st.divider()
-st.caption("RC6.17は売買判断補助です。自動発注は行いません。旧RC6.16は別ファイルで保存し、比較・復元できるようにしています。")
+st.caption("Ver.7は売買判断補助です。自動発注は行いません。旧Ver.6.16は別ファイルで保存し、比較・復元できるようにしています。")

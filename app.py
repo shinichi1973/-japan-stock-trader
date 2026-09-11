@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.17 STOCH S-SHARE GUIDE"
-BUILD = "VER6.0-RC6.17-STOCH-S-SHARE-HOLDING-SELL-20260911"
+VERSION = "6.0 RC6.17 STOCH MAIN"
+BUILD = "VER6.0-RC6.17-STOCH-MAIN-LIGHT-20260911"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1776,57 +1776,14 @@ def build_purchase_plan(candidates, buying_power, current_assets, held_codes, ma
 
     return pd.DataFrame(rows, columns=cols)
 
-# ------------------------------------------------------------
-# サイドバー
-# ------------------------------------------------------------
-with st.sidebar:
-    st.header("⚙️ Ver.6.0設定")
-    initial = st.number_input("バックテスト初期資金（円）", 10000, 200000000, 600000, 10000)
-    current_assets = st.number_input("現在資産（円）", 10000, 200000000, 600000, 10000)
-    target_assets = st.number_input("最終目標資産（円）", 1000000, 1000000000, 100000000, 1000000)
 
-    st.subheader("短期売買")
-    maxpos = st.number_input("最大保有銘柄数", 1, 50, 10)
-    maxbuy = st.number_input("1銘柄最大購入額（円）", 1000, 20000000, 100000, 1000)
-    sl = st.slider("基本損切り（%）", 3.0, 15.0, 7.0, .5)
-    tp = st.slider("利確目安（%）", 8.0, 50.0, 15.0, 1.0)
-    rlo = st.slider("RSI下限", 25, 60, 40)
-    rhi = st.slider("RSI上限", 60, 80, 70)
-    mintech = st.slider("最低テクニカルスコア", 60, 95, 75)
-    minbuy_score = st.slider("BUY最低AIスコア", 70, 95, 80)
-    max_gap = st.slider("翌営業日寄付ギャップ許容（%）", 1.0, 10.0, 5.0, .5)
-
-    st.subheader("購入株数・資金管理")
-    reserve_pct = st.slider("買付余力の現金温存率（%）", 0, 80, 20, 5)
-    daily_deploy_pct = st.slider("1日に使う余力上限（%）", 10, 100, 50, 5)
-    risk_per_trade_pct = st.slider("1銘柄の許容損失（総資産比%）", 0.25, 3.0, 1.0, 0.25)
-    price_buffer_pct = st.slider("寄付価格上振れバッファ（%）", 0.0, 10.0, 3.0, .5)
-    allow_addon = st.checkbox("保有銘柄への買い増しを許可", False)
-
-    st.subheader("連敗ブレーキ")
-    cooldown = st.number_input("4連敗後のBUY停止日数", 5, 30, 10)
-    risk_cooldown = st.number_input("9連敗後のBUY停止日数", 5, 45, 15)
-    severe_cooldown = st.number_input("10連敗後のBUY停止日数", 10, 60, 20)
-
-    use_liq = st.checkbox("流動性TOP50を使用", True)
-    no_trade_on_bad_market = st.checkbox("市場悪化時はNO TRADE", True)
-
-    st.subheader("分析対象")
-    universe_text = st.text_area("分析対象銘柄コード", DEFAULT_UNIVERSE, height=130)
-
-# ------------------------------------------------------------
-# メイン
-# ------------------------------------------------------------
-st.title("📈 日本株 AI投資アシスタント Ver.6.0")
-st.caption(f"BUILD: {BUILD}")
-
-
-
-# ------------------------------------------------------------
-# RC6.13 TEST：ストキャスティクスGC単独バックテスト
-# ------------------------------------------------------------
-def _stoch_prepare(df, k_period=14, k_smooth=3, d_period=3):
-    """Slow Stochastic %K/%D とGC/DCを、当日までのOHLCだけで計算する。"""
+# ============================================================
+# RC6.17 MAIN — ストキャスティクス実運用版
+# ============================================================
+def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
+    """Slow Stochastic 14,3,3。RC6.16で採用したBUY/SELL判定専用。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
     x = df.copy().sort_index()
     low_n = x["Low"].rolling(int(k_period), min_periods=int(k_period)).min()
     high_n = x["High"].rolling(int(k_period), min_periods=int(k_period)).max()
@@ -1838,2267 +1795,232 @@ def _stoch_prepare(df, k_period=14, k_smooth=3, d_period=3):
     x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
     return x
 
-
-def _next_trading_date(df, dt):
-    idx = df.index
-    pos = idx.searchsorted(pd.Timestamp(dt), side="right")
-    return idx[pos] if pos < len(idx) else None
-
-
-def _stoch_backtest(data_map, exit_mode, initial_cash=600000.0, max_positions=5,
-                    max_buy=120000.0, tp_pct=15.0, sl_pct=7.0, hold_days=10,
-                    k_period=14, k_smooth=3, d_period=3, entry_k_max=None,
-                    signal_start_date=None, signal_end_date=None):
-    """
-    Entry: Slow Stoch GC確定日の次営業日寄付。
-    Exit : DC / TP-SL / 固定保有日数のいずれか。
-    BUY選定には他のAI・RSI・MA・市場環境を一切使用しない。
-    """
-    prepared = {t:_stoch_prepare(df, k_period, k_smooth, d_period) for t,df in data_map.items() if not df.empty}
-    all_dates = sorted(set(dt for df in prepared.values() for dt in df.index))
-    cash = float(initial_cash)
-    pos = {}
-    pending_buy = {}
-    pending_sell = {}
-    trades = []
-    equity_rows = []
-
-    for dt in all_dates:
-        # 予約SELLを寄付で執行（DC・固定保有）
-        for t, reason in list(pending_sell.pop(dt, [])):
-            if t not in pos or t not in prepared or dt not in prepared[t].index:
-                continue
-            row = prepared[t].loc[dt]
-            px = float(row["Open"])
-            q = pos[t]["shares"]
-            pnl = (px-pos[t]["entry"])*q
-            pnl_pct = (px/pos[t]["entry"]-1)*100
-            cash += px*q
-            trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":px,"株数":q,
-                           "損益":pnl,"損益率":pnl_pct,"理由":reason,"シグナル日":pos[t].get("exit_signal_date",pd.NaT),
-                           "%K":float(row.get("STOCH_K",np.nan)),"%D":float(row.get("STOCH_D",np.nan))})
-            del pos[t]
-
-        # 予約BUYを寄付で執行
-        todays = sorted(pending_buy.pop(dt, []), key=lambda z:(z["k"], z["ticker"]))
-        for order in todays:
-            t = order["ticker"]
-            if t in pos or t not in prepared or dt not in prepared[t].index or len(pos) >= int(max_positions):
-                continue
-            px = float(prepared[t].loc[dt,"Open"])
-            budget = min(float(max_buy), cash)
-            q = int(budget/px)
-            if q <= 0:
-                continue
-            cost = q*px
-            cash -= cost
-            pos[t] = {"entry":px,"shares":q,"entry_date":dt,"bars":0,"exit_signal_date":pd.NaT}
-            trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":px,"株数":q,
-                           "損益":0.0,"損益率":0.0,"理由":"Slow Stochastic GC（翌営業日寄付）",
-                           "シグナル日":order["signal_date"],"%K":order["k"],"%D":order["d"]})
-
-        # 保有中を評価
-        for t in list(pos):
-            if t not in prepared or dt not in prepared[t].index:
-                continue
-            row = prepared[t].loc[dt]
-            if dt < pos[t]["entry_date"]:
-                continue
-            pos[t]["bars"] += 1
-            entry = pos[t]["entry"]
-            q = pos[t]["shares"]
-
-            if exit_mode == "TP/SL":
-                stop_px = entry*(1-float(sl_pct)/100)
-                take_px = entry*(1+float(tp_pct)/100)
-                hit_sl = float(row["Low"]) <= stop_px
-                hit_tp = float(row["High"]) >= take_px
-                if hit_sl or hit_tp:
-                    # 同一日に両方到達した場合は保守的に損切り優先
-                    px = stop_px if hit_sl else take_px
-                    reason = (f"損切り -{sl_pct:.1f}%" if hit_sl else f"利確 +{tp_pct:.1f}%")
-                    pnl = (px-entry)*q
-                    pnl_pct = (px/entry-1)*100
-                    cash += px*q
-                    trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":px,"株数":q,
-                                   "損益":pnl,"損益率":pnl_pct,"理由":reason,"シグナル日":dt,
-                                   "%K":float(row.get("STOCH_K",np.nan)),"%D":float(row.get("STOCH_D",np.nan))})
-                    del pos[t]
-                    continue
-
-            elif exit_mode == "DC" and bool(row.get("STOCH_DC",False)):
-                nd = _next_trading_date(prepared[t], dt)
-                if nd is not None:
-                    pos[t]["exit_signal_date"] = dt
-                    pending_sell.setdefault(nd,[]).append((t,"Slow Stochastic DC（翌営業日寄付）"))
-
-            elif exit_mode == "10日保有" and pos[t]["bars"] >= int(hold_days):
-                nd = _next_trading_date(prepared[t], dt)
-                if nd is not None:
-                    pos[t]["exit_signal_date"] = dt
-                    pending_sell.setdefault(nd,[]).append((t,f"{int(hold_days)}営業日保有後（翌営業日寄付）"))
-
-        # GC検出 → 次営業日BUY予約
-        for t,df in prepared.items():
-            if t in pos or dt not in df.index:
-                continue
-            r = df.loc[dt]
-            if not bool(r.get("STOCH_GC",False)) or not np.isfinite(r.get("STOCH_K",np.nan)):
-                continue
-            # 比較検証用：GC発生時のSlow %K位置だけを切り分ける。Noneは制限なし。
-            if entry_k_max is not None and float(r["STOCH_K"]) > float(entry_k_max):
-                continue
-            # OOS検証用：シグナル発生日を期間内に限定する。
-            if signal_start_date is not None and pd.Timestamp(dt) < pd.Timestamp(signal_start_date):
-                continue
-            if signal_end_date is not None and pd.Timestamp(dt) > pd.Timestamp(signal_end_date):
-                continue
-            nd = _next_trading_date(df, dt)
-            if nd is None:
-                continue
-            pending_buy.setdefault(nd,[]).append({"ticker":t,"signal_date":dt,
-                                                  "k":float(r["STOCH_K"]),"d":float(r["STOCH_D"])})
-
-        # 時価評価
-        mv = 0.0
-        for t,p0 in pos.items():
-            df = prepared[t]
-            if dt in df.index:
-                px = float(df.loc[dt,"Close"])
-            else:
-                prev = df.loc[df.index<=dt]
-                px = float(prev.iloc[-1]["Close"]) if not prev.empty else p0["entry"]
-            mv += px*p0["shares"]
-        equity_rows.append({"日付":dt,"現金":cash,"保有時価":mv,"総資産":cash+mv})
-
-    tr = pd.DataFrame(trades)
-    eq = pd.DataFrame(equity_rows)
-    return tr,eq
-
-
-def _slice_stoch_data(data_map, start_date=None, end_date=None, warmup_calendar_days=120):
-    """ストキャスOOS用。開始前にウォームアップ期間を残し、終了日は切る。"""
-    out = {}
-    start_ts = pd.Timestamp(start_date) if start_date is not None else None
-    end_ts = pd.Timestamp(end_date) if end_date is not None else None
-    warm_start = start_ts - pd.Timedelta(days=int(warmup_calendar_days)) if start_ts is not None else None
-    for t, df in data_map.items():
-        if df is None or df.empty:
-            continue
-        d = df.copy()
-        if warm_start is not None:
-            d = d[d.index >= warm_start]
-        if end_ts is not None:
-            d = d[d.index <= end_ts]
-        if not d.empty:
-            d.attrs.update(getattr(df, "attrs", {}))
-            out[t] = d
-    return out
-
-
-def _stoch_rank_score(metrics):
-    """学習期間だけで順位付けする保守的スコア。OOS値は一切使用しない。"""
-    pf_ = min(float(metrics.get("PF", 0.0)), 3.0)
-    ret_ = float(metrics.get("損益率%", 0.0))
-    dd_ = abs(float(metrics.get("最大DD%", 0.0)))
-    n_ = int(metrics.get("決済数", 0))
-    sample_penalty = 0.0 if n_ >= 80 else (80 - n_) * 0.25
-    return ret_ + (pf_ - 1.0) * 35.0 - dd_ * 0.6 - sample_penalty
-
-
-def _stoch_metrics(tr, eq, initial_cash):
-    sells = tr[tr["売買"]=="SELL"].copy() if not tr.empty else pd.DataFrame()
-    final = float(eq.iloc[-1]["総資産"]) if not eq.empty else float(initial_cash)
-    profit = final-float(initial_cash)
-    ret = profit/float(initial_cash)*100 if initial_cash else 0.0
-    wins = int((sells["損益"]>0).sum()) if not sells.empty else 0
-    n = len(sells)
-    winrate = wins/n*100 if n else 0.0
-    gp = float(sells.loc[sells["損益"]>0,"損益"].sum()) if n else 0.0
-    gl = abs(float(sells.loc[sells["損益"]<0,"損益"].sum())) if n else 0.0
-    pf = gp/gl if gl>0 else (9.99 if gp>0 else 0.0)
-    if not eq.empty:
-        curve = eq["総資産"].astype(float)
-        peak = curve.cummax()
-        dd = (curve/peak-1)*100
-        maxdd = float(dd.min())
-    else:
-        maxdd = 0.0
-    avg = float(sells["損益率"].mean()) if n else 0.0
-    return {"初期資金":float(initial_cash),"最終資産":final,"損益":profit,"損益率%":ret,
-            "決済数":n,"勝率%":winrate,"PF":pf,"最大DD%":maxdd,"平均1トレード%":avg}
-
-
-
+st.title("📉 日本株 AI投資アシスタント Ver.6.17")
+st.caption(f"{VERSION} / BUILD: {BUILD}")
+st.success("メインロジック：AI選定TOP50 × Slow Stochastic 14,3,3｜BUY=%K≤20のGC｜SELL=DC＋損切りセンサー")
+st.caption("旧ロジック一式はRC6.16として別ファイル保存。Ver.6.17では実トレードに必要な処理だけを優先し、重い逆算探索・旧バックテスト画面は実行しません。")
 
 # ------------------------------------------------------------
-# RC6.16 TEST：ストキャスSELL深掘り + 70/30 OOS
-# BUYは %K<=20 GC に固定。SELLはDC発生時の%K下限を探索する。
+# ① 実トレード入力を最上部に集約
 # ------------------------------------------------------------
-def _stoch_sell_threshold_backtest(
-    data_map, initial_cash=600000.0, max_positions=5, max_buy=120000.0,
-    entry_k_max=20.0, sell_k_min=0.0,
-    k_period=14, k_smooth=3, d_period=3,
-    signal_start_date=None, signal_end_date=None, force_close_end=True,
-):
-    """
-    Entry: Slow Stoch GC かつ %K<=entry_k_max を終値で確認し、翌営業日寄付でBUY。
-    Exit : Slow Stoch DC かつ %K>=sell_k_min を終値で確認し、翌営業日寄付でSELL。
-    sell_k_min=0 は「DCなら位置を問わず売却」。
-    BUY/SELLの判定にAI・MA・RSI・出来高・市場/海外フィルターは使わない。
-    """
-    prepared={t:_stoch_prepare(df,k_period,k_smooth,d_period) for t,df in data_map.items() if df is not None and not df.empty}
-    all_dates=sorted(set(dt for df in prepared.values() for dt in df.index))
-    cash=float(initial_cash); pos={}; pending_buy={}; pending_sell={}; trades=[]; equity_rows=[]
+st.header("① 朝の入力 — 取引履歴と買付余力")
+st.caption("この2項目を近くにまとめました。入力後、そのまま下のストキャス判定へ進みます。")
+input_left, input_right = st.columns([1.35, 1.0], gap="large")
 
-    for dt in all_dates:
-        # 前日までに確定したSELLを寄付で執行
-        for t,reason,sig_k,sig_d,sig_dt in list(pending_sell.pop(dt, [])):
-            if t not in pos or t not in prepared or dt not in prepared[t].index:
-                continue
-            row=prepared[t].loc[dt]; px=float(row["Open"]); q=pos[t]["shares"]
-            pnl=(px-pos[t]["entry"])*q; pnl_pct=(px/pos[t]["entry"]-1.0)*100.0
-            cash += px*q
-            trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":px,"株数":q,
-                           "損益":pnl,"損益率":pnl_pct,"理由":reason,"シグナル日":sig_dt,
-                           "%K":sig_k,"%D":sig_d,"未来情報使用":False})
-            del pos[t]
-
-        # 前日までに確定したBUYを寄付で執行
-        todays=sorted(pending_buy.pop(dt, []), key=lambda z:(z["k"],z["ticker"]))
-        for order in todays:
-            t=order["ticker"]
-            if t in pos or t not in prepared or dt not in prepared[t].index or len(pos)>=int(max_positions):
-                continue
-            px=float(prepared[t].loc[dt,"Open"]); budget=min(float(max_buy),cash); q=int(budget/px)
-            if q<=0: continue
-            cash -= q*px
-            pos[t]={"entry":px,"shares":q,"entry_date":dt}
-            trades.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":px,"株数":q,
-                           "損益":0.0,"損益率":0.0,"理由":f"Stoch GC %K<={entry_k_max:g}（翌営業日寄付）",
-                           "シグナル日":order["signal_date"],"%K":order["k"],"%D":order["d"],"未来情報使用":False})
-
-        # 当日終値でSELLシグナル判定
-        for t in list(pos):
-            if t not in prepared or dt not in prepared[t].index: continue
-            r=prepared[t].loc[dt]; sk=safe_float(r.get("STOCH_K")); sd=safe_float(r.get("STOCH_D"))
-            if not bool(r.get("STOCH_DC",False)) or not np.isfinite(sk):
-                continue
-            if float(sk) < float(sell_k_min):
-                continue
-            if signal_start_date is not None and pd.Timestamp(dt)<pd.Timestamp(signal_start_date):
-                continue
-            if signal_end_date is not None and pd.Timestamp(dt)>pd.Timestamp(signal_end_date):
-                continue
-            nd=_next_trading_date(prepared[t],dt)
-            if nd is not None:
-                reason=("Stoch DC（位置制限なし）" if float(sell_k_min)<=0 else f"Stoch DC %K>={float(sell_k_min):g}") + "（翌営業日寄付）"
-                pending_sell.setdefault(nd,[]).append((t,reason,float(sk),float(sd) if np.isfinite(sd) else np.nan,dt))
-
-        # 当日終値でBUYシグナル判定
-        for t,df in prepared.items():
-            if t in pos or dt not in df.index: continue
-            r=df.loc[dt]; sk=safe_float(r.get("STOCH_K")); sd=safe_float(r.get("STOCH_D"))
-            if not bool(r.get("STOCH_GC",False)) or not np.isfinite(sk) or float(sk)>float(entry_k_max):
-                continue
-            if signal_start_date is not None and pd.Timestamp(dt)<pd.Timestamp(signal_start_date):
-                continue
-            if signal_end_date is not None and pd.Timestamp(dt)>pd.Timestamp(signal_end_date):
-                continue
-            nd=_next_trading_date(df,dt)
-            if nd is not None:
-                pending_buy.setdefault(nd,[]).append({"ticker":t,"signal_date":dt,"k":float(sk),"d":float(sd) if np.isfinite(sd) else np.nan})
-
-        mv=0.0
-        for t,p0 in pos.items():
-            df=prepared[t]
-            prev=df.loc[df.index<=dt]
-            px=float(prev.iloc[-1]["Close"]) if not prev.empty else p0["entry"]
-            mv += px*p0["shares"]
-        equity_rows.append({"日付":dt,"現金":cash,"保有時価":mv,"総資産":cash+mv})
-
-    # 比較時に未決済ポジションが成績を歪めないよう期間末終値で評価決済
-    if force_close_end and all_dates and pos:
-        last_dt=all_dates[-1]
-        for t in list(pos):
-            df=prepared[t]; prev=df.loc[df.index<=last_dt]
-            if prev.empty: continue
-            px=float(prev.iloc[-1]["Close"]); q=pos[t]["shares"]; pnl=(px-pos[t]["entry"])*q; pct=(px/pos[t]["entry"]-1)*100
-            cash += px*q
-            trades.append({"日付":last_dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":px,"株数":q,
-                           "損益":pnl,"損益率":pct,"理由":"期間末評価決済","シグナル日":last_dt,
-                           "%K":safe_float(prev.iloc[-1].get("STOCH_K")),"%D":safe_float(prev.iloc[-1].get("STOCH_D")),"未来情報使用":False})
-            del pos[t]
-        if equity_rows:
-            equity_rows[-1]["現金"]=cash; equity_rows[-1]["保有時価"]=0.0; equity_rows[-1]["総資産"]=cash
-
-    return pd.DataFrame(trades),pd.DataFrame(equity_rows)
-
-
-def _sell_rank_for_profit(metrics):
-    """学習期間の利益を最優先。極端に少ない決済数には罰則を付ける。"""
-    ret=float(metrics.get("損益率%",0.0)); pf_=float(metrics.get("PF",0.0)); dd=abs(float(metrics.get("最大DD%",0.0))); n=int(metrics.get("決済数",0))
-    sample_penalty=max(0,40-n)*0.75
-    return ret + min(pf_,3.0)*2.0 - dd*0.05 - sample_penalty
-
-
-# ------------------------------------------------------------
-# RC6.15 TEST：BUY入口3方式の同条件直接比較
-# ① RC6.12 BUYシグナル ② Stoch %K<=20 GC ③ 両方一致
-# 出口・資金条件は共通化して「入口の差」だけを見る。
-# ------------------------------------------------------------
-def _entry_signal_comparison_backtest(
-    data_map, mode, market_df, overseas_df, liq_codes_set, held_codes_set,
-    initial_cash=600000.0, max_positions=5, max_buy=120000.0,
-    take_profit_pct=15.0, stop_loss_pct=7.0,
-    rsi_low=40, rsi_high=70, min_tech=75, min_ai=80,
-    max_gap_pct=5.0, use_liquidity=True, no_trade_bad_market=True,
-    cooldown_days=10, risk_cooldown_days=15, severe_cooldown_days=20,
-    stoch_k_max=20.0,
-):
-    """BUY入口だけを変え、出口と資金配分を共通化した比較用バックテスト。"""
-    mode = str(mode)
-    if mode not in {"RC6.12", "STOCH20", "COMBINED"}:
-        raise ValueError(f"unknown comparison mode: {mode}")
-
-    prepared = {t: _stoch_prepare(df, 14, 3, 3) for t, df in data_map.items() if df is not None and not df.empty}
-    dates = sorted(set(dt for df in prepared.values() for dt in df.index))
-    cash = float(initial_cash)
-    pos = {}
-    trades = []
-    equity = []
-    pending = {}
-    pending_tickers = set()
-
-    stats_cmp = {t:{"trades":0,"wins":0,"gp":0.0,"gl":0.0,"recent_losses":0} for t in prepared}
-    losses_cmp = 0
-    block_until_cmp = None
-    severe_block_until_cmp = None
-
-    for dt in dates:
-        # 前営業日終値で確定したBUYを翌営業日寄付で約定。
-        for order in pending.pop(dt, []):
-            t = order["ticker"]
-            pending_tickers.discard(t)
-            if t not in prepared or dt not in prepared[t].index or t in pos:
-                continue
-            r = prepared[t].loc[dt]
-            open_px = safe_float(r.get("Open"))
-            signal_close = float(order.get("signal_close", np.nan))
-            gap = (open_px/signal_close-1.0)*100 if np.isfinite(open_px) and signal_close > 0 else 999.0
-            if not np.isfinite(open_px) or open_px <= 0 or abs(gap) > float(max_gap_pct):
-                continue
-            if len(pos) >= int(max_positions):
-                continue
-            # 全3方式で同じ1銘柄上限を使用し、AI点数によるサイズ差を作らない。
-            budget = min(float(max_buy), cash)
-            shares = int(budget / open_px)
-            if shares <= 0:
-                continue
-            cost = shares * open_px
-            if cost > cash:
-                continue
-            cash -= cost
-            pos[t] = {"entry":open_px,"shares":shares,"entry_date":dt}
-            trades.append({
-                "日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY","価格":open_px,"株数":shares,
-                "損益":0.0,"損益率":0.0,"理由":order["reason"],"シグナル日":order["signal_date"],
-                "寄付ギャップ率":gap,"未来情報使用":False,
-                "テクニカルスコア":order.get("ts",np.nan),"総合AIスコア":order.get("score",np.nan),
-                "STOCH_K":order.get("stoch_k",np.nan),"STOCH_D":order.get("stoch_d",np.nan),
-            })
-
-        # 共通出口：+TP / -SL。両方同日到達時は保守的にSL優先。
-        for t in list(pos):
-            if dt not in prepared[t].index:
-                continue
-            r = prepared[t].loc[dt]
-            q = pos[t]
-            entry = float(q["entry"])
-            sh = int(q["shares"])
-            hi = safe_float(r.get("High"))
-            lo = safe_float(r.get("Low"))
-            close_px = safe_float(r.get("Close"))
-            tp_px = entry * (1.0 + float(take_profit_pct)/100.0)
-            sl_px = entry * (1.0 - float(stop_loss_pct)/100.0)
-            hit_sl = np.isfinite(lo) and lo <= sl_px
-            hit_tp = np.isfinite(hi) and hi >= tp_px
-            exit_px = None
-            exit_reason = None
-            if hit_sl:
-                exit_px = sl_px
-                exit_reason = f"共通SL -{float(stop_loss_pct):g}%"
-            elif hit_tp:
-                exit_px = tp_px
-                exit_reason = f"共通TP +{float(take_profit_pct):g}%"
-            if exit_px is not None:
-                pnl = (exit_px-entry)*sh
-                pct = (exit_px/entry-1.0)*100.0
-                cash += exit_px*sh
-                s0 = stats_cmp[t]
-                s0["trades"] += 1
-                if pnl > 0:
-                    s0["wins"] += 1; s0["gp"] += pnl; s0["recent_losses"] = 0; losses_cmp = 0
-                else:
-                    s0["gl"] += abs(pnl); s0["recent_losses"] += 1; losses_cmp += 1
-                    if losses_cmp >= 10:
-                        severe_block_until_cmp = dt + pd.tseries.offsets.BDay(int(severe_cooldown_days))
-                    elif losses_cmp >= 9:
-                        block_until_cmp = dt + pd.tseries.offsets.BDay(int(risk_cooldown_days))
-                    elif losses_cmp >= 4:
-                        block_until_cmp = dt + pd.tseries.offsets.BDay(int(cooldown_days))
-                trades.append({
-                    "日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL","価格":exit_px,"株数":sh,
-                    "損益":pnl,"損益率":pct,"理由":exit_reason,"未来情報使用":False,"連敗数":losses_cmp,
-                })
-                del pos[t]
-
-        # 当日終値でBUY入口を判定。
-        candidates = []
-        blocked_cmp = is_blocked(dt, block_until_cmp, severe_block_until_cmp)
-        for t,d in prepared.items():
-            if dt not in d.index or t in pos or t in pending_tickers:
-                continue
-            r = d.loc[dt]
-            close_px = safe_float(r.get("Close"))
-            if not np.isfinite(close_px) or close_px <= 0:
-                continue
-
-            stoch_gc = bool(r.get("STOCH_GC", False)) and np.isfinite(r.get("STOCH_K", np.nan)) and float(r["STOCH_K"]) <= float(stoch_k_max)
-
-            # RC6.12 BUY判定（現在コードの既存BUYシグナル部分を比較用に再現）。
-            c = code(t)
-            rc_ok = True
-            ts = np.nan; score = np.nan; ms = ""; os_state = ""
-            # 現在のRC6.12比較基準をそのまま再現。通常運用側の条件はこの検証では変更しない。
-            if close_px >= 2000:
-                rc_ok = False
-            if use_liquidity and c not in liq_codes_set and c not in held_codes_set and c != "6085":
-                rc_ok = False
-            if rc_ok:
-                try:
-                    ts = tech(r, int(rsi_low), int(rsi_high))
-                except Exception:
-                    ts = 0.0
-                if ts < float(min_tech):
-                    rc_ok = False
-            if rc_ok:
-                hc = confidence(stats_cmp[t]) * recent_loss_penalty(stats_cmp[t])
-                hp = conf_points(hc)
-                ms, mp, mf = market_info(market_df, dt)
-                os0 = overseas_snapshot(overseas_df, dt)
-                qfactor, qblock, _, _, _, _ = stock_quality(stats_cmp[t])
-                base = ts*.55 + hp*.30 + mp*.15
-                raw = float(np.clip(base*qfactor,0,100))
-                score = raw * os0["海外為替係数"]
-                os_state = os0["海外為替判定"]
-                threshold = 86 if ms in ["⚪ 中立","🟠 やや弱気","🔴 弱気"] else 82 if ms == "🟡 やや強気" else 80
-                if qblock or score < float(min_ai) or score < threshold or os0["海外為替係数"] < .50:
-                    rc_ok = False
-                if no_trade_bad_market and mf <= 0:
-                    rc_ok = False
-                if blocked_cmp:
-                    rc_ok = False
-
-            signal_ok = rc_ok if mode == "RC6.12" else stoch_gc if mode == "STOCH20" else (rc_ok and stoch_gc)
-            if not signal_ok:
-                continue
-            # 共通出口なので候補順位だけは、RC系はAI点数、ストキャス単独は売られ過ぎの強さで並べる。
-            priority = float(score) if mode in {"RC6.12","COMBINED"} and np.isfinite(score) else (100.0-float(r["STOCH_K"]))
-            candidates.append((priority,t,ts,score,float(r.get("STOCH_K",np.nan)),float(r.get("STOCH_D",np.nan))))
-
-        candidates.sort(key=lambda x:x[0], reverse=True)
-        free_slots = max(int(max_positions)-len(pos)-len(pending_tickers), 0)
-        for _,t,ts,score,sk,sd in candidates[:free_slots]:
-            nxt = _next_trading_date(prepared[t], dt)
-            if nxt is None:
-                continue
-            label = {"RC6.12":"RC6.12 BUYシグナル","STOCH20":"Stoch GC %K≤20","COMBINED":"RC6.12 + Stoch GC %K≤20"}[mode]
-            pending.setdefault(nxt,[]).append({
-                "ticker":t,"signal_date":dt,"signal_close":float(prepared[t].loc[dt,"Close"]),
-                "reason":label+"（翌営業日寄付）","ts":ts,"score":score,"stoch_k":sk,"stoch_d":sd,
-            })
-            pending_tickers.add(t)
-
-        hv = 0.0
-        for t,q in pos.items():
-            if dt in prepared[t].index:
-                cp = safe_float(prepared[t].loc[dt].get("Close"))
-                if np.isfinite(cp):
-                    hv += cp*int(q["shares"])
-        equity.append({"日付":dt,"現金":cash,"保有株評価額":hv,"総資産":cash+hv,"保有銘柄数":len(pos)})
-
-    tr = pd.DataFrame(trades)
-    eq = pd.DataFrame(equity)
-    return tr, eq
-
-# ------------------------------------------------------------
-# 画面タブ：通常運用と1億円逆算検証を完全分離
-# ------------------------------------------------------------
-tab_normal, tab_reverse, tab_stoch = st.tabs([
-    "📈 通常運用・RC6.12",
-    "🧬 1億円逆算・検証",
-    "📉 ストキャスGC単独検証",
-])
-
-with tab_normal:
-    st.info(
-        "Ver.5.5系を土台に、企業価値AI・テンバガーAI・保有銘柄AI・損切り/資金管理を維持し、"
-        "保有銘柄はSBI証券『約定履歴CSV』から自動復元し、買付余力からS株の購入株数まで計算します。"
-        "RC6.12では通常運用と1億円逆算検証を上部タブで分離し、通常売買ロジックへ検証条件を混在させません。"
-        "有料APIを使わず、TradingView公開スキャナーから東証銘柄を一括取得します。"
-        "個別サイトへの連続アクセスを避け、みんかぶ・Stooq・Yahoo系は予備経路として残します。"
-        "最新日は元のOHLCV履歴へ追加し、テクニカル指標は一度だけ計算します。"
-        "日経平均を直接取得できない場合に限り、1321.Tの当日騰落率を"
-        "市場判定用の代理データとして使用します。代理使用は画面とCSVに明記し、"
-        "1321.Tも古い場合は売買判定を停止します。"
-    )
-    st.success("📄 保有銘柄：SBI約定履歴CSV / 💴 購入株数：買付余力連動（スクショ/OCR完全除外）")
-
-    # ------------------------------------------------------------
-    # SBI約定履歴CSV
-    # ------------------------------------------------------------
-    st.header("📄 ① SBI約定履歴CSVから現在保有を自動復元")
-    st.caption(
-        "SBI証券『口座管理 → 取引履歴 → 約定履歴』からCSVを保存し、そのままアップロードしてください。"
-        "買付・売却を時系列で相殺し、現在株数と平均取得単価を自動計算します。"
-    )
+with input_left:
+    st.subheader("📄 SBI 約定履歴CSV")
     trade_files = st.file_uploader(
-        "SBI約定履歴CSVを追加",
+        "約定履歴CSVを追加",
         type=["csv"],
         accept_multiple_files=True,
-        key="sbi_execution_csvs"
+        key="sbi_execution_csvs_v617",
     )
 
-    sbi_trades_df = pd.DataFrame()
-    sbi_lots_df = pd.DataFrame()
-    sbi_audit_df = pd.DataFrame()
-    sbi_warning_df = pd.DataFrame()
-    confirmed = {}
-
-    if trade_files:
-        parsed_parts = []
-        parse_errors = []
-        encodings = []
-        for f in trade_files:
-            try:
-                part, enc = parse_sbi_execution_csv(f)
-                if not part.empty:
-                    parsed_parts.append(part)
-                    encodings.append(f"{f.name}: {enc}")
-            except Exception as e:
-                parse_errors.append(f"{f.name}: {e}")
-
-        if parsed_parts:
-            sbi_trades_df = pd.concat(parsed_parts, ignore_index=True)
-            before = len(sbi_trades_df)
-            sbi_trades_df = sbi_trades_df.drop_duplicates("_dedupe_key", keep="first").copy()
-            dupes = before - len(sbi_trades_df)
-            holdings_auto_df, sbi_lots_df, sbi_audit_df, sbi_warning_df = rebuild_holdings_from_trades(sbi_trades_df)
-
-            if not holdings_auto_df.empty:
-                confirmed = {
-                    str(r["code"]): {
-                        "shares": int(r["shares"]),
-                        "avg_price": float(r["avg_price"]),
-                        "source": str(r["source"]),
-                        "account_types": str(r.get("account_types", "")),
-                    }
-                    for _, r in holdings_auto_df.iterrows()
-                }
-                st.session_state["confirmed_holdings"] = confirmed
-            else:
-                st.session_state["confirmed_holdings"] = {}
-
-            dates = sbi_trades_df["約定日"].dropna()
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("約定明細", len(sbi_trades_df))
-            c2.metric("現在保有", len(holdings_auto_df))
-            c3.metric("重複除外", dupes)
-            c4.metric("履歴警告", len(sbi_warning_df))
-            if not dates.empty:
-                st.caption(f"履歴範囲：{dates.min().date()} ～ {dates.max().date()} / " + " / ".join(encodings))
-
-            if not holdings_auto_df.empty:
-                st.subheader("✅ 自動復元した現在保有")
-                display_holdings = holdings_auto_df.rename(columns={
-                    "code":"コード", "name":"銘柄名", "shares":"株数", "avg_price":"取得単価",
-                    "account_types":"預り区分", "history_status":"履歴完全性"
-                })
-                cols = [c for c in ["コード","銘柄名","株数","取得単価","預り区分","履歴完全性"] if c in display_holdings.columns]
-                st.dataframe(display_holdings[cols], use_container_width=True, hide_index=True)
-                st.success(f"🤖 保有AIへ {len(holdings_auto_df)}銘柄を自動登録しました。確認・手入力は不要です。")
-            else:
-                st.warning("CSVから現在保有を復元できませんでした。履歴範囲を確認してください。")
-
-            if not sbi_warning_df.empty:
-                st.error(
-                    "⚠️ 履歴開始前から保有していた可能性のある取引があります。"
-                    "該当銘柄は安全のため保有AIへ自動登録していません。より古い期間を含むCSVで再実行してください。"
-                )
-                st.dataframe(sbi_warning_df, use_container_width=True, hide_index=True)
-
-            with st.expander("🔎 約定履歴からの復元監査ログ"):
-                st.dataframe(sbi_audit_df, use_container_width=True, hide_index=True)
-
-        if parse_errors:
-            st.error("読み込めなかったCSVがあります。\n\n- " + "\n- ".join(parse_errors))
-    else:
-        st.info("SBI約定履歴CSVをアップロードすると、現在保有を自動復元して保有AIへ渡します。")
-        st.session_state["confirmed_holdings"] = {}
-
-    confirmed = st.session_state.get("confirmed_holdings", {}) if trade_files else {}
-    held_codes = list(confirmed.keys())
-    entry_map = {c: float(v["avg_price"]) for c, v in confirmed.items()}
-    share_map = {c: int(v["shares"]) for c, v in confirmed.items()}
-
-    holdings_input_rows = [
-        {
-            "コード": c,
-            "銘柄名": STOCK_NAMES.get(c, c),
-            "株数": int(v["shares"]),
-            "取得単価": float(v["avg_price"]),
-            "預り区分": v.get("account_types", ""),
-            "データ元": v.get("source", "SBI約定履歴CSV自動復元"),
-            "保有AI使用可": "YES",
-        }
-        for c, v in confirmed.items()
-    ]
-    holdings_input_df = pd.DataFrame(holdings_input_rows)
-
-    if held_codes:
-        st.success(f"🤖 保有AI入力：{len(held_codes)}銘柄（CSV自動復元）")
-    else:
-        st.warning("🤖 保有AI入力：0銘柄。SBI約定履歴CSVをアップロードしてください。")
-
-    # ------------------------------------------------------------
-    # SBI買付余力
-    # ------------------------------------------------------------
-    st.header("💴 ② SBI買付余力 / 購入可能資金")
-    st.caption(
-        "SBI『口座管理 → 口座（円建）→ 買付余力』の買付余力を使用します。"
-        "CSV/TXT/HTML/WebArchiveとして保存できた場合は自動読取できます。"
-        "自動読取できない場合も、金額1つだけ入力すれば購入株数を自動計算します。"
-    )
-
+with input_right:
+    st.subheader("💴 SBI 買付余力")
     bp_file = st.file_uploader(
-        "SBI買付余力情報ファイル（任意・スクショ不可）",
+        "余力ファイル（任意）",
         type=["csv", "txt", "html", "htm", "webarchive"],
-        key="sbi_buying_power_file"
+        key="sbi_buying_power_file_v617",
     )
-
+    if "sbi_buying_power_yen_v617" not in st.session_state:
+        st.session_state["sbi_buying_power_yen_v617"] = 0
     detected_buying_power = None
-    buying_power_source = "手入力"
-    bp_parse_error = ""
     if bp_file is not None:
         try:
-            detected_buying_power, _bp_text = extract_buying_power_from_file(bp_file)
-            st.session_state["sbi_buying_power_yen"] = int(detected_buying_power)
-            buying_power_source = f"SBI余力ファイル自動読取: {bp_file.name}"
-            st.success(f"✅ 買付余力を自動取得：¥{int(detected_buying_power):,}")
+            detected_buying_power, _ = extract_buying_power_from_file(bp_file)
+            st.session_state["sbi_buying_power_yen_v617"] = int(detected_buying_power)
+            st.success(f"自動取得：¥{int(detected_buying_power):,}")
         except Exception as e:
-            bp_parse_error = str(e)
-            st.warning(f"買付余力ファイルを自動読取できませんでした：{e}")
-
-    if "sbi_buying_power_yen" not in st.session_state:
-        st.session_state["sbi_buying_power_yen"] = 0
+            st.warning(f"余力自動読取不可：{e}")
     buying_power = st.number_input(
-        "SBI 現物買付余力（円）",
+        "現物買付余力（円）",
         min_value=0,
         max_value=1_000_000_000,
         step=1000,
-        key="sbi_buying_power_yen",
-        help="SBI画面の買付余力を入力。保有銘柄のような複数項目の手入力は不要で、この1項目だけです。"
+        key="sbi_buying_power_yen_v617",
     )
-    if detected_buying_power is None:
-        buying_power_source = "手入力"
 
-    bp_c1, bp_c2, bp_c3 = st.columns(3)
-    bp_c1.metric("買付余力", f"¥{int(buying_power):,}")
-    bp_c2.metric("現金温存", f"{reserve_pct}%")
-    bp_c3.metric("1日使用上限", f"{daily_deploy_pct}%")
+# 約定履歴 → 現在保有を復元
+confirmed = {}
+sbi_trades_df = pd.DataFrame()
+sbi_warning_df = pd.DataFrame()
+if trade_files:
+    parsed_parts, parse_errors = [], []
+    for f in trade_files:
+        try:
+            part, _enc = parse_sbi_execution_csv(f)
+            if not part.empty:
+                parsed_parts.append(part)
+        except Exception as e:
+            parse_errors.append(f"{f.name}: {e}")
+    if parsed_parts:
+        sbi_trades_df = pd.concat(parsed_parts, ignore_index=True)
+        sbi_trades_df = sbi_trades_df.drop_duplicates("_dedupe_key", keep="first").copy()
+        holdings_auto_df, _lots, _audit, sbi_warning_df = rebuild_holdings_from_trades(sbi_trades_df)
+        if not holdings_auto_df.empty:
+            confirmed = {
+                str(r["code"]): {
+                    "shares": int(r["shares"]),
+                    "avg_price": float(r["avg_price"]),
+                    "source": str(r["source"]),
+                    "account_types": str(r.get("account_types", "")),
+                }
+                for _, r in holdings_auto_df.iterrows()
+            }
+        if parse_errors:
+            st.warning("一部CSVを読めませんでした：\n- " + "\n- ".join(parse_errors))
 
-    # ------------------------------------------------------------
-    # データ取得
-    # ------------------------------------------------------------
-    analysis_codes = list(dict.fromkeys(parse_codes(universe_text) + held_codes))
-    with st.spinner("📡 株価・市場・海外データを取得中…"):
-        analysis_tickers = tickers(",".join(analysis_codes))
-        tv_quotes, tv_endpoint_diagnostics = tradingview_batch_quotes(tuple(analysis_tickers + ["1321.T"]))
+held_codes = list(confirmed.keys())
+summary_a, summary_b, summary_c = st.columns(3)
+summary_a.metric("現在保有", f"{len(held_codes)}銘柄")
+summary_b.metric("買付余力", f"¥{int(buying_power):,}")
+summary_c.metric("約定明細", f"{len(sbi_trades_df)}件")
+
+if confirmed:
+    with st.expander("現在保有を確認", expanded=False):
+        hrows = []
+        for c, v in confirmed.items():
+            hrows.append({"コード":c,"銘柄名":STOCK_NAMES.get(c,c),"株数":v["shares"],"取得単価":v["avg_price"]})
+        st.dataframe(pd.DataFrame(hrows), use_container_width=True, hide_index=True)
+if not sbi_warning_df.empty:
+    st.error("履歴不足の可能性がある銘柄があります。安全のため警告対象は保有復元から除外されています。")
+
+# ------------------------------------------------------------
+# ② 資金管理（普段は触らなくてよい設定）
+# ------------------------------------------------------------
+with st.expander("⚙️ 資金管理・ストキャス設定", expanded=False):
+    s1, s2, s3, s4 = st.columns(4)
+    current_assets = s1.number_input("現在資産（円）", 10000, 200000000, 600000, 10000, key="v617_assets")
+    maxbuy = s2.number_input("1銘柄最大購入額（円）", 1000, 20000000, 100000, 1000, key="v617_maxbuy")
+    sl = s3.slider("損切りセンサー（%）", 3.0, 15.0, 7.0, .5, key="v617_sl")
+    maxpos = s4.number_input("最大保有銘柄数", 1, 50, 10, key="v617_maxpos")
+    p1, p2, p3, p4 = st.columns(4)
+    reserve_pct = p1.slider("現金温存率（%）", 0, 80, 20, 5, key="v617_reserve")
+    daily_deploy_pct = p2.slider("1日使用上限（%）", 10, 100, 50, 5, key="v617_daily")
+    risk_per_trade_pct = p3.slider("1銘柄許容損失（資産比%）", 0.25, 3.0, 1.0, 0.25, key="v617_risk")
+    price_buffer_pct = p4.slider("価格上振れバッファ（%）", 0.0, 10.0, 3.0, .5, key="v617_buffer")
+    allow_addon = st.checkbox("保有銘柄への買い増しを許可", False, key="v617_addon")
+    universe_text = st.text_area(
+        "AI選定TOP50 / 分析対象コード",
+        DEFAULT_UNIVERSE,
+        height=100,
+        key="v617_universe",
+        help="既存のAI選定ユニバース。保有銘柄はCSVから自動追加されます。",
+    )
+
+# ------------------------------------------------------------
+# ③ 軽量データ取得：市場/海外/1億円探索を外し、ストキャスに必要な個別株だけ
+# ------------------------------------------------------------
+st.header("② 今日のストキャス判定")
+analysis_codes = list(dict.fromkeys(parse_codes(universe_text) + held_codes))
+analysis_tickers = tickers(",".join(analysis_codes))
+
+if st.button("▶️ ストキャス判定を更新", type="primary", use_container_width=True, key="v617_run"):
+    with st.spinner("AI選定TOP50＋保有銘柄のストキャスだけを軽量計算中…"):
+        tv_quotes, _tv_diag = tradingview_batch_quotes(tuple(analysis_tickers))
         TRADINGVIEW_QUOTES_CACHE.clear()
         TRADINGVIEW_QUOTES_CACHE.update(tv_quotes)
-        data = {t: stock_data(t) for t in analysis_tickers}
-        data = {t:d for t,d in data.items() if not d.empty}
-        individual_dates = [
-            pd.Timestamp(d.attrs.get("regular_market_date")).normalize()
-            for d in data.values() if pd.notna(d.attrs.get("regular_market_date", pd.NaT))
-        ]
-        expected_market_date = max(individual_dates) if individual_dates else pd.NaT
-        market = market_data(expected_market_date)
-        overseas = overseas_data()
+        # Ver.17は5年分を毎回取らず、ストキャス判定に十分な1年だけ取得。
+        data = {t: stock_data(t, years=1) for t in analysis_tickers}
+        data = {t:d for t,d in data.items() if d is not None and not d.empty}
+    st.session_state["v617_data"] = data
+else:
+    data = st.session_state.get("v617_data", {})
 
-    diagnostic_rows = list(tv_endpoint_diagnostics)
-    for ticker in analysis_tickers:
-        frame = data.get(ticker, pd.DataFrame())
-        latest = pd.NaT if frame.empty else pd.Timestamp(frame.index.max()).normalize()
-        required = pd.NaT if frame.empty else frame.attrs.get("regular_market_date", pd.NaT)
-        required = pd.Timestamp(required).normalize() if pd.notna(required) else pd.NaT
-        source = "取得失敗" if frame.empty else frame.attrs.get("source", "不明")
-        diagnostic_rows.append({
-            "段階":"銘柄別採用結果", "対象":f"{code(ticker)} {name(ticker)}", "取得先":source,
-            "HTTP状態":"-", "結果":("最新" if pd.notna(latest) and pd.notna(required) and latest >= required else "未更新"),
-            "詳細":f"最終日={latest.date() if pd.notna(latest) else 'なし'} / 必要日={required.date() if pd.notna(required) else '不明'} / TV一括={'あり' if ticker in tv_quotes else 'なし'}",
-        })
-    data_source_diagnostics_df = pd.DataFrame(diagnostic_rows)
+if not data:
+    st.info("上の『ストキャス判定を更新』を押すと、買い・売り候補を表示します。")
+else:
+    buy_signal_rows, sell_signal_rows = [], []
+    held_code_set = set(map(str, held_codes))
 
-    freshness_df, market_data_stale, stale_tickers = build_freshness_report(data, market)
-    market_latest_date = pd.NaT if market.empty else pd.Timestamp(market.index.max()).normalize()
-    market_required_date = pd.to_datetime(
-        freshness_df.loc[freshness_df["種別"] == "市場", "基準日"], errors="coerce"
-    ).max() if not freshness_df.empty else pd.NaT
-    market_mode = market.attrs.get("market_mode", "NIKKEI225_DIRECT") if not market.empty else "NO_DATA"
-    market_is_proxy = market_mode == "1321_ETF_PROXY"
-    market_source = market.attrs.get("source", "取得失敗") if not market.empty else "取得失敗"
-    stale_held_tickers = {c + ".T" for c in held_codes} & stale_tickers
+    for t, df0 in data.items():
+        sx = stoch_prepare_light(df0, 14, 3, 3)
+        if sx.empty:
+            continue
+        r = sx.iloc[-1]
+        sk = safe_float(r.get("STOCH_K"))
+        sd = safe_float(r.get("STOCH_D"))
+        px = safe_float(r.get("Close"))
+        c = code(t)
+        if not (np.isfinite(px) and px > 0):
+            continue
 
-    st.success(f"株価データ取得：{len(data)}銘柄")
-    if market_data_stale:
-        st.error(
-            "🔴 DATA STALE：日経平均の最新確定データを確認できません。"
-            "安全のため、本日の新規BUYと保有銘柄のSELL/HOLD判定を停止します。"
-        )
-    elif stale_held_tickers:
-        st.error(
-            "🔴 DATA STALE：一部の保有銘柄が日経平均の最終日まで更新されていません。"
-            "該当銘柄のSELL/HOLD判定を停止します。"
-        )
-    else:
-        latest_label = market_latest_date.date() if pd.notna(market_latest_date) else "不明"
-        if market_is_proxy:
-            st.warning(
-                f"🟡 データ鮮度OK（代理）：日経平均の直接日足が古いため、"
-                f"1321.Tの騰落率で市場判定を補完しました。最終日 {latest_label}"
-            )
-        else:
-            st.success(f"🟢 データ鮮度OK：日経平均・保有銘柄の最終日 {latest_label}")
-
-    with st.expander("🔎 株価データの取得元・最終日"):
-        st.dataframe(freshness_df, use_container_width=True, hide_index=True)
-    with st.expander("🧪 無料データ取得診断"):
-        st.dataframe(data_source_diagnostics_df, use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------------
-    # 目標資産 / 複利ロードマップ
-    # ------------------------------------------------------------
-    st.header("🎯 ③ 60万円 → 1億円 複利ロードマップ")
-    if current_assets > 0 and target_assets > current_assets:
-        months_10 = math.log(target_assets / current_assets) / math.log(1.10)
-        st.write(f"月利10%を毎月完全に複利で達成した場合の理論値：**約{months_10:.1f}か月**")
-        st.warning("これは数学上の試算であり、月利10%を保証するものではありません。実運用ではDD・損失・相場環境を必ず考慮します。")
-    else:
-        st.info("現在資産が目標以上、または入力値を確認してください。")
-
-    milestones = [1_000_000, 2_000_000, 5_000_000, 10_000_000, 30_000_000, 50_000_000, 100_000_000]
-    road = []
-    for m in milestones:
-        if m <= current_assets:
-            status = "達成"
-        else:
-            status = f"{m/current_assets:.1f}倍"
-        road.append({"目標資産":m, "現在資産から":status})
-    st.dataframe(pd.DataFrame(road), use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------------
-    # 流動性
-    # ------------------------------------------------------------
-    liq = pd.DataFrame([
-        {"コード":code(t),"銘柄名":name(t),"平均売買代金":d.Turnover.mean(),
-         "平均出来高":d.Volume.mean()} for t,d in data.items()
-    ])
-    if not liq.empty:
-        liq = liq.sort_values("平均売買代金", ascending=False).reset_index(drop=True)
-        liq["売買代金順位"] = liq.index + 1
-        liq["売買代金TOP50"] = liq["売買代金順位"] <= 50
-    liq_codes = set(liq.loc[liq["売買代金TOP50"],"コード"]) if not liq.empty else set()
-
-    # ------------------------------------------------------------
-    # 5年バックテスト：未来情報を避けるためファンダメンタルは使用しない
-    # ------------------------------------------------------------
-    st.header("🧪 ③ 現行ロジック・バックテスト")
-    cash = float(initial)
-    pos = {}
-    stats = {t:{"trades":0,"wins":0,"gp":0.0,"gl":0.0,"recent_losses":0} for t in data}
-    trades, analyses, equity = [], [], []
-    losses = 0
-    maxloss = 0
-    block_until = None
-    severe_block_until = None
-    pending_buys = {}
-    pending_tickers = set()
-
-    dates = sorted(set(x for d in data.values() for x in d.index))
-
-    for dt in dates:
-        # BUY予約を翌営業日寄付で約定
-        for order in pending_buys.pop(dt, []):
-            t = order["ticker"]
-            pending_tickers.discard(t)
-            if t not in data or dt not in data[t].index or t in pos:
-                continue
-            r = data[t].loc[dt]
-            p = float(r.Open)
-            signal_close = order["signal_close"]
-            gap = (p/signal_close - 1) * 100 if signal_close > 0 else 999
-            if p <= 0 or abs(gap) > max_gap:
-                continue
-            if is_blocked(dt, block_until, severe_block_until) or len(pos) >= maxpos:
-                continue
-            if order["market_factor"] <= 0:
-                continue
-            rf = risk_factor_from_losses(losses)
-            budget = min(maxbuy, cash) * order["score_factor"] * rf
-            shares = int(budget / p)
-            if shares <= 0:
-                continue
-            cost = shares * p
-            if cost > cash:
-                continue
-            cash -= cost
-            pos[t] = {"entry":p,"shares":shares}
-            trades.append({
-                "日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY",
-                "価格":p,"株数":shares,"損益":0,"損益率":0,
-                "理由":"Ver.6.0基盤AI BUY（翌営業日寄付）",
-                "シグナル日":order["signal_date"],"テクニカルスコア":order["ts"],
-                "総合AIスコア":order["score"],"市場判定":order["market_state"],
-                "海外為替判定":order["overseas_state"],"寄付ギャップ率":gap,
-                "未来情報使用":False
+        # BUY：RC6.16で採用した %K<=20 のGC
+        if bool(r.get("STOCH_GC", False)) and np.isfinite(sk) and sk <= 20:
+            buy_signal_rows.append({
+                "コード": c,
+                "銘柄名": name(t),
+                "総合AIスコア": 100.0 - float(sk),
+                "現在株価": float(px),
+                "%K": float(sk),
+                "%D": float(sd),
+                "条件": "%K≤20 GC",
             })
 
-        # 保有ポジション評価/SELL
-        for t in list(pos):
-            if dt not in data[t].index:
-                continue
-            r = data[t].loc[dt]
-            p = float(r.Close)
-            q = pos[t]
-            pnl = (p-q["entry"]) * q["shares"]
-            pct = (p/q["entry"] - 1) * 100
-            ma25_confirm = p < r.MA25 and (r.MA25_Slope < 0 or tech(r,rlo,rhi) < 60)
-            reason = ("損切り" if pct <= -sl else
-                      "利確" if pct >= tp else
-                      "25日線割れ確認" if ma25_confirm else None)
-            if reason:
-                cash += p * q["shares"]
-                s = stats[t]; s["trades"] += 1
-                if pnl > 0:
-                    s["wins"] += 1; s["gp"] += pnl; s["recent_losses"] = 0; losses = 0
-                else:
-                    s["gl"] += abs(pnl); s["recent_losses"] += 1
-                    losses += 1; maxloss = max(maxloss, losses)
-                    if losses >= 10:
-                        severe_block_until = dt + pd.tseries.offsets.BDay(severe_cooldown)
-                    elif losses >= 9:
-                        block_until = dt + pd.tseries.offsets.BDay(risk_cooldown)
-                    elif losses >= 4:
-                        block_until = dt + pd.tseries.offsets.BDay(cooldown)
-                trades.append({
-                    "日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL",
-                    "価格":p,"株数":q["shares"],"損益":pnl,"損益率":pct,
-                    "理由":reason,"未来情報使用":False,"連敗数":losses
-                })
-                del pos[t]
-
-        # BUYシグナル
-        candidates = []
-        for t,d in data.items():
-            if dt not in d.index or t in pos:
-                continue
-            r = d.loc[dt]; p = float(r.Close); c = code(t)
-            # 既存版の永続ルールを維持
-            if p >= 2000:
-                continue
-            if use_liq and c not in liq_codes and c not in held_codes and c != "6085":
-                continue
-            ts = tech(r,rlo,rhi)
-            if ts < mintech:
-                continue
-            hc = confidence(stats[t]) * recent_loss_penalty(stats[t])
-            hp = conf_points(hc)
-            ms, mp, mf = market_info(market, dt)
-            os = overseas_snapshot(overseas, dt)
-            qfactor, qblock, qreason, wr, pf, avg = stock_quality(stats[t])
-
-            base = ts*.55 + hp*.30 + mp*.15
-            raw = float(np.clip(base*qfactor,0,100))
-            score = raw * os["海外為替係数"]
-            threshold = 86 if ms in ["⚪ 中立","🟠 やや弱気","🔴 弱気"] else 82 if ms == "🟡 やや強気" else 80
-            blocked = is_blocked(dt, block_until, severe_block_until)
-            reject = qblock or score < minbuy_score or score < threshold or os["海外為替係数"] < .50
-            if no_trade_on_bad_market and mf <= 0:
-                reject = True
-
-            analyses.append({
-                "日付":dt,"コード":c,"銘柄名":name(t),"株価":p,
-                "テクニカルスコア":ts,"総合AIスコア":score,
-                "市場判定":ms,"市場ポイント":mp,
-                "海外為替判定":os["海外為替判定"],"海外為替係数":os["海外為替係数"],
-                "銘柄期待値係数":qfactor,"過去勝率":wr*100,"過去PF":pf,
-                "過去平均損益":avg,"新規BUY停止":blocked,
-                "未来情報使用":False
-            })
-            if not blocked and not reject:
-                candidates.append((score,t,ts,hc,ms,mp,os, qfactor,wr,pf,avg))
-
-        candidates.sort(reverse=True)
-        for score,t,ts,hc,ms,mp,os,qfactor,wr,pf,avg in candidates:
-            if t in pending_tickers:
-                continue
-            nxt = next_trade_date(data[t].index, dt)
-            if nxt is None:
-                continue
-            pending_buys.setdefault(nxt,[]).append({
-                "ticker":t,"score":score,"ts":ts,"market_state":ms,"market_factor":mp,
-                "overseas_state":os["海外為替判定"],"signal_date":dt,
-                "signal_close":float(data[t].loc[dt].Close),
-                "score_factor":1.0 if score >= 85 else .85 if score >= 75 else .70
-            })
-            pending_tickers.add(t)
-
-        hv = sum(float(data[t].loc[dt].Close)*q["shares"] for t,q in pos.items()
-                 if dt in data[t].index)
-        equity.append({
-            "日付":dt,"現金":cash,"保有株評価額":hv,"総資産":cash+hv,
-            "保有銘柄数":len(pos),"連敗数":losses,
-            "新規BUY停止中":is_blocked(dt,block_until,severe_block_until)
-        })
-
-    trades_df = pd.DataFrame(trades)
-    analysis_df = pd.DataFrame(analyses)
-    equity_df = pd.DataFrame(equity)
-
-    if not equity_df.empty:
-        equity_df["最高資産"] = equity_df["総資産"].cummax()
-        equity_df["DD"] = equity_df["総資産"] - equity_df["最高資産"]
-        equity_df["DD率"] = np.where(equity_df["最高資産"] != 0,
-                                      equity_df["DD"]/equity_df["最高資産"]*100, 0)
-        final = float(equity_df["総資産"].iloc[-1])
-        maxdd = float(equity_df["DD"].min())
-        maxddrate = float(equity_df["DD率"].min())
-    else:
-        final, maxdd, maxddrate = initial, 0.0, 0.0
-
-    selltr = trades_df[trades_df["売買"]=="SELL"] if not trades_df.empty else pd.DataFrame()
-    winrate = (selltr["損益"] > 0).mean()*100 if not selltr.empty else 0
-    gp = selltr.loc[selltr["損益"]>0,"損益"].sum() if not selltr.empty else 0
-    gl = abs(selltr.loc[selltr["損益"]<0,"損益"].sum()) if not selltr.empty else 0
-    pf = gp/gl if gl else 0
-
-    # ------------------------------------------------------------
-    # RC6.12 検証専用：1億円逆算・時系列OOS最適化
-    # ------------------------------------------------------------
-    def _period_metrics(eq_df, tr_df, start_date=None, end_date=None):
-        """指定期間の成績。期間開始時資産を基準に複利月利を計算する。"""
-        if eq_df is None or eq_df.empty:
-            return {"start": float(initial), "final": float(initial), "return_pct": 0.0,
-                    "monthly_cagr_pct": 0.0, "maxdd_pct": 0.0, "pf": 0.0,
-                    "winrate": 0.0, "sells": 0}
-        e = eq_df.copy()
-        e["日付"] = pd.to_datetime(e["日付"])
-        if start_date is not None:
-            e = e[e["日付"] >= pd.Timestamp(start_date)]
-        if end_date is not None:
-            e = e[e["日付"] <= pd.Timestamp(end_date)]
-        if e.empty:
-            return {"start": float(initial), "final": float(initial), "return_pct": 0.0,
-                    "monthly_cagr_pct": 0.0, "maxdd_pct": 0.0, "pf": 0.0,
-                    "winrate": 0.0, "sells": 0}
-        start_val = float(e["総資産"].iloc[0])
-        final_val = float(e["総資産"].iloc[-1])
-        peak = e["総資産"].cummax()
-        dd = np.where(peak > 0, (e["総資産"] / peak - 1.0) * 100.0, 0.0)
-        maxdd_pct = float(np.min(dd)) if len(dd) else 0.0
-        days = max((pd.Timestamp(e["日付"].iloc[-1]) - pd.Timestamp(e["日付"].iloc[0])).days, 1)
-        months = max(days / 30.4375, 1/30.4375)
-        if start_val > 0 and final_val > 0:
-            monthly = ((final_val/start_val)**(1/months)-1)*100
-        else:
-            monthly = -100.0
-        ret = (final_val/start_val-1)*100 if start_val else 0.0
-
-        t = tr_df.copy() if tr_df is not None else pd.DataFrame()
-        if not t.empty:
-            t["日付"] = pd.to_datetime(t["日付"])
-            if start_date is not None:
-                t = t[t["日付"] >= pd.Timestamp(start_date)]
-            if end_date is not None:
-                t = t[t["日付"] <= pd.Timestamp(end_date)]
-            s = t[t["売買"] == "SELL"].copy()
-        else:
-            s = pd.DataFrame()
-        if s.empty:
-            pf_ = 0.0; wr_ = 0.0; n_ = 0
-        else:
-            gp_ = float(s.loc[s["損益"] > 0, "損益"].sum())
-            gl_ = abs(float(s.loc[s["損益"] < 0, "損益"].sum()))
-            pf_ = gp_/gl_ if gl_ > 0 else (9.99 if gp_ > 0 else 0.0)
-            wr_ = float((s["損益"] > 0).mean()*100)
-            n_ = int(len(s))
-        return {"start": start_val, "final": final_val, "return_pct": ret,
-                "monthly_cagr_pct": float(monthly), "maxdd_pct": maxdd_pct,
-                "pf": float(pf_), "winrate": wr_, "sells": n_}
-
-
-    # FAST: 候補ごとに不変な市場・海外情報を先に1回だけ計算
-    _rev_market_cache = {}
-    _rev_overseas_cache = {}
-    for _dt in dates:
-        try:
-            _rev_market_cache[_dt] = market_info(market, _dt)
-        except Exception:
-            _rev_market_cache[_dt] = ("⚪ 中立", 0.0, 0.0)
-        try:
-            _rev_overseas_cache[_dt] = overseas_snapshot(overseas, _dt)
-        except Exception:
-            _rev_overseas_cache[_dt] = {"海外為替判定":"⚪ 海外データなし","海外為替係数":1.0}
-
-    # RSIレンジ別テクニカルも候補間で再利用
-    _rev_tech_cache = {}
-    def _cached_tech(t, dt, rlo_, rhi_):
-        key_ = (t, pd.Timestamp(dt), int(rlo_), int(rhi_))
-        if key_ not in _rev_tech_cache:
-            _rev_tech_cache[key_] = tech(data[t].loc[dt], int(rlo_), int(rhi_))
-        return _rev_tech_cache[key_]
-
-
-    def _reverse_backtest(params, end_date=None):
-        """RC6.11の未来情報なし約定方式を保つ高速版。
-        粗探索ではend_dateまでだけ計算し、OOSを無駄に走らせない。
-        """
-        cash_ = float(initial)
-        pos_ = {}
-        stats_ = {t:{"trades":0,"wins":0,"gp":0.0,"gl":0.0,"recent_losses":0} for t in data}
-        trades_ = []
-        equity_ = []
-        losses_ = 0
-        block_until_ = None
-        severe_block_until_ = None
-        pending_ = {}
-        pending_tickers_ = set()
-        allowed_market = set(params["market_states"])
-        allowed_overseas = set(params["overseas_states"])
-
-        run_dates_ = dates if end_date is None else [d for d in dates if pd.Timestamp(d) <= pd.Timestamp(end_date)]
-        for dt in run_dates_:
-            for order in pending_.pop(dt, []):
-                t = order["ticker"]
-                pending_tickers_.discard(t)
-                if t not in data or dt not in data[t].index or t in pos_:
-                    continue
-                r = data[t].loc[dt]
-                p = float(r.Open)
-                signal_close = order["signal_close"]
-                gap = (p/signal_close - 1)*100 if signal_close > 0 else 999
-                if p <= 0 or abs(gap) > params["max_gap"]:
-                    continue
-                if is_blocked(dt, block_until_, severe_block_until_) or len(pos_) >= params["maxpos"]:
-                    continue
-                rf = risk_factor_from_losses(losses_)
-                budget = min(params["maxbuy"], cash_) * order["score_factor"] * rf
-                shares = int(budget/p)
-                if shares <= 0:
-                    continue
-                cost = shares*p
-                if cost > cash_:
-                    continue
-                cash_ -= cost
-                pos_[t] = {"entry":p,"shares":shares}
-                trades_.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"BUY",
-                                "価格":p,"株数":shares,"損益":0.0,"損益率":0.0,
-                                "理由":"RC6.12逆算検証 BUY（翌営業日寄付）",
-                                "市場判定":order["market_state"],"海外為替判定":order["overseas_state"],
-                                "総合AIスコア":order["score"],"テクニカルスコア":order["ts"],
-                                "寄付ギャップ率":gap,"未来情報使用":False})
-
-            for t in list(pos_):
-                if dt not in data[t].index:
-                    continue
-                r = data[t].loc[dt]
-                p = float(r.Close)
-                q = pos_[t]
-                pnl = (p-q["entry"])*q["shares"]
-                pct = (p/q["entry"]-1)*100
-                ma25_confirm = p < r.MA25 and (r.MA25_Slope < 0 or _cached_tech(t, dt, params["rlo"], params["rhi"]) < 60)
-                reason = ("損切り" if pct <= -params["sl"] else
-                          "利確" if pct >= params["tp"] else
-                          "25日線割れ確認" if ma25_confirm else None)
-                if reason:
-                    cash_ += p*q["shares"]
-                    s = stats_[t]; s["trades"] += 1
-                    if pnl > 0:
-                        s["wins"] += 1; s["gp"] += pnl; s["recent_losses"] = 0; losses_ = 0
-                    else:
-                        s["gl"] += abs(pnl); s["recent_losses"] += 1; losses_ += 1
-                        if losses_ >= 10:
-                            severe_block_until_ = dt + pd.tseries.offsets.BDay(severe_cooldown)
-                        elif losses_ >= 9:
-                            block_until_ = dt + pd.tseries.offsets.BDay(risk_cooldown)
-                        elif losses_ >= 4:
-                            block_until_ = dt + pd.tseries.offsets.BDay(cooldown)
-                    trades_.append({"日付":dt,"コード":code(t),"銘柄名":name(t),"売買":"SELL",
-                                    "価格":p,"株数":q["shares"],"損益":pnl,"損益率":pct,
-                                    "理由":reason,"未来情報使用":False,"連敗数":losses_})
-                    del pos_[t]
-
-            candidates_ = []
-            for t,d in data.items():
-                if dt not in d.index or t in pos_:
-                    continue
-                r = d.loc[dt]; p = float(r.Close); c = code(t)
-                if p >= 2000:
-                    continue
-                if use_liq and c not in liq_codes and c not in held_codes and c != "6085":
-                    continue
-                ts = _cached_tech(t, dt, params["rlo"], params["rhi"])
-                if ts < params["mintech"]:
-                    continue
-                hc = confidence(stats_[t]) * recent_loss_penalty(stats_[t])
-                hp = conf_points(hc)
-                ms, mp, mf = _rev_market_cache[dt] if dt in _rev_market_cache else market_info(market, dt)
-                osnap = _rev_overseas_cache[dt] if dt in _rev_overseas_cache else overseas_snapshot(overseas, dt)
-                if ms not in allowed_market or osnap["海外為替判定"] not in allowed_overseas:
-                    continue
-                qfactor, qblock, _qreason, wr, pf_hist, avg = stock_quality(stats_[t])
-                base = ts*.55 + hp*.30 + mp*.15
-                raw = float(np.clip(base*qfactor,0,100))
-                score = raw * osnap["海外為替係数"]
-                threshold = 86 if ms in ["⚪ 中立","🟠 やや弱気","🔴 弱気"] else 82 if ms == "🟡 やや強気" else 80
-                blocked_ = is_blocked(dt, block_until_, severe_block_until_)
-                reject = qblock or score < params["minbuy"] or score < threshold or osnap["海外為替係数"] < .50
-                if mf <= 0:
-                    reject = True
-                if not blocked_ and not reject:
-                    candidates_.append((score,t,ts,ms,osnap))
-
-            candidates_.sort(reverse=True)
-            for score,t,ts,ms,osnap in candidates_:
-                if t in pending_tickers_:
-                    continue
-                nxt = next_trade_date(data[t].index, dt)
-                if nxt is None:
-                    continue
-                pending_.setdefault(nxt,[]).append({
-                    "ticker":t,"score":score,"ts":ts,"market_state":ms,
-                    "overseas_state":osnap["海外為替判定"],"signal_close":float(data[t].loc[dt].Close),
-                    "score_factor":1.0 if score >= 85 else .85 if score >= 75 else .70
-                })
-                pending_tickers_.add(t)
-
-            hv = sum(float(data[t].loc[dt].Close)*q["shares"] for t,q in pos_.items() if dt in data[t].index)
-            equity_.append({"日付":dt,"総資産":cash_+hv,"現金":cash_,"保有株評価額":hv,"保有銘柄数":len(pos_)})
-
-        return pd.DataFrame(trades_), pd.DataFrame(equity_)
-
-
-    def _candidate_param_sets(limit=96):
-        """固定seedで再現可能なランダム探索。現行値を必ず1候補目に含める。"""
-        current = dict(sl=float(sl), tp=float(tp), rlo=int(rlo), rhi=int(rhi),
-                       mintech=int(mintech), minbuy=int(minbuy_score), max_gap=float(max_gap),
-                       maxpos=int(maxpos), maxbuy=float(maxbuy),
-                       market_states=("🟢 強気","🟡 やや強気","⚪ 中立","🟠 やや弱気","🔴 弱気"),
-                       overseas_states=("🟢 海外・為替 良好","🟡 海外・為替 やや良好","⚪ 海外・為替 中立","🔴 海外・為替 注意","⚪ 海外データなし"))
-        sets = [current]
-        rng = np.random.default_rng(61112)
-        choices = {
-            "sl":[4.0,5.0,6.0,7.0,8.0,9.0],
-            "tp":[10.0,12.0,15.0,18.0,20.0,25.0],
-            "rlo":[35,40,45], "rhi":[65,70,75],
-            "mintech":[70,75,80,85], "minbuy":[75,80,85,90],
-            "max_gap":[2.0,3.0,5.0], "maxpos":[5,7,10],
-            "maxbuy":[60000.0,80000.0,100000.0,120000.0],
-            "market_states":[("🟢 強気",), ("🟢 強気","🟡 やや強気")],
-            "overseas_states":[("🟢 海外・為替 良好",), ("🟢 海外・為替 良好","🟡 海外・為替 やや良好"), ("🟢 海外・為替 良好","🟡 海外・為替 やや良好","⚪ 海外・為替 中立")],
-        }
-        seen = {tuple(sorted((k,str(v)) for k,v in current.items()))}
-        while len(sets) < int(limit):
-            p = {k: choices[k][int(rng.integers(0,len(choices[k])))] for k in choices}
-            if p["rlo"] >= p["rhi"]:
-                continue
-            key = tuple(sorted((k,str(v)) for k,v in p.items()))
-            if key in seen:
-                continue
-            seen.add(key); sets.append(p)
-        return sets
-
-
-with tab_reverse:
-    st.header("🧬 RC6.12 検証：1億円逆算・ロジック探索")
-    st.caption(
-        "RC6.11本体の売買方式は変更せず、BUY/SELL・市場環境・資金配分の候補だけを探索します。"
-        "前半70%を学習、後半30%を未見(OOS)として評価し、OOSは候補選定に使いません。"
-    )
-    st.caption("FAST方式：全候補は学習期間だけ計算 → 学習上位だけ5年フル計算。未選抜候補のOOSは計算しません。")
-    opt_c1,opt_c2,opt_c3 = st.columns(3)
-    speed_mode = opt_c1.selectbox("探索速度", ["⚡ 高速（24候補→上位3）","⚖️ 標準（36候補→上位5）","🔬 精密（60候補→上位7）"], index=1, key="reverse_speed")
-    if speed_mode.startswith("⚡"):
-        opt_trials, opt_topk = 24, 3
-    elif speed_mode.startswith("🔬"):
-        opt_trials, opt_topk = 60, 7
-    else:
-        opt_trials, opt_topk = 36, 5
-    opt_train_pct = opt_c2.slider("学習期間比率(%)", 60, 80, 70, 5, key="reverse_train_pct")
-    opt_min_trades = opt_c3.number_input("学習期間の最低決済数", 5, 100, 20, 5, key="reverse_min_trades")
-
-    if dates:
-        split_idx = min(max(int(len(dates)*opt_train_pct/100)-1,0), len(dates)-1)
-        split_date = pd.Timestamp(dates[split_idx])
-        st.info(f"時系列分割：学習 ～ {split_date.date()} / OOS {split_date.date()} より後 ～ 最新日")
-    else:
-        split_date = None
-
-    if st.button("🚀 FAST 1億円逆算バックテストを実行", type="primary", key="run_reverse_test"):
-        if not dates or split_date is None:
-            st.error("バックテスト用の日足データがありません。")
-        else:
-            # 第1段階：全候補は学習期間だけ。OOSは一切計算しない。
-            coarse_rows_ = []
-            param_sets = _candidate_param_sets(int(opt_trials))
-            progress = st.progress(0, text="第1段階：学習期間だけ高速探索…")
-            for i,p_ in enumerate(param_sets):
-                tr_train_, eq_train_ = _reverse_backtest(p_, end_date=split_date)
-                train_m = _period_metrics(eq_train_, tr_train_, end_date=split_date)
-                trade_penalty = max(0, int(opt_min_trades)-train_m["sells"]) * 0.8
-                dd_penalty = max(0.0, abs(train_m["maxdd_pct"])-15.0) * 0.35
-                train_score = (train_m["monthly_cagr_pct"]*2.0 + min(train_m["pf"],4.0)*1.5
-                               + train_m["winrate"]*0.02 - trade_penalty - dd_penalty)
-                coarse_rows_.append({
-                    "候補":i+1,"学習評価点":train_score,
-                    "学習月利CAGR%":train_m["monthly_cagr_pct"],"学習PF":train_m["pf"],
-                    "学習最大DD%":train_m["maxdd_pct"],"学習決済数":train_m["sells"],
-                    "損切り%":p_["sl"],"利確%":p_["tp"],"RSI下限":p_["rlo"],"RSI上限":p_["rhi"],
-                    "最低テクニカル":p_["mintech"],"最低AI":p_["minbuy"],"ギャップ上限%":p_["max_gap"],
-                    "最大保有":p_["maxpos"],"1銘柄上限円":p_["maxbuy"],
-                    "市場条件":" / ".join(p_["market_states"]),"海外条件":" / ".join(p_["overseas_states"]),
-                    "_params":p_
-                })
-                progress.progress((i+1)/len(param_sets)*0.72, text=f"第1段階 {i+1}/{len(param_sets)}")
-
-            eligible_ = [r for r in coarse_rows_ if r["学習決済数"] >= int(opt_min_trades)]
-            ranked_ = sorted(eligible_ if eligible_ else coarse_rows_, key=lambda x:x["学習評価点"], reverse=True)
-            finalists_ = ranked_[:min(int(opt_topk), len(ranked_))]
-
-            # 第2段階：上位候補だけフル5年を走らせ、初めてOOSを開封。
-            final_rows_ = []
-            best_payload = None
-            best_train_score = -1e18
-            for j,r0_ in enumerate(finalists_):
-                p_ = r0_["_params"]
-                tr_, eq_ = _reverse_backtest(p_)
-                train_m = _period_metrics(eq_, tr_, end_date=split_date)
-                oos_m = _period_metrics(eq_, tr_, start_date=split_date + pd.Timedelta(days=1))
-                row_ = {k:v for k,v in r0_.items() if k != "_params"}
-                row_.update({
-                    "OOS月利CAGR%":oos_m["monthly_cagr_pct"],"OOS総損益%":oos_m["return_pct"],
-                    "OOS_PF":oos_m["pf"],"OOS最大DD%":oos_m["maxdd_pct"],"OOS決済数":oos_m["sells"],
-                    "精密検証":True
-                })
-                final_rows_.append(row_)
-                if train_m["sells"] >= int(opt_min_trades) and r0_["学習評価点"] > best_train_score:
-                    best_train_score = r0_["学習評価点"]
-                    best_payload = (p_,tr_,eq_,train_m,oos_m,r0_["候補"])
-                progress.progress(0.72 + (j+1)/max(len(finalists_),1)*0.28, text=f"第2段階 OOS精密検証 {j+1}/{len(finalists_)}")
-            progress.empty()
-
-            # 表示用：上位以外はOOS未計算と明示
-            coarse_public_ = []
-            finalist_ids_ = {r["候補"] for r in final_rows_}
-            finals_map_ = {r["候補"]:r for r in final_rows_}
-            for r_ in sorted(coarse_rows_, key=lambda x:x["学習評価点"], reverse=True):
-                base_ = {k:v for k,v in r_.items() if k != "_params"}
-                if r_["候補"] in finalist_ids_:
-                    base_.update({k:v for k,v in finals_map_[r_["候補"]].items() if k.startswith("OOS") or k=="精密検証"})
-                else:
-                    base_.update({"OOS月利CAGR%":np.nan,"OOS総損益%":np.nan,"OOS_PF":np.nan,"OOS最大DD%":np.nan,"OOS決済数":np.nan,"精密検証":False})
-                coarse_public_.append(base_)
-            result_ = pd.DataFrame(coarse_public_).reset_index(drop=True)
-            st.session_state["reverse_results"] = result_
-            st.session_state["reverse_fast_mode"] = speed_mode
-            if best_payload is not None:
-                p_,tr_,eq_,train_m,oos_m,best_no = best_payload
-                st.session_state["reverse_best_params"] = p_
-                st.session_state["reverse_best_trades"] = tr_
-                st.session_state["reverse_best_equity"] = eq_
-                st.session_state["reverse_best_no"] = best_no
-                st.session_state["reverse_best_train"] = train_m
-                st.session_state["reverse_best_oos"] = oos_m
-            st.success(f"FAST探索完了：{len(param_sets)}候補を学習期間で比較し、上位{len(finalists_)}候補だけOOS精密検証しました。")
-
-    if "reverse_results" in st.session_state:
-        rr = st.session_state["reverse_results"]
-        st.subheader("🏆 FAST二段階探索：学習順位と上位候補のOOS答え合わせ")
-        show_cols = ["候補","学習評価点","学習月利CAGR%","学習PF","学習最大DD%","学習決済数",
-                     "OOS月利CAGR%","OOS_PF","OOS最大DD%","OOS決済数","損切り%","利確%",
-                     "最低テクニカル","最低AI","ギャップ上限%","最大保有","1銘柄上限円","市場条件","海外条件"]
-        st.dataframe(rr[[c for c in show_cols if c in rr.columns]].head(15), use_container_width=True, hide_index=True)
-        st.download_button("📥 探索結果CSV", csv_bytes(rr), "RC6_12_reverse_search_results.csv", "text/csv")
-
-    if "reverse_best_params" in st.session_state:
-        bp_ = st.session_state["reverse_best_params"]
-        bm_ = st.session_state["reverse_best_train"]
-        om_ = st.session_state["reverse_best_oos"]
-        best_no_ = st.session_state["reverse_best_no"]
-        st.subheader(f"✅ 最終候補（候補{best_no_}：OOSを見ずに選定）")
-        a,b,c,d = st.columns(4)
-        a.metric("学習 月利CAGR", f"{bm_['monthly_cagr_pct']:.2f}%")
-        b.metric("OOS 月利CAGR", f"{om_['monthly_cagr_pct']:.2f}%")
-        c.metric("OOS PF", f"{om_['pf']:.2f}")
-        d.metric("OOS 最大DD", f"{om_['maxdd_pct']:.2f}%")
-
-        if om_["monthly_cagr_pct"] > 0 and current_assets > 0 and target_assets > current_assets:
-            rmonth = om_["monthly_cagr_pct"]/100
-            months_to_target = math.log(target_assets/current_assets)/math.log(1+rmonth) if rmonth > 0 else np.nan
-            st.write(f"OOS月利CAGRを将来も維持できると仮定した数学上の1億円到達：**約{months_to_target:.1f}か月**")
-        else:
-            st.write("OOS成績からは、現時点で1億円への複利到達月数を正の成長率で推定できません。")
-        if om_["monthly_cagr_pct"] >= 10:
-            st.success("OOSでも月利CAGR 10%以上。ただし、この結果だけで実運用10%を保証するものではありません。")
-        elif om_["monthly_cagr_pct"] > 0:
-            st.info(f"OOS月利CAGRは {om_['monthly_cagr_pct']:.2f}% です。10%に無理に合わせず、この未見期間成績を基準に判断します。")
-        else:
-            st.warning("学習期間では良くてもOOSでは成長が残っていません。過学習候補として不採用です。")
-
-        pdisp = pd.DataFrame([{
-            "損切り%":bp_["sl"],"利確%":bp_["tp"],"RSI":f"{bp_['rlo']}～{bp_['rhi']}",
-            "最低テクニカル":bp_["mintech"],"最低AI":bp_["minbuy"],"ギャップ上限%":bp_["max_gap"],
-            "最大保有":bp_["maxpos"],"1銘柄上限円":bp_["maxbuy"],
-            "市場条件":" / ".join(bp_["market_states"]),"海外条件":" / ".join(bp_["overseas_states"])
-        }])
-        st.dataframe(pdisp,use_container_width=True,hide_index=True)
-        st.download_button("📥 最終候補 売買履歴CSV", csv_bytes(st.session_state["reverse_best_trades"]),
-                           "RC6_12_reverse_best_trades.csv","text/csv")
-        st.download_button("📥 最終候補 資産曲線CSV", csv_bytes(st.session_state["reverse_best_equity"]),
-                           "RC6_12_reverse_best_equity.csv","text/csv")
-
-
-with tab_stoch:
-    st.header("📉 ストキャスティクスGCだけで5年バックテスト")
-    st.caption("BUY条件は Slow Stochastic (14,3,3) のゴールデンクロスだけ。RC6.12のAI・RSI・移動平均・出来高・市場環境・海外環境・ファンダはBUY判定に使いません。")
-    st.info("GCは終値確定後に判定し、翌営業日寄付で買うため未来情報を使いません。TP/SLが同一日に両方到達した場合は、保守的に損切りを先に約定したものとして計算します。")
-
-    sc1,sc2,sc3 = st.columns(3)
-    stoch_initial = sc1.number_input("初期資金（円）",100000,10000000,600000,50000,key="stoch_initial")
-    stoch_maxpos = sc2.number_input("最大同時保有数",1,20,5,1,key="stoch_maxpos")
-    stoch_maxbuy = sc3.number_input("1銘柄上限（円）",10000,1000000,120000,10000,key="stoch_maxbuy")
-
-    sp1,sp2,sp3 = st.columns(3)
-    stoch_tp = sp1.number_input("TP/SL方式 利確%",1.0,50.0,15.0,1.0,key="stoch_tp")
-    stoch_sl = sp2.number_input("TP/SL方式 損切り%",1.0,30.0,7.0,1.0,key="stoch_sl")
-    stoch_hold = sp3.number_input("固定保有営業日",1,60,10,1,key="stoch_hold")
-
-    st.write("**検証する3方式**：①GC買い→DC売り　②GC買い→+15%/-7%（設定変更可）　③GC買い→10営業日保有（設定変更可）")
-
-    if st.button("▶️ ストキャスGC単独バックテストを実行",type="primary",key="run_stoch_test"):
-        if not data:
-            st.error("日足OHLCデータがありません。通常運用タブのデータ取得状態を確認してください。")
-        else:
-            modes=["DC","TP/SL","10日保有"]
-            rows=[]
-            payload={}
-            prog=st.progress(0,text="ストキャスGC単独バックテストを計算中…")
-            for i,m in enumerate(modes):
-                tr_,eq_=_stoch_backtest(data,m,float(stoch_initial),int(stoch_maxpos),float(stoch_maxbuy),
-                                        float(stoch_tp),float(stoch_sl),int(stoch_hold),14,3,3)
-                met_=_stoch_metrics(tr_,eq_,float(stoch_initial))
-                label={"DC":"GC→DC","TP/SL":f"GC→+{stoch_tp:g}%/-{stoch_sl:g}%",
-                       "10日保有":f"GC→{int(stoch_hold)}営業日"}[m]
-                rows.append({"方式":label,**met_})
-                payload[m]=(tr_,eq_)
-                prog.progress((i+1)/len(modes),text=f"{i+1}/{len(modes)} {label}")
-            prog.empty()
-            result_=pd.DataFrame(rows).sort_values("損益率%",ascending=False).reset_index(drop=True)
-            st.session_state["stoch_results"]=result_
-            st.session_state["stoch_payload"]=payload
-            st.session_state["stoch_params"]={"initial":float(stoch_initial),"maxpos":int(stoch_maxpos),
-                                                "maxbuy":float(stoch_maxbuy),"tp":float(stoch_tp),
-                                                "sl":float(stoch_sl),"hold":int(stoch_hold),
-                                                "k_period":14,"k_smooth":3,"d_period":3}
-
-    if "stoch_results" in st.session_state:
-        sr=st.session_state["stoch_results"]
-        st.subheader("📊 3方式の比較結果")
-        show=sr.copy()
-        for c in ["初期資金","最終資産","損益"]:
-            show[c]=show[c].round(0).astype(int)
-        for c in ["損益率%","勝率%","最大DD%","平均1トレード%"]:
-            show[c]=show[c].round(2)
-        show["PF"]=show["PF"].round(2)
-        st.dataframe(show,use_container_width=True,hide_index=True)
-        best=sr.iloc[0]
-        st.success(f"ストキャス単独の3方式では **{best['方式']}** が最高：最終資産 {best['最終資産']:,.0f}円 / 損益率 {best['損益率%']:+.2f}% / PF {best['PF']:.2f} / 最大DD {best['最大DD%']:.2f}%")
-        st.caption("RC6.12現行ロジックとは別検証です。結果が良くても、そのまま通常運用へ採用せずOOS・期間分割で再検証してください。")
-
-        out=io.BytesIO()
-        with ZipFile(out,"w") as z:
-            z.writestr("00_stoch_comparison.csv",csv_bytes(sr))
-            prm=st.session_state.get("stoch_params",{})
-            z.writestr("01_stoch_parameters.csv",csv_bytes(pd.DataFrame([prm])))
-            for m,(tr_,eq_) in st.session_state.get("stoch_payload",{}).items():
-                safe={"DC":"dc","TP/SL":"tpsl","10日保有":"fixed_hold"}[m]
-                z.writestr(f"10_{safe}_trades.csv",csv_bytes(tr_))
-                z.writestr(f"11_{safe}_equity.csv",csv_bytes(eq_))
-        out.seek(0)
-        st.download_button("📦 ストキャス単独検証結果ZIPをダウンロード",out.getvalue(),
-                           "RC6_13_STOCH_GC_ONLY_BACKTEST.zip","application/zip",use_container_width=True)
-
-    st.divider()
-    st.subheader("🧪 GC発生位置 5段階＋OOS検証")
-    st.caption("出口条件は同じ +15%利確 / -7%損切り。GC発生時のSlow %K上限を 10 / 15 / 20 / 25 / 30 で比較します。")
-    st.info("まず70%の学習期間だけで5条件を順位付けし、1位条件を固定してから残り30%のOOSを開封します。OOS成績を見て条件を選び直しません。")
-
-    if st.button("▶️ 5段階比較＋70/30 OOSを実行", type="primary", key="run_stoch_level_oos_test"):
-        if not data:
-            st.error("日足OHLCデータがありません。通常運用タブのデータ取得状態を確認してください。")
-        else:
-            all_dates2 = sorted(set(pd.Timestamp(dt) for df in data.values() if df is not None and not df.empty for dt in df.index))
-            if len(all_dates2) < 200:
-                st.error("OOS検証に必要な日足データが不足しています。")
-            else:
-                split_idx = max(1, min(len(all_dates2)-2, int(len(all_dates2)*0.70)-1))
-                train_end = all_dates2[split_idx]
-                oos_start = all_dates2[split_idx+1]
-                full_end = all_dates2[-1]
-                train_data = _slice_stoch_data(data, None, train_end)
-                oos_data = _slice_stoch_data(data, oos_start, full_end, warmup_calendar_days=120)
-
-                level_specs = [("%K≤10",10.0),("%K≤15",15.0),("%K≤20",20.0),("%K≤25",25.0),("%K≤30",30.0)]
-                train_rows=[]
-                train_payload={}
-                prog3=st.progress(0,text="学習70%：5条件を比較中…")
-                for i,(label3,kmax3) in enumerate(level_specs):
-                    tr3,eq3=_stoch_backtest(
-                        train_data,"TP/SL",float(stoch_initial),int(stoch_maxpos),float(stoch_maxbuy),
-                        float(stoch_tp),float(stoch_sl),int(stoch_hold),14,3,3,
-                        entry_k_max=kmax3, signal_end_date=train_end
-                    )
-                    met3=_stoch_metrics(tr3,eq3,float(stoch_initial))
-                    score3=_stoch_rank_score(met3)
-                    train_rows.append({"GC発生位置":label3,"%K上限":kmax3,"学習評価点":score3,**met3})
-                    train_payload[label3]=(tr3,eq3)
-                    prog3.progress((i+1)/len(level_specs)*0.65,text=f"学習70% {i+1}/{len(level_specs)} {label3}")
-
-                train_result=pd.DataFrame(train_rows).sort_values("学習評価点",ascending=False).reset_index(drop=True)
-                best_label=str(train_result.iloc[0]["GC発生位置"])
-                best_k=float(train_result.iloc[0]["%K上限"])
-
-                # OOSは学習1位だけを固定して1回だけ計算する。
-                prog3.progress(0.80,text=f"OOS30%：学習1位 {best_label} を固定して検証中…")
-                oos_tr,oos_eq=_stoch_backtest(
-                    oos_data,"TP/SL",float(stoch_initial),int(stoch_maxpos),float(stoch_maxbuy),
-                    float(stoch_tp),float(stoch_sl),int(stoch_hold),14,3,3,
-                    entry_k_max=best_k, signal_start_date=oos_start, signal_end_date=full_end
-                )
-                oos_met=_stoch_metrics(oos_tr,oos_eq,float(stoch_initial))
-                prog3.progress(1.0,text="OOS検証完了")
-                prog3.empty()
-
-                best_train=train_result.iloc[0].to_dict()
-                oos_summary=pd.DataFrame([{
-                    "学習選定条件":best_label,
-                    "%K上限":best_k,
-                    "学習開始":all_dates2[0].date(),
-                    "学習終了":pd.Timestamp(train_end).date(),
-                    "OOS開始":pd.Timestamp(oos_start).date(),
-                    "OOS終了":pd.Timestamp(full_end).date(),
-                    "学習最終資産":best_train.get("最終資産"),
-                    "学習損益率%":best_train.get("損益率%"),
-                    "学習PF":best_train.get("PF"),
-                    "学習最大DD%":best_train.get("最大DD%"),
-                    "学習勝率%":best_train.get("勝率%"),
-                    "学習決済数":best_train.get("決済数"),
-                    "OOS最終資産":oos_met.get("最終資産"),
-                    "OOS損益率%":oos_met.get("損益率%"),
-                    "OOS_PF":oos_met.get("PF"),
-                    "OOS最大DD%":oos_met.get("最大DD%"),
-                    "OOS勝率%":oos_met.get("勝率%"),
-                    "OOS決済数":oos_met.get("決済数"),
-                }])
-
-                st.session_state["stoch_level5_train_results"] = train_result
-                st.session_state["stoch_level5_train_payload"] = train_payload
-                st.session_state["stoch_level5_oos_summary"] = oos_summary
-                st.session_state["stoch_level5_oos_trades"] = oos_tr
-                st.session_state["stoch_level5_oos_equity"] = oos_eq
-                st.session_state["stoch_level5_params"] = {
-                    "initial":float(stoch_initial),"maxpos":int(stoch_maxpos),"maxbuy":float(stoch_maxbuy),
-                    "tp":float(stoch_tp),"sl":float(stoch_sl),"k_period":14,"k_smooth":3,"d_period":3,
-                    "entry_levels":"K<=10 / 15 / 20 / 25 / 30","train_ratio":0.70,"oos_ratio":0.30,
-                    "train_end":str(pd.Timestamp(train_end).date()),"oos_start":str(pd.Timestamp(oos_start).date()),
-                    "selected_by":"train_only_rank_score"
-                }
-
-    if "stoch_level5_train_results" in st.session_state:
-        trr=st.session_state["stoch_level5_train_results"]
-        st.subheader("📊 学習70%：5条件の順位")
-        tsh=trr.copy()
-        for c in ["初期資金","最終資産","損益"]:
-            if c in tsh.columns: tsh[c]=tsh[c].round(0).astype(int)
-        for c in ["学習評価点","損益率%","勝率%","最大DD%","平均1トレード%","PF"]:
-            if c in tsh.columns: tsh[c]=tsh[c].round(2)
-        st.dataframe(tsh,use_container_width=True,hide_index=True)
-        best_train_row=trr.iloc[0]
-        st.success(
-            f"学習70%だけで選んだ1位は **{best_train_row['GC発生位置']}**："
-            f"損益率 {best_train_row['損益率%']:+.2f}% / PF {best_train_row['PF']:.2f} / "
-            f"最大DD {best_train_row['最大DD%']:.2f}% / 決済 {int(best_train_row['決済数'])}回"
-        )
-
-    if "stoch_level5_oos_summary" in st.session_state:
-        oo=st.session_state["stoch_level5_oos_summary"]
-        r0=oo.iloc[0]
-        st.subheader("🔒 未学習30% OOS答え合わせ")
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric("OOS損益率",f"{float(r0['OOS損益率%']):+.2f}%")
-        c2.metric("OOS PF",f"{float(r0['OOS_PF']):.2f}")
-        c3.metric("OOS 最大DD",f"{float(r0['OOS最大DD%']):.2f}%")
-        c4.metric("OOS 決済数",f"{int(r0['OOS決済数'])}")
-        st.dataframe(oo,use_container_width=True,hide_index=True)
-        if float(r0['OOS_PF']) >= 1.5 and float(r0['OOS損益率%']) > 0 and int(r0['OOS決済数']) >= 30:
-            st.success("OOSでも利益とPFが残っています。次段階としてRC6.12のBUY候補へストキャス条件を重ねる比較検証に進める水準です。")
-        elif float(r0['OOS_PF']) > 1.0 and float(r0['OOS損益率%']) > 0:
-            st.info("OOSでもプラスですが、強い優位性と断定するにはまだ弱めです。追加期間・銘柄群で再検証します。")
-        else:
-            st.warning("学習期間では強くてもOOSで優位性が残っていません。通常運用へは組み込みません。")
-
-        out3=io.BytesIO()
-        with ZipFile(out3,"w") as z:
-            z.writestr("00_stoch_gc_level5_train_comparison.csv",csv_bytes(st.session_state["stoch_level5_train_results"]))
-            z.writestr("01_stoch_gc_level5_parameters.csv",csv_bytes(pd.DataFrame([st.session_state.get("stoch_level5_params",{})])))
-            z.writestr("02_stoch_gc_level5_oos_summary.csv",csv_bytes(oo))
-            safe5={"%K≤10":"k10","%K≤15":"k15","%K≤20":"k20","%K≤25":"k25","%K≤30":"k30"}
-            for label5,(tr5,eq5) in st.session_state.get("stoch_level5_train_payload",{}).items():
-                s5=safe5.get(label5,"other")
-                z.writestr(f"10_train_{s5}_trades.csv",csv_bytes(tr5))
-                z.writestr(f"11_train_{s5}_equity.csv",csv_bytes(eq5))
-            z.writestr("20_oos_selected_trades.csv",csv_bytes(st.session_state.get("stoch_level5_oos_trades",pd.DataFrame())))
-            z.writestr("21_oos_selected_equity.csv",csv_bytes(st.session_state.get("stoch_level5_oos_equity",pd.DataFrame())))
-        out3.seek(0)
-        st.download_button(
-            "📦 5段階＋OOS検証ZIPをダウンロード",out3.getvalue(),
-            "RC6_14_STOCH_GC_LEVEL5_OOS_BACKTEST.zip","application/zip",use_container_width=True
-        )
-
-
-    st.divider()
-    st.subheader("⚔️ BUY入口 3方式・同条件直接対決")
-    st.caption("①RC6.12 BUYシグナル ②Stoch %K≤20 GC ③RC6.12＋Stoch一致。出口と資金条件を共通化し、BUY入口の差だけを比較します。")
-    st.info("共通条件：翌営業日寄付で買付、利確 +15% / 損切り -7%（画面設定可）、同一日TP/SL到達時はSL優先。既存RC6.12通常運用ロジック自体は変更しません。")
-
-    ec1,ec2,ec3=st.columns(3)
-    cmp_initial=ec1.number_input("比較 初期資金（円）",100000,10000000,600000,50000,key="entry_cmp_initial")
-    cmp_maxpos=ec2.number_input("比較 最大同時保有数",1,20,5,1,key="entry_cmp_maxpos")
-    cmp_maxbuy=ec3.number_input("比較 1銘柄上限（円）",10000,1000000,120000,10000,key="entry_cmp_maxbuy")
-    ex1,ex2=st.columns(2)
-    cmp_tp=ex1.number_input("比較 共通利確%",1.0,50.0,15.0,1.0,key="entry_cmp_tp")
-    cmp_sl=ex2.number_input("比較 共通損切り%",1.0,30.0,7.0,1.0,key="entry_cmp_sl")
-
-    if st.button("▶️ 3方式を同条件で比較",type="primary",key="run_entry_3way_compare"):
-        if not data:
-            st.error("日足OHLCデータがありません。通常運用タブのデータ取得状態を確認してください。")
-        else:
-            modes_cmp=[("RC6.12","RC6.12 BUY"),("STOCH20","Stoch %K≤20 GC"),("COMBINED","RC6.12＋Stoch %K≤20")]
-            cmp_rows=[]; cmp_payload={}
-            pc=st.progress(0,text="3方式の同条件バックテストを計算中…")
-            for i,(mode_cmp,label_cmp) in enumerate(modes_cmp):
-                trc,eqc=_entry_signal_comparison_backtest(
-                    data,mode_cmp,market,overseas,set(liq_codes),set(held_codes),
-                    initial_cash=float(cmp_initial),max_positions=int(cmp_maxpos),max_buy=float(cmp_maxbuy),
-                    take_profit_pct=float(cmp_tp),stop_loss_pct=float(cmp_sl),
-                    rsi_low=int(rlo),rsi_high=int(rhi),min_tech=float(mintech),min_ai=float(minbuy_score),
-                    max_gap_pct=float(max_gap),use_liquidity=bool(use_liq),no_trade_bad_market=bool(no_trade_on_bad_market),
-                    cooldown_days=int(cooldown),risk_cooldown_days=int(risk_cooldown),severe_cooldown_days=int(severe_cooldown),
-                    stoch_k_max=20.0,
-                )
-                metc=_stoch_metrics(trc,eqc,float(cmp_initial))
-                cmp_rows.append({"方式":label_cmp,**metc})
-                cmp_payload[mode_cmp]=(trc,eqc)
-                pc.progress((i+1)/3,text=f"{i+1}/3 {label_cmp}")
-            pc.empty()
-            cmp_df=pd.DataFrame(cmp_rows).sort_values("損益率%",ascending=False).reset_index(drop=True)
-            st.session_state["entry_3way_results"]=cmp_df
-            st.session_state["entry_3way_payload"]=cmp_payload
-            st.session_state["entry_3way_params"]={
-                "initial":float(cmp_initial),"maxpos":int(cmp_maxpos),"maxbuy":float(cmp_maxbuy),
-                "tp":float(cmp_tp),"sl":float(cmp_sl),"stoch_k_max":20.0,
-                "stoch":"Slow 14,3,3","execution":"signal close -> next trading day open",
-                "same_day_tp_sl":"SL first (conservative)",
-                "comparison_purpose":"same exits and sizing; compare BUY entries only",
-            }
-
-    if "entry_3way_results" in st.session_state:
-        cdf=st.session_state["entry_3way_results"]
-        st.subheader("📊 3方式 直接比較結果")
-        cshow=cdf.copy()
-        for c in ["初期資金","最終資産","損益"]:
-            if c in cshow.columns: cshow[c]=cshow[c].round(0).astype(int)
-        for c in ["損益率%","勝率%","PF","最大DD%","平均1トレード%"]:
-            if c in cshow.columns: cshow[c]=cshow[c].round(2)
-        st.dataframe(cshow,use_container_width=True,hide_index=True)
-        b=cdf.iloc[0]
-        st.success(f"同条件比較の1位：**{b['方式']}**｜最終資産 {b['最終資産']:,.0f}円｜損益率 {b['損益率%']:+.2f}%｜PF {b['PF']:.2f}｜最大DD {b['最大DD%']:.2f}%｜決済 {int(b['決済数'])}回")
-
-        # 現行RC6.12通常バックテストは出口まで異なるため、参考値として別枠表示。
-        ref=pd.DataFrame([{
-            "参考":"現行RC6.12通常バックテスト（出口条件も現行のまま）",
-            "初期資金":float(initial),"最終資産":float(final),
-            "損益率%":((float(final)/float(initial)-1)*100 if float(initial) else 0.0),
-            "PF":float(pf),"最大DD%":float(maxddrate),"決済数":int(len(selltr)),
-        }])
-        st.caption("参考：下段は現行RC6.12そのもの。上の3方式とは出口条件が違うため、順位判定には混ぜません。")
-        st.dataframe(ref,use_container_width=True,hide_index=True)
-
-        bout=io.BytesIO()
-        with ZipFile(bout,"w") as z:
-            z.writestr("00_entry_3way_comparison.csv",csv_bytes(cdf))
-            z.writestr("01_entry_3way_parameters.csv",csv_bytes(pd.DataFrame([st.session_state.get("entry_3way_params",{})])))
-            z.writestr("02_rc612_current_reference.csv",csv_bytes(ref))
-            safe_cmp={"RC6.12":"rc612","STOCH20":"stoch_k20","COMBINED":"combined"}
-            for mc,(tc,ec) in st.session_state.get("entry_3way_payload",{}).items():
-                nm=safe_cmp.get(mc,mc.lower())
-                z.writestr(f"10_{nm}_trades.csv",csv_bytes(tc))
-                z.writestr(f"11_{nm}_equity.csv",csv_bytes(ec))
-        bout.seek(0)
-        st.download_button("📦 3方式直接比較ZIPをダウンロード",bout.getvalue(),
-                           "RC6_15_ENTRY_3WAY_COMPARISON.zip","application/zip",use_container_width=True)
-
-
-    st.divider()
-    st.subheader("🔻 RC6.16 SELL条件：ストキャス深掘り＋OOS")
-    st.caption("BUYは Slow Stochastic (14,3,3) の %K≤20 ゴールデンクロスに固定。SELLだけをデッドクロス発生時の%K位置で比較します。")
-    st.info("比較するSELL：DC位置制限なし / %K≥20 / 30 / 40 / 50 / 60 / 70 / 80 / 90。70%学習期間で利益を中心に1位を選び、そのSELL条件を固定して30%OOSへ投入します。")
-
-    sv1,sv2,sv3=st.columns(3)
-    sell_initial=sv1.number_input("SELL探索 初期資金（円）",100000,10000000,600000,50000,key="sellopt_initial")
-    sell_maxpos=sv2.number_input("SELL探索 最大同時保有数",1,20,5,1,key="sellopt_maxpos")
-    sell_maxbuy=sv3.number_input("SELL探索 1銘柄上限（円）",10000,1000000,120000,10000,key="sellopt_maxbuy")
-
-    if st.button("▶️ SELL 9条件＋70/30 OOSを実行",type="primary",key="run_stoch_sell_oos"):
-        if not data:
-            st.error("日足OHLCデータがありません。通常運用タブのデータ取得状態を確認してください。")
-        else:
-            dts=sorted(set(pd.Timestamp(dt) for df in data.values() if df is not None and not df.empty for dt in df.index))
-            if len(dts)<200:
-                st.error("OOS検証に必要な日足データが不足しています。")
-            else:
-                spidx=max(1,min(len(dts)-2,int(len(dts)*0.70)-1)); train_end2=dts[spidx]; oos_start2=dts[spidx+1]; full_end2=dts[-1]
-                train_data2=_slice_stoch_data(data,None,train_end2); oos_data2=_slice_stoch_data(data,oos_start2,full_end2,120)
-                sell_levels=[0.0,20.0,30.0,40.0,50.0,60.0,70.0,80.0,90.0]
-                srows=[]; spayload={}
-                ps=st.progress(0,text="学習70%：SELL 9条件を比較中…")
-                for i,lv in enumerate(sell_levels):
-                    trs,eqs=_stoch_sell_threshold_backtest(train_data2,float(sell_initial),int(sell_maxpos),float(sell_maxbuy),20.0,lv,14,3,3,None,train_end2,True)
-                    mets=_stoch_metrics(trs,eqs,float(sell_initial)); score_s=_sell_rank_for_profit(mets)
-                    label_s="DC制限なし" if lv<=0 else f"DC %K≥{lv:g}"
-                    srows.append({"SELL条件":label_s,"SELL_%K下限":lv,"学習評価点":score_s,**mets}); spayload[label_s]=(trs,eqs)
-                    ps.progress((i+1)/len(sell_levels)*0.70,text=f"学習70% {i+1}/{len(sell_levels)} {label_s}")
-                sdf=pd.DataFrame(srows).sort_values(["学習評価点","損益率%","PF"],ascending=False).reset_index(drop=True)
-                selected_label=str(sdf.iloc[0]["SELL条件"]); selected_k=float(sdf.iloc[0]["SELL_%K下限"])
-                ps.progress(0.82,text=f"OOS30%：{selected_label} を固定して検証中…")
-                otr,oeq=_stoch_sell_threshold_backtest(oos_data2,float(sell_initial),int(sell_maxpos),float(sell_maxbuy),20.0,selected_k,14,3,3,oos_start2,full_end2,True)
-                omet=_stoch_metrics(otr,oeq,float(sell_initial)); ps.progress(1.0,text="SELL OOS検証完了"); ps.empty()
-                osum=pd.DataFrame([{
-                    "BUY正式候補":"Stoch GC %K≤20","学習選定SELL":selected_label,"SELL_%K下限":selected_k,
-                    "学習開始":dts[0].date(),"学習終了":pd.Timestamp(train_end2).date(),"OOS開始":pd.Timestamp(oos_start2).date(),"OOS終了":pd.Timestamp(full_end2).date(),
-                    "学習損益率%":float(sdf.iloc[0]["損益率%"]),"学習PF":float(sdf.iloc[0]["PF"]),"学習最大DD%":float(sdf.iloc[0]["最大DD%"]),"学習決済数":int(sdf.iloc[0]["決済数"]),
-                    "OOS損益率%":omet["損益率%"],"OOS_PF":omet["PF"],"OOS最大DD%":omet["最大DD%"],"OOS勝率%":omet["勝率%"],"OOS決済数":omet["決済数"]
-                }])
-                st.session_state["stoch_sell_train_results"]=sdf; st.session_state["stoch_sell_train_payload"]=spayload
-                st.session_state["stoch_sell_oos_summary"]=osum; st.session_state["stoch_sell_oos_trades"]=otr; st.session_state["stoch_sell_oos_equity"]=oeq
-                st.session_state["stoch_formal_sell_k_min"]=selected_k
-                st.session_state["stoch_sell_params"]={"stoch":"Slow 14,3,3","entry":"GC and K<=20","sell_grid":"DC any / K>=20,30,40,50,60,70,80,90","train_ratio":0.70,"oos_ratio":0.30,"selected_by":"TRAIN return-centered score only","execution":"signal close -> next trading day open"}
-
-    if "stoch_sell_train_results" in st.session_state:
-        sdf=st.session_state["stoch_sell_train_results"]; st.subheader("📊 学習70%：SELL 9条件ランキング")
-        sdsp=sdf.copy()
-        for c in ["初期資金","最終資産","損益"]:
-            if c in sdsp: sdsp[c]=sdsp[c].round(0).astype(int)
-        for c in ["学習評価点","損益率%","勝率%","PF","最大DD%","平均1トレード%"]:
-            if c in sdsp: sdsp[c]=sdsp[c].round(2)
-        st.dataframe(sdsp,use_container_width=True,hide_index=True)
-        br=sdf.iloc[0]
-        st.success(f"学習70%で選んだSELLは **{br['SELL条件']}**｜損益率 {br['損益率%']:+.2f}%｜PF {br['PF']:.2f}｜最大DD {br['最大DD%']:.2f}%｜決済 {int(br['決済数'])}回")
-
-    if "stoch_sell_oos_summary" in st.session_state:
-        so=st.session_state["stoch_sell_oos_summary"]; rr=so.iloc[0]; st.subheader("🔒 SELL条件 OOS30%答え合わせ")
-        a,b,c,d=st.columns(4); a.metric("OOS損益率",f"{float(rr['OOS損益率%']):+.2f}%"); b.metric("OOS PF",f"{float(rr['OOS_PF']):.2f}"); c.metric("OOS最大DD",f"{float(rr['OOS最大DD%']):.2f}%"); d.metric("OOS決済",f"{int(rr['OOS決済数'])}回")
-        st.dataframe(so,use_container_width=True,hide_index=True)
-        selected=float(rr["SELL_%K下限"]); sell_text="DCなら位置を問わずSELL" if selected<=0 else f"%K≥{selected:g}の位置でデッドクロスしたらSELL"
-        st.warning(f"RC6.16 正式候補ロジック：BUY = %K≤20でGC → 翌営業日寄付。SELL = {sell_text} → 翌営業日寄付。※最終採用はこのOOS結果を確認して固定します。")
-
-        # 現在日のRC6.17候補シグナルを表示
-        # BUY: ストキャス条件一致銘柄に、既存の資金管理ロジックでS株の参考株数を付与。
-        # SELL: SBI約定履歴CSVから復元された「現在保有中」の銘柄だけを対象にする。
-        buy_signal_rows=[]
-        sell_signal_rows=[]
-        held_code_set=set(map(str, held_codes))
-
-        for t,df0 in data.items():
-            if df0 is None or df0.empty:
-                continue
-            sx=_stoch_prepare(df0,14,3,3)
-            if sx is None or sx.empty:
-                continue
-            r=sx.iloc[-1]
-            sk=safe_float(r.get("STOCH_K"))
-            sd=safe_float(r.get("STOCH_D"))
-            px=safe_float(r.get("Close"))
-            c=code(t)
-
-            if bool(r.get("STOCH_GC",False)) and np.isfinite(sk) and sk<=20 and np.isfinite(px) and px>0:
-                buy_signal_rows.append({
-                    "コード":c,
-                    "銘柄名":name(t),
-                    "総合AIスコア":100.0-float(sk),  # 株数計算用の並び順。低い%Kを優先。
-                    "現在株価":float(px),
-                    "%K":float(sk),
-                    "%D":float(sd),
-                    "条件":"%K≤20 GC",
-                })
-
-            # SELL候補は「現在保有中」だけ。未保有銘柄のSELLシグナルは表示しない。
-            sell_ok = bool(r.get("STOCH_DC",False)) and np.isfinite(sk) and (selected<=0 or sk>=selected)
-            if c in held_code_set and sell_ok:
-                h=confirmed.get(c,{}) if isinstance(confirmed,dict) else {}
+        # SELL：現在保有中のみ。DCを主条件、基本損切りを安全センサーとして併用。
+        if c in held_code_set:
+            h = confirmed.get(c, {})
+            shares = int(safe_float(h.get("shares", 0)) or 0)
+            avg = safe_float(h.get("avg_price", np.nan))
+            pnl_pct = ((px / avg - 1.0) * 100.0) if np.isfinite(avg) and avg > 0 else np.nan
+            dc_hit = bool(r.get("STOCH_DC", False)) and np.isfinite(sk)
+            stop_hit = np.isfinite(pnl_pct) and pnl_pct <= -float(sl)
+            if dc_hit or stop_hit:
+                reasons = []
+                if stop_hit:
+                    reasons.append(f"損切りセンサー -{float(sl):.1f}%到達")
+                if dc_hit:
+                    reasons.append("ストキャスDC")
                 sell_signal_rows.append({
-                    "コード":c,
-                    "銘柄名":name(t),
-                    "保有株数":int(safe_float(h.get("shares",h.get("株数",0))) or 0),
-                    "取得単価":safe_float(h.get("avg_price",h.get("取得単価",np.nan))),
-                    "現在株価":float(px) if np.isfinite(px) else np.nan,
-                    "%K":float(sk) if np.isfinite(sk) else np.nan,
-                    "%D":float(sd) if np.isfinite(sd) else np.nan,
-                    "条件":sell_text,
+                    "コード": c,
+                    "銘柄名": name(t),
+                    "保有株数": shares,
+                    "取得単価": avg,
+                    "現在株価": float(px),
+                    "損益率%": pnl_pct,
+                    "%K": float(sk) if np.isfinite(sk) else np.nan,
+                    "%D": float(sd) if np.isfinite(sd) else np.nan,
+                    "売り理由": "＋".join(reasons),
                 })
 
-        st.subheader("🧭 RC6.17 ストキャス現在シグナル")
+    # SELLを先に表示：実トレードで既存ポジションの安全確認を優先
+    st.subheader("🔻 売り候補 — 現在保有中のみ")
+    if sell_signal_rows:
+        sell_view = pd.DataFrame(sell_signal_rows)
+        sell_view["優先"] = sell_view["売り理由"].str.contains("損切りセンサー").map({True:"🚨 最優先",False:"🔻 SELL"})
+        sell_view = sell_view[["優先","コード","銘柄名","保有株数","取得単価","現在株価","損益率%","%K","%D","売り理由"]]
+        for c in ["取得単価","現在株価","損益率%","%K","%D"]:
+            sell_view[c] = pd.to_numeric(sell_view[c], errors="coerce").round(2)
+        st.dataframe(sell_view, use_container_width=True, hide_index=True)
+    else:
+        st.success("現在保有中にSELL条件はありません。")
 
-        st.markdown("#### 🟢 買い候補 — S株なら何株？（参考）")
-        if buy_signal_rows:
-            buy_signal_df=pd.DataFrame(buy_signal_rows).sort_values(["%K","コード"],ascending=[True,True]).reset_index(drop=True)
-
-            # 最大保有数だけで参考株数が0になるのを避けるため、表示用は最大3枠を仮確保。
-            # ただし既存の余力・現金温存・1日使用上限・損失許容・価格バッファはそのまま使う。
-            stoch_plan=build_purchase_plan(
-                buy_signal_df, buying_power, current_assets, held_codes,
-                max(int(maxpos),len(held_code_set)+3), maxbuy, sl,
-                reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
-                allow_addon=allow_addon, market_block=False
-            )
-
-            # ストキャス値を戻して、ユーザーが朝見る項目だけに整理する。
-            buy_view=stoch_plan.merge(
-                buy_signal_df[["コード","%K","%D","条件"]],on="コード",how="left"
-            )
-            buy_view=buy_view.rename(columns={
-                "購入株数":"参考S株数",
-                "予定購入額":"概算購入額",
-            })
-            show_cols=[
-                "購入優先度","コード","銘柄名","現在株価","参考S株数",
-                "概算購入額","買付余力使用率","%K","%D","買付可否","見送り理由"
-            ]
-            buy_view=buy_view[[c for c in show_cols if c in buy_view.columns]].copy()
-            for c in ["現在株価","概算購入額"]:
-                if c in buy_view:
-                    buy_view[c]=pd.to_numeric(buy_view[c],errors="coerce").round(0)
-            for c in ["買付余力使用率","%K","%D"]:
-                if c in buy_view:
-                    buy_view[c]=pd.to_numeric(buy_view[c],errors="coerce").round(2)
-            st.dataframe(buy_view.head(3),use_container_width=True,hide_index=True)
-            st.caption(
-                f"参考株数は現在の買付余力 ¥{int(buying_power):,} と既存の資金管理設定から算出します。"
-                "実際のS株注文数を自動発注するものではありません。"
-            )
-        else:
-            st.info("現在、%K≤20のゴールデンクロスに一致する買い候補はありません。")
-
-        st.markdown("#### 🔻 売り候補 — 現在保有中のみ")
-        if sell_signal_rows:
-            sell_view=pd.DataFrame(sell_signal_rows)
-            for c in ["取得単価","現在株価","%K","%D"]:
-                if c in sell_view:
-                    sell_view[c]=pd.to_numeric(sell_view[c],errors="coerce").round(2)
-            st.dataframe(sell_view,use_container_width=True,hide_index=True)
-        else:
-            st.info("現在保有中の銘柄には、ストキャスSELL条件に一致する売り候補はありません。")
-
-        sout=io.BytesIO()
-        with ZipFile(sout,"w") as z:
-            z.writestr("00_stoch_sell_train_comparison.csv",csv_bytes(st.session_state["stoch_sell_train_results"]))
-            z.writestr("01_stoch_sell_parameters.csv",csv_bytes(pd.DataFrame([st.session_state.get("stoch_sell_params",{})])))
-            z.writestr("02_stoch_sell_oos_summary.csv",csv_bytes(so))
-            for lab,(tt,ee) in st.session_state.get("stoch_sell_train_payload",{}).items():
-                nm=lab.replace("DC ","").replace("%K≥","k").replace("制限なし","any").replace(".","_")
-                z.writestr(f"10_train_sell_{nm}_trades.csv",csv_bytes(tt)); z.writestr(f"11_train_sell_{nm}_equity.csv",csv_bytes(ee))
-            z.writestr("20_oos_selected_sell_trades.csv",csv_bytes(st.session_state.get("stoch_sell_oos_trades",pd.DataFrame())))
-            z.writestr("21_oos_selected_sell_equity.csv",csv_bytes(st.session_state.get("stoch_sell_oos_equity",pd.DataFrame())))
-        sout.seek(0)
-        st.download_button("📦 RC6.16 SELL深掘り＋OOS ZIPをダウンロード",sout.getvalue(),"RC6_16_STOCH_SELL_OPT_OOS.zip","application/zip",use_container_width=True)
-
-
-with tab_normal:
-    # ------------------------------------------------------------
-    # 現在の新規BUY + 現在ファンダメンタル
-    # ------------------------------------------------------------
-    latest_rows = []
-    for t,d in data.items():
-        r = d.iloc[-1]; p = float(r.Close); c = code(t)
-        # 日経平均より古い個別株データは、現在のBUY候補に使用しない。
-        if market_data_stale or t in stale_tickers:
-            continue
-        if p >= 2000:
-            continue
-        if use_liq and c not in liq_codes and c not in held_codes and c != "6085":
-            continue
-        ts = tech(r,rlo,rhi)
-        if ts < mintech:
-            continue
-        hc = confidence(stats[t]) * recent_loss_penalty(stats[t])
-        hp = conf_points(hc)
-        ms,mp,mf = market_info(market, d.index[-1])
-        os = overseas_snapshot(overseas, d.index[-1])
-        qfactor,qblock,qreason,wr,pf_hist,avg_hist = stock_quality(stats[t])
-        tech_score = ts
-        current_base = tech_score*.40 + hp*.20 + mp*.10 + os["海外為替係数"]*100*.10
-        f = fundamental_snapshot(t)
-        value = safe_float(f.get("企業価値スコア"),50)
-        growth = safe_float(f.get("成長性スコア"),50)
-        ten = tenbagger_score(f)
-        # 現在の総合スコア：ファンダメンタルを中心軸にする
-        total = np.clip(
-            value*.30 + growth*.20 + tech_score*.25 + hp*.10 + mp*.05 +
-            os["海外為替係数"]*100*.05 + ten*.05, 0, 100
+    st.subheader("🟢 買い候補 — 参考S株数まで表示")
+    if buy_signal_rows:
+        buy_signal_df = pd.DataFrame(buy_signal_rows).sort_values(["%K","コード"]).reset_index(drop=True)
+        plan = build_purchase_plan(
+            buy_signal_df, buying_power, current_assets, held_codes,
+            max(int(maxpos), len(held_code_set) + 3), maxbuy, sl,
+            reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
+            allow_addon=allow_addon, market_block=False,
         )
-        latest_rows.append({
-            "コード":c,"銘柄名":name(t),"現在株価":p,
-            "データ最終日":pd.Timestamp(d.index[-1]).normalize(),
-            "データ元":d.attrs.get("source", "不明"),"データ鮮度":"🟢 OK",
-            "総合AIスコア":float(total),"企業価値スコア":value,
-            "成長性スコア":growth,"テンバガー度":ten,
-            "テクニカルスコア":ts,"AI信頼度":hp,
-            "市場判定":ms,"海外為替判定":os["海外為替判定"],
-            "現在PER":f.get("PER",np.nan),"予想PER":f.get("予想PER",np.nan),
-            "PBR":f.get("PBR",np.nan),"ROE":f.get("ROE",np.nan),
-            "売上成長率":f.get("売上成長率",np.nan),
-            "利益成長率":f.get("利益成長率",np.nan),
-            "時価総額":f.get("時価総額",np.nan),
-            "AI参考価値下限":f.get("AI参考価値下限",np.nan),
-            "AI参考価値":f.get("AI参考価値",np.nan),
-            "AI参考価値上限":f.get("AI参考価値上限",np.nan),
-            "参考価値上昇余地":f.get("参考価値上昇余地",np.nan),
-            "価値算定根拠":f.get("価値算定根拠",""),
-            "実保有銘柄":c in held_codes,
-        })
-
-    latest_columns = [
-        "コード","銘柄名","現在株価","データ最終日","データ元","データ鮮度",
-        "総合AIスコア","企業価値スコア","成長性スコア","テンバガー度",
-        "テクニカルスコア","AI信頼度","市場判定","海外為替判定",
-        "現在PER","予想PER","PBR","ROE","売上成長率","利益成長率","時価総額",
-        "AI参考価値下限","AI参考価値","AI参考価値上限","参考価値上昇余地",
-        "価値算定根拠","実保有銘柄",
-    ]
-    latest_df = pd.DataFrame(latest_rows, columns=latest_columns)
-    if not latest_df.empty:
-        latest_df = latest_df.sort_values("総合AIスコア",ascending=False).reset_index(drop=True)
-
-    # 「今日のBUY」は最低AIスコアを通過した銘柄だけ。候補一覧とは分離する。
-    today_buy_df = (
-        latest_df[latest_df["総合AIスコア"] >= minbuy_score].copy()
-        if not latest_df.empty and not market_data_stale else latest_df.iloc[0:0].copy()
-    )
-    if not today_buy_df.empty:
-        today_buy_df = today_buy_df.sort_values("総合AIスコア", ascending=False).reset_index(drop=True)
-
-    # 現在市場のNO TRADE判定（購入株数計算にも使用）
-    _latest_dt_for_market = max(data[next(iter(data))].index) if data else datetime.now()
-    _current_market_state = market_info(market, _latest_dt_for_market)[0] if not market.empty and data else "⚪ データなし"
-    _market_block = bool(
-        market_data_stale or
-        (no_trade_on_bad_market and ("🔴" in _current_market_state or "🟠" in _current_market_state))
-    )
-
-    purchase_plan_df = build_purchase_plan(
-        today_buy_df, buying_power, current_assets, held_codes, maxpos, maxbuy, sl,
-        reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
-        allow_addon=allow_addon, market_block=_market_block
-    )
-
-    buying_power_df = pd.DataFrame([{
-        "買付余力": float(buying_power),
-        "データ元": buying_power_source,
-        "現金温存率": float(reserve_pct),
-        "1日使用上限率": float(daily_deploy_pct),
-        "1銘柄許容損失率_総資産比": float(risk_per_trade_pct),
-        "寄付価格上振れバッファ": float(price_buffer_pct),
-        "最大保有銘柄数": int(maxpos),
-        "現在保有銘柄数": len(held_codes),
-        "買い増し許可": bool(allow_addon),
-        "市場NO_TRADE": bool(_market_block),
-        "市場判定": _current_market_state,
-    }])
-
-    # ------------------------------------------------------------
-    # 保有銘柄AI
-    # ------------------------------------------------------------
-    holding_rows = []
-    for c in held_codes:
-        t = c + ".T"
-        if market_data_stale or t in stale_tickers:
-            d = data.get(t, pd.DataFrame())
-            latest = pd.NaT if d.empty else pd.Timestamp(d.index.max()).normalize()
-            holding_rows.append({
-                "コード":c,"銘柄名":name(t),"株数":share_map.get(c, np.nan),
-                "取得単価":entry_map.get(c, np.nan),
-                "保有情報データ元":confirmed.get(c, {}).get("source", "SBI約定履歴CSV自動復元"),
-                "現在価格":np.nan,"含み損益率":np.nan,"企業価値スコア":np.nan,
-                "成長性スコア":np.nan,"テンバガー度":np.nan,"AI参考価値":np.nan,
-                "参考価値上昇余地":np.nan,"テクニカルスコア":np.nan,
-                "判定":"🔴 DATA STALE","売却期限目安":"判定停止・データ更新後に再実行",
-                "警戒理由":f"株価データ最終日 {latest.date() if pd.notna(latest) else '取得不可'} / "
-                           f"必要データ日 {market_required_date.date() if pd.notna(market_required_date) else '取得不可'}",
-                "補足":"古いデータではSELL/HOLDを出しません",
-            })
-            continue
-        if t not in data:
-            holding_rows.append({"コード":c,"銘柄名":name(t),"判定":"データ不足","警戒理由":"株価データ取得不可"})
-            continue
-        d = data[t]; r = d.iloc[-1]; p = float(r.Close)
-        ep = entry_map.get(c, np.nan)
-        sh = share_map.get(c, np.nan)
-        pct = (p/ep-1)*100 if np.isfinite(ep) and ep else np.nan
-        alerts = []
-        reasons = []
-
-        if np.isfinite(pct) and pct <= -sl:
-            alerts.append("損切りライン到達")
-        if p < r.MA25 and (r.MA25_Slope < 0 or tech(r,rlo,rhi) < 60):
-            alerts.append("25日線割れ確認")
-        if r.MA25 < r.MA75:
-            alerts.append("25日線<75日線")
-        if r.MA25_Slope < 0:
-            alerts.append("25日線下降")
-
-        f = fundamental_snapshot(t)
-        value = safe_float(f.get("企業価値スコア"),50)
-        growth = safe_float(f.get("成長性スコア"),50)
-        ten = tenbagger_score(f)
-        fair = safe_float(f.get("AI参考価値"),np.nan)
-        upside = safe_float(f.get("参考価値上昇余地"),np.nan)
-
-        if value < 40:
-            alerts.append("企業価値スコア低下")
-        if growth < 40:
-            alerts.append("成長性低下")
-        if np.isfinite(fair) and p > fair*1.20:
-            alerts.append("参考価値に対して割高")
-        if np.isfinite(fair) and p < fair*.75:
-            reasons.append("参考価値に対して割安")
-
-        if len(alerts) >= 3 or ("損切りライン到達" in alerts):
-            decision = "🔴 SELL"
-            deadline = "原則：次の1～3営業日以内"
-        elif len(alerts) >= 1:
-            decision = "🟡 WATCH"
-            deadline = "目安：数営業日～1週間で再判定"
-        else:
-            decision = "🟢 HOLD"
-            deadline = "継続保有・決算/企業価値を監視"
-
-        holding_rows.append({
-            "コード":c,"銘柄名":name(t),"株数":sh,"取得単価":ep,
-            "保有情報データ元": confirmed.get(c, {}).get("source", "SBI約定履歴CSV自動復元"),
-            "現在価格":p,"含み損益率":pct,"企業価値スコア":value,
-            "成長性スコア":growth,"テンバガー度":ten,
-            "AI参考価値":fair,"参考価値上昇余地":upside,
-            "テクニカルスコア":tech(r,rlo,rhi),
-            "判定":decision,"売却期限目安":deadline,
-            "警戒理由":" / ".join(alerts) if alerts else "重大警戒なし",
-            "補足":" / ".join(reasons)
-        })
-
-    holdings_df = pd.DataFrame(holding_rows)
-
-    # ------------------------------------------------------------
-    # UI：保有銘柄
-    # ------------------------------------------------------------
-    st.header("📦 ④ 現在保有銘柄AI診断")
-    if holdings_df.empty:
-        st.info("保有銘柄はまだ登録されていません。SBI約定履歴CSVをアップロードしてください。")
+        buy_view = plan.merge(buy_signal_df[["コード","%K","%D","条件"]], on="コード", how="left")
+        buy_view = buy_view.rename(columns={"購入株数":"参考S株数","予定購入額":"概算購入額"})
+        cols = ["購入優先度","コード","銘柄名","現在株価","参考S株数","概算購入額","購入後推定余力","買付余力使用率","%K","%D","買付可否","見送り理由"]
+        buy_view = buy_view[[c for c in cols if c in buy_view.columns]].head(3).copy()
+        for c in ["現在株価","概算購入額","購入後推定余力"]:
+            if c in buy_view:
+                buy_view[c] = pd.to_numeric(buy_view[c], errors="coerce").round(0)
+        for c in ["買付余力使用率","%K","%D"]:
+            if c in buy_view:
+                buy_view[c] = pd.to_numeric(buy_view[c], errors="coerce").round(2)
+        st.dataframe(buy_view, use_container_width=True, hide_index=True)
+        st.caption(f"参考S株数は買付余力 ¥{int(buying_power):,} と資金管理設定から算出。候補は最大3銘柄です。")
     else:
-        sell_now = holdings_df[holdings_df["判定"]=="🔴 SELL"]
-        watch = holdings_df[holdings_df["判定"]=="🟡 WATCH"]
-        hold = holdings_df[holdings_df["判定"]=="🟢 HOLD"]
-        stale_holdings = holdings_df[holdings_df["判定"]=="🔴 DATA STALE"]
+        st.info("現在、%K≤20のゴールデンクロスに一致する買い候補はありません。")
 
-        c1,c2,c3,c4 = st.columns(4)
-        c1.metric("🔴 SELL",len(sell_now))
-        c2.metric("🟡 WATCH",len(watch))
-        c3.metric("🟢 HOLD",len(hold))
-        c4.metric("DATA STALE",len(stale_holdings))
+    st.caption(f"取得成功：{len(data)}/{len(analysis_tickers)}銘柄。Ver.17では市場・海外・ファンダメンタル・逆算探索を毎回走らせず、ストキャス実運用へ処理を集中しています。")
 
-        if not stale_holdings.empty:
-            st.error("🔴 古い株価データの銘柄は売買判定を停止しています。")
-            st.dataframe(stale_holdings, use_container_width=True, hide_index=True)
-
-        if not sell_now.empty:
-            st.subheader("🔴 早期売却候補")
-            st.dataframe(sell_now, use_container_width=True, hide_index=True)
-        if not watch.empty:
-            st.subheader("🟡 注意・再判定")
-            st.dataframe(watch, use_container_width=True, hide_index=True)
-        if not hold.empty:
-            st.subheader("🟢 保有継続")
-            st.dataframe(hold, use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------------
-    # UI：新規BUY / 購入株数 / テンバガー
-    # ------------------------------------------------------------
-    st.header("🟢 ⑤ 今日の正式BUY / 購入株数 TOP3")
-    if market_data_stale:
-        st.error("🔴 DATA STALEのため、本日の新規BUY判定を停止しています。データ更新後に再実行してください。")
-    elif today_buy_df.empty:
-        st.info(f"💤 BUY基準（AI {minbuy_score}点以上）を満たす銘柄はありません。今日はNO TRADEです。")
-    elif purchase_plan_df.empty:
-        st.warning("正式BUY候補はありますが、資金管理条件により購入株数を出せません。最大保有銘柄数などを確認してください。")
-    else:
-        executable = purchase_plan_df[(purchase_plan_df["買付可否"] == "🟢 BUY") & (purchase_plan_df["購入株数"] > 0)]
-        if executable.empty:
-            st.warning("正式BUY候補はありますが、本日の買付余力・市場・保有上限では購入指示は0株です。")
-        for _, rr in purchase_plan_df.iterrows():
-            if rr["買付可否"] == "🟢 BUY":
-                st.success(
-                    f"**{int(rr['購入優先度'])}位 {rr['銘柄名']}（{rr['コード']}）**｜"
-                    f"AI {rr['総合AIスコア']:.1f}｜**{int(rr['購入株数'])}株**｜"
-                    f"概算 ¥{rr['予定購入額']:,.0f}｜購入後余力 約¥{rr['購入後推定余力']:,.0f}"
-                )
-            else:
-                st.info(
-                    f"{int(rr['購入優先度'])}位 {rr['銘柄名']}（{rr['コード']}）｜0株｜{rr['見送り理由']}"
-                )
-        st.dataframe(purchase_plan_df, use_container_width=True, hide_index=True)
-        st.caption(
-            "購入株数はS株1株単位。現在株価に上振れバッファを加えて余力を引き当てます。"
-            "実際の約定価格は寄付等で変動するため、表示金額は概算です。"
-        )
-
-    st.header("🔥 ⑥ テンバガーAI候補")
-    if latest_df.empty:
-        st.info("候補なし")
-    else:
-        ten_df = latest_df.sort_values("テンバガー度",ascending=False).head(10)
-        st.dataframe(
-            ten_df[["コード","銘柄名","テンバガー度","企業価値スコア","成長性スコア",
-                    "時価総額","予想PER","売上成長率","利益成長率","現在株価"]],
-            use_container_width=True, hide_index=True
-        )
-        st.caption("テンバガー度は『将来10倍を保証する確率』ではなく、成長余地・規模・成長率・収益性等をまとめた探索スコアです。")
-
-    # ------------------------------------------------------------
-    # UI：市場とNO TRADE
-    # ------------------------------------------------------------
-    latest_market_state = _current_market_state
-    st.header("🌎 ⑦ 市場環境 / NO TRADE")
-    if market_data_stale:
-        st.error("🔴 DATA STALE → 市場判定と新規BUYを停止")
-    else:
-        if market_is_proxy:
-            proxy_pct = safe_float(market.attrs.get("proxy_return_pct"), np.nan)
-            proxy_label = f"{proxy_pct:+.2f}%" if np.isfinite(proxy_pct) else "取得不可"
-            st.warning(
-                "市場判定データ：1321.T（日経225連動ETF）の騰落率代理 "
-                f"{proxy_label}。日経平均の正確な終値としては使用しません。"
-            )
-        if "🔴" in latest_market_state or "🟠" in latest_market_state:
-            st.warning(f"市場環境：{latest_market_state} → 無理な新規BUYを抑制")
-        elif latest_market_state == "⚪ 中立":
-            st.info("市場環境：中立 → 銘柄選別を厳格化")
-        else:
-            st.success(f"市場環境：{latest_market_state}")
-
-    # ------------------------------------------------------------
-    # UI：バックテスト成績
-    # ------------------------------------------------------------
-    st.header("📊 ⑧ バックテスト結果")
-    summary = pd.DataFrame({
-        "項目":[
-            "Ver","初期資金","最終資産","損益","損益率","決済トレード数",
-            "勝率","Profit Factor","最大DD","最大DD率","最大連続損失",
-            "ファンダメンタルAI","テンバガーAI","保有銘柄AI","SBI約定履歴CSV",
-            "SBI買付余力","購入株数自動計算","未来情報混入","SBI自動発注"
-        ],
-        "結果":[
-            VERSION,initial,final,final-initial,(final/initial-1)*100 if initial else 0,
-            len(selltr),winrate,pf,maxdd,maxddrate,maxloss,
-            "現在情報のみ・バックテスト未使用","あり","あり","あり",
-            f"¥{int(buying_power):,} ({buying_power_source})","あり","なし","なし"
-        ]
-    })
-    summary = pd.concat([summary, pd.DataFrame([
-        {"項目":"市場判定データ最終日", "結果":market_latest_date.date() if pd.notna(market_latest_date) else "取得失敗"},
-        {"項目":"市場判定方式", "結果":"1321.T騰落率代理" if market_is_proxy else "日経平均直接"},
-        {"項目":"市場判定データ元", "結果":market_source},
-        {"項目":"データ鮮度安全装置", "結果":"🔴 DATA STALE・売買判定停止" if market_data_stale else "🟢 OK"},
-    ])], ignore_index=True)
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------------
-    # AI信頼度 / データ品質
-    # ------------------------------------------------------------
-    st.header("🛡️ ⑨ データ品質・AI安全チェック")
-    quality = pd.DataFrame([
-        {"チェック":"市場データ鮮度","状態":"🔴 DATA STALE" if market_data_stale else "🟢 OK",
-         "内容":f"市場判定最終日: {market_latest_date.date() if pd.notna(market_latest_date) else '取得失敗'} / 古い場合はBUY・SELL・HOLDを停止"},
-        {"チェック":"市場判定方式","状態":"🟡 1321.T代理" if market_is_proxy else "🟢 日経平均直接",
-         "内容":("1321.Tの当日騰落率を市場の移動平均・傾向判定だけに使用。日経平均の正確な終値ではありません"
-                 if market_is_proxy else "日経平均の直接取得値を使用")},
-        {"チェック":"個別株データ鮮度","状態":"🔴 要停止" if stale_held_tickers else "🟢 OK",
-         "内容":f"市場最終日より古い保有銘柄: {len(stale_held_tickers)}件 / 該当銘柄は売買判定停止"},
-        {"チェック":"未来情報","状態":"🟢 OK","内容":"バックテストのBUY/SELL判定は日付時点の価格データのみ"},
-        {"チェック":"現在ファンダメンタル","状態":"🟡 現在分析のみ","内容":"Yahoo Financeの現在情報。過去バックテストには混入させない"},
-        {"チェック":"SBI約定履歴CSV","状態":"🟢 自動復元","内容":"約定履歴の買付・売却を時系列処理し、現在株数と平均取得単価を自動復元。スクショ/OCRは完全除外"},
-        {"チェック":"買付余力","状態":"🟢 連動" if buying_power > 0 else "🟡 未入力","内容":f"{buying_power_source} / 購入株数計算に使用"},
-        {"チェック":"購入株数","状態":"🟢 資金管理","内容":"買付余力・現金温存率・1日上限・損切り幅・1銘柄リスク・価格上振れバッファからS株数を算出"},
-        {"チェック":"SBI自動発注","状態":"🟢 OFF","内容":"注文は行わない"},
-        {"チェック":"NO TRADE","状態":"🟢 ON","内容":"市場悪化・条件不足時は無理なBUYを抑制"},
-    ])
-    st.dataframe(quality, use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------------
-    # CSV/ZIP
-    # ------------------------------------------------------------
-    stock_results = (
-        selltr.groupby(["コード","銘柄名"]).agg(
-            トレード数=("損益","count"),
-            勝ち=("損益",lambda x:(x>0).sum()),
-            損益=("損益","sum"),
-            平均損益=("損益","mean")
-        ).reset_index()
-        if not selltr.empty else pd.DataFrame()
-    )
-
-    if not market.empty:
-        market_export = market.reset_index()
-        market_export["市場判定方式"] = "1321.T騰落率代理" if market_is_proxy else "日経平均直接"
-        market_export["データ元"] = market_source
-        market_export["代理換算値"] = bool(market_is_proxy)
-    else:
-        market_export = pd.DataFrame()
-
-    market_proxy_detail = pd.DataFrame([{
-        "市場判定方式": "1321.T騰落率代理" if market_is_proxy else "日経平均直接",
-        "データ元": market_source,
-        "基準日": market.attrs.get("proxy_base_date", pd.NaT) if not market.empty else pd.NaT,
-        "基準日日経平均終値": market.attrs.get("proxy_base_index_close", np.nan) if not market.empty else np.nan,
-        "基準日1321.T終値": market.attrs.get("proxy_base_close", np.nan) if not market.empty else np.nan,
-        "必要日1321.T終値": market.attrs.get("proxy_required_close", np.nan) if not market.empty else np.nan,
-        "1321.T当日騰落率": market.attrs.get("proxy_return_pct", np.nan) if not market.empty else np.nan,
-        "市場判定用換算値": market.attrs.get("converted_market_close", np.nan) if not market.empty else np.nan,
-        "注意": ("市場環境判定専用の代理値。日経平均の正確な終値ではない"
-                 if market_is_proxy else "代理値は使用していない"),
-    }])
-
-    files = {
-        "00_summary.csv":summary,
-        "00b_buying_power.csv":buying_power_df,
-        "01_today_buy.csv":today_buy_df,
-        "01a_purchase_plan.csv":purchase_plan_df,
-        "01b_current_candidates.csv":latest_df,
-        "02_holdings_ai.csv":holdings_df,
-        "02a_holdings_input.csv":holdings_input_df,
-        "02b_sbi_trade_history.csv":sbi_trades_df.drop(columns=["_dedupe_key","_source_order"], errors="ignore"),
-        "02c_sbi_rebuild_audit.csv":sbi_audit_df,
-        "02d_sbi_account_lots.csv":sbi_lots_df,
-        "02e_sbi_history_warnings.csv":sbi_warning_df,
-        "03_tenbagger_candidates.csv":latest_df.sort_values("テンバガー度",ascending=False) if not latest_df.empty else latest_df,
-        "04_all_ai_analysis.csv":analysis_df,
-        "05_trade_history.csv":trades_df,
-        "06_equity_curve.csv":equity_df,
-        "07_stock_results.csv":stock_results,
-        "08_liquidity_top50.csv":liq,
-        "09_quality_check.csv":quality,
-        "09a_data_freshness.csv":freshness_df,
-        "09b_market_proxy_detail.csv":market_proxy_detail,
-        "09c_data_source_diagnostics.csv":data_source_diagnostics_df,
-        "10_market_data.csv":market_export,
-        "11_overseas_data.csv":overseas.reset_index() if not overseas.empty else pd.DataFrame(),
-    }
-
-    # RC6.12逆算検証を実行済みなら、通常の全処理ZIPへも結果を自動収録する。
-    if "reverse_results" in st.session_state:
-        files["12_reverse_optimization_all.csv"] = st.session_state["reverse_results"]
-    if "reverse_best_params" in st.session_state:
-        bp_zip = st.session_state["reverse_best_params"]
-        bm_zip = st.session_state.get("reverse_best_train", {})
-        om_zip = st.session_state.get("reverse_best_oos", {})
-        files["13_reverse_optimization_best.csv"] = pd.DataFrame([{
-            "候補": st.session_state.get("reverse_best_no", np.nan),
-            "損切り%": bp_zip.get("sl"), "利確%": bp_zip.get("tp"),
-            "RSI下限": bp_zip.get("rlo"), "RSI上限": bp_zip.get("rhi"),
-            "最低テクニカル": bp_zip.get("mintech"), "最低AI": bp_zip.get("minbuy"),
-            "ギャップ上限%": bp_zip.get("max_gap"), "最大保有": bp_zip.get("maxpos"),
-            "1銘柄上限円": bp_zip.get("maxbuy"),
-            "市場条件": " / ".join(bp_zip.get("market_states", ())),
-            "海外条件": " / ".join(bp_zip.get("overseas_states", ())),
-            "学習月利CAGR%": bm_zip.get("monthly_cagr_pct"), "学習PF": bm_zip.get("pf"),
-            "学習最大DD%": bm_zip.get("maxdd_pct"), "学習決済数": bm_zip.get("sells"),
-            "OOS月利CAGR%": om_zip.get("monthly_cagr_pct"), "OOS総損益%": om_zip.get("return_pct"),
-            "OOS_PF": om_zip.get("pf"), "OOS最大DD%": om_zip.get("maxdd_pct"),
-            "OOS決済数": om_zip.get("sells"),
-        }])
-        files["14_reverse_oos_result.csv"] = pd.DataFrame([om_zip])
-        files["15_reverse_best_trades.csv"] = st.session_state.get("reverse_best_trades", pd.DataFrame())
-        files["16_reverse_best_equity.csv"] = st.session_state.get("reverse_best_equity", pd.DataFrame())
-
-    # ストキャスGC単独検証を実行済みなら、通常の全処理ZIPにも収録する。
-    if "stoch_results" in st.session_state:
-        files["20_stoch_gc_comparison.csv"] = st.session_state["stoch_results"]
-        files["21_stoch_gc_parameters.csv"] = pd.DataFrame([st.session_state.get("stoch_params", {})])
-        for smode_, payload_ in st.session_state.get("stoch_payload", {}).items():
-            strades_, sequity_ = payload_
-            ssafe_ = {"DC":"dc","TP/SL":"tpsl","10日保有":"fixed_hold"}.get(smode_, "other")
-            files[f"22_stoch_{ssafe_}_trades.csv"] = strades_
-            files[f"23_stoch_{ssafe_}_equity.csv"] = sequity_
-
-    # ストキャスGC 5段階＋70/30 OOS検証も、実行済みなら全処理ZIPへ収録する。
-    if "stoch_level5_train_results" in st.session_state:
-        files["24_stoch_gc_level5_train_comparison.csv"] = st.session_state["stoch_level5_train_results"]
-        files["25_stoch_gc_level5_parameters.csv"] = pd.DataFrame([st.session_state.get("stoch_level5_params", {})])
-        files["26_stoch_gc_level5_oos_summary.csv"] = st.session_state.get("stoch_level5_oos_summary", pd.DataFrame())
-        level5_safe_ = {"%K≤10":"k10", "%K≤15":"k15", "%K≤20":"k20", "%K≤25":"k25", "%K≤30":"k30"}
-        for level_label_, payload_ in st.session_state.get("stoch_level5_train_payload", {}).items():
-            ltrades_, lequity_ = payload_
-            lsafe_ = level5_safe_.get(level_label_, "other")
-            files[f"27_stoch_level5_train_{lsafe_}_trades.csv"] = ltrades_
-            files[f"28_stoch_level5_train_{lsafe_}_equity.csv"] = lequity_
-        files["29_stoch_level5_oos_selected_trades.csv"] = st.session_state.get("stoch_level5_oos_trades", pd.DataFrame())
-        files["30_stoch_level5_oos_selected_equity.csv"] = st.session_state.get("stoch_level5_oos_equity", pd.DataFrame())
-
-    buf = io.BytesIO()
-    with ZipFile(buf,"w") as z:
-        for fn,df in files.items():
-            z.writestr(fn,csv_bytes(df))
-    buf.seek(0)
-
-    st.header("📦 ⑩ 全処理データ")
-    st.download_button(
-        "📦 Ver.6.0 全処理データをZIPでダウンロード",
-        buf.getvalue(),
-        "ver6_0_RC6_8_all_analysis.zip",
-        "application/zip",
-        use_container_width=True
-    )
-
-    st.caption(
-        "※本版は投資判断補助・検証用です。月利10%・1億円到達・テンバガー化・"
-        "AI適正株価・購入株数による利益を保証するものではありません。SBIへの自動発注は行いません。"
-    )
+st.divider()
+st.caption("RC6.17は売買判断補助です。自動発注は行いません。旧RC6.16は別ファイルで保存し、比較・復元できるようにしています。")

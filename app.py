@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "6.0 RC6.16 STOCH FORMAL CANDIDATE"
-BUILD = "VER6.0-RC6.16-STOCH-K20-SELL-OPT-OOS-20260911"
+VERSION = "6.0 RC6.17 STOCH S-SHARE GUIDE"
+BUILD = "VER6.0-RC6.17-STOCH-S-SHARE-HOLDING-SELL-20260911"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3534,20 +3534,102 @@ with tab_stoch:
         selected=float(rr["SELL_%K下限"]); sell_text="DCなら位置を問わずSELL" if selected<=0 else f"%K≥{selected:g}の位置でデッドクロスしたらSELL"
         st.warning(f"RC6.16 正式候補ロジック：BUY = %K≤20でGC → 翌営業日寄付。SELL = {sell_text} → 翌営業日寄付。※最終採用はこのOOS結果を確認して固定します。")
 
-        # 現在日のRC6.16候補シグナルを表示
-        latest_signals=[]
+        # 現在日のRC6.17候補シグナルを表示
+        # BUY: ストキャス条件一致銘柄に、既存の資金管理ロジックでS株の参考株数を付与。
+        # SELL: SBI約定履歴CSVから復元された「現在保有中」の銘柄だけを対象にする。
+        buy_signal_rows=[]
+        sell_signal_rows=[]
+        held_code_set=set(map(str, held_codes))
+
         for t,df0 in data.items():
-            if df0 is None or df0.empty: continue
-            sx=_stoch_prepare(df0,14,3,3); r=sx.iloc[-1]; sk=safe_float(r.get("STOCH_K")); sd=safe_float(r.get("STOCH_D"))
-            if bool(r.get("STOCH_GC",False)) and np.isfinite(sk) and sk<=20:
-                latest_signals.append({"コード":code(t),"銘柄名":name(t),"判定":"買い候補","%K":sk,"%D":sd,"条件":"%K≤20 GC"})
-            if code(t) in set(held_codes) and bool(r.get("STOCH_DC",False)) and np.isfinite(sk) and sk>=selected:
-                latest_signals.append({"コード":code(t),"銘柄名":name(t),"判定":"売り候補","%K":sk,"%D":sd,"条件":sell_text})
-        st.subheader("🧭 RC6.16 現在シグナル（検証候補）")
-        if latest_signals:
-            ls=pd.DataFrame(latest_signals); ls["%K"]=ls["%K"].round(2); ls["%D"]=ls["%D"].round(2); st.dataframe(ls,use_container_width=True,hide_index=True)
+            if df0 is None or df0.empty:
+                continue
+            sx=_stoch_prepare(df0,14,3,3)
+            if sx is None or sx.empty:
+                continue
+            r=sx.iloc[-1]
+            sk=safe_float(r.get("STOCH_K"))
+            sd=safe_float(r.get("STOCH_D"))
+            px=safe_float(r.get("Close"))
+            c=code(t)
+
+            if bool(r.get("STOCH_GC",False)) and np.isfinite(sk) and sk<=20 and np.isfinite(px) and px>0:
+                buy_signal_rows.append({
+                    "コード":c,
+                    "銘柄名":name(t),
+                    "総合AIスコア":100.0-float(sk),  # 株数計算用の並び順。低い%Kを優先。
+                    "現在株価":float(px),
+                    "%K":float(sk),
+                    "%D":float(sd),
+                    "条件":"%K≤20 GC",
+                })
+
+            # SELL候補は「現在保有中」だけ。未保有銘柄のSELLシグナルは表示しない。
+            sell_ok = bool(r.get("STOCH_DC",False)) and np.isfinite(sk) and (selected<=0 or sk>=selected)
+            if c in held_code_set and sell_ok:
+                h=confirmed.get(c,{}) if isinstance(confirmed,dict) else {}
+                sell_signal_rows.append({
+                    "コード":c,
+                    "銘柄名":name(t),
+                    "保有株数":int(safe_float(h.get("shares",h.get("株数",0))) or 0),
+                    "取得単価":safe_float(h.get("avg_price",h.get("取得単価",np.nan))),
+                    "現在株価":float(px) if np.isfinite(px) else np.nan,
+                    "%K":float(sk) if np.isfinite(sk) else np.nan,
+                    "%D":float(sd) if np.isfinite(sd) else np.nan,
+                    "条件":sell_text,
+                })
+
+        st.subheader("🧭 RC6.17 ストキャス現在シグナル")
+
+        st.markdown("#### 🟢 買い候補 — S株なら何株？（参考）")
+        if buy_signal_rows:
+            buy_signal_df=pd.DataFrame(buy_signal_rows).sort_values(["%K","コード"],ascending=[True,True]).reset_index(drop=True)
+
+            # 最大保有数だけで参考株数が0になるのを避けるため、表示用は最大3枠を仮確保。
+            # ただし既存の余力・現金温存・1日使用上限・損失許容・価格バッファはそのまま使う。
+            stoch_plan=build_purchase_plan(
+                buy_signal_df, buying_power, current_assets, held_codes,
+                max(int(maxpos),len(held_code_set)+3), maxbuy, sl,
+                reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
+                allow_addon=allow_addon, market_block=False
+            )
+
+            # ストキャス値を戻して、ユーザーが朝見る項目だけに整理する。
+            buy_view=stoch_plan.merge(
+                buy_signal_df[["コード","%K","%D","条件"]],on="コード",how="left"
+            )
+            buy_view=buy_view.rename(columns={
+                "購入株数":"参考S株数",
+                "予定購入額":"概算購入額",
+            })
+            show_cols=[
+                "購入優先度","コード","銘柄名","現在株価","参考S株数",
+                "概算購入額","買付余力使用率","%K","%D","買付可否","見送り理由"
+            ]
+            buy_view=buy_view[[c for c in show_cols if c in buy_view.columns]].copy()
+            for c in ["現在株価","概算購入額"]:
+                if c in buy_view:
+                    buy_view[c]=pd.to_numeric(buy_view[c],errors="coerce").round(0)
+            for c in ["買付余力使用率","%K","%D"]:
+                if c in buy_view:
+                    buy_view[c]=pd.to_numeric(buy_view[c],errors="coerce").round(2)
+            st.dataframe(buy_view.head(3),use_container_width=True,hide_index=True)
+            st.caption(
+                f"参考株数は現在の買付余力 ¥{int(buying_power):,} と既存の資金管理設定から算出します。"
+                "実際のS株注文数を自動発注するものではありません。"
+            )
         else:
-            st.info("現在はRC6.16ストキャス条件に一致する買い・売りシグナルはありません。")
+            st.info("現在、%K≤20のゴールデンクロスに一致する買い候補はありません。")
+
+        st.markdown("#### 🔻 売り候補 — 現在保有中のみ")
+        if sell_signal_rows:
+            sell_view=pd.DataFrame(sell_signal_rows)
+            for c in ["取得単価","現在株価","%K","%D"]:
+                if c in sell_view:
+                    sell_view[c]=pd.to_numeric(sell_view[c],errors="coerce").round(2)
+            st.dataframe(sell_view,use_container_width=True,hide_index=True)
+        else:
+            st.info("現在保有中の銘柄には、ストキャスSELL条件に一致する売り候補はありません。")
 
         sout=io.BytesIO()
         with ZipFile(sout,"w") as z:

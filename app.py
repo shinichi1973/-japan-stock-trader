@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.2",
+    page_title="日本株 AI投資アシスタント Ver.17.3",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.2 STOCH + VALUE AI AUTO"
-BUILD = "VER17-2-STOCH-VALUE-AI-AUTO-20260913"
+VERSION = "17.3 STOCH + VALUE AI SPLIT GUARD"
+BUILD = "VER17-3-STOCH-VALUE-AI-SPLIT-GUARD-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1267,13 +1267,112 @@ def info_num(info, *keys):
                 return x
     return np.nan
 
+def parse_split_factor(v):
+    """Yahooの lastSplitFactor 等を 5:1 -> 5.0 のように正規化する。"""
+    if v is None:
+        return np.nan
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        x = safe_float(v)
+        return x if np.isfinite(x) and x > 0 else np.nan
+    txt = str(v).strip().replace(" ", "")
+    m = re.match(r"^([0-9.]+)[:/]([0-9.]+)$", txt)
+    if m:
+        a, b = safe_float(m.group(1)), safe_float(m.group(2))
+        if np.isfinite(a) and np.isfinite(b) and a > 0 and b > 0:
+            return a / b
+    x = safe_float(txt)
+    return x if np.isfinite(x) and x > 0 else np.nan
+
+
+def split_date_from_info(v):
+    """lastSplitDate をJSTの日付へ変換。取得不能ならNaT。"""
+    try:
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return pd.NaT
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            return pd.to_datetime(int(v), unit="s", utc=True).tz_convert(JST).tz_localize(None)
+        return pd.to_datetime(v, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+
+def _split_recent(split_date, max_days=1095):
+    if pd.isna(split_date):
+        return False
+    try:
+        d = pd.Timestamp(split_date).date()
+        return 0 <= (tokyo_now().date() - d).days <= int(max_days)
+    except Exception:
+        return False
+
+
+def _adjust_by_split_to_implied(raw_value, implied_value, split_factor, recent=True):
+    """
+    EPSなどについて、株価/PEから逆算した同一株式基準の値と照合し、
+    直近分割比率で説明できるズレだけを補正する。
+    戻り値: (補正後, 補正有無, 判定文)
+    """
+    raw = safe_float(raw_value)
+    implied = safe_float(implied_value)
+    f = safe_float(split_factor)
+    if not (np.isfinite(raw) and raw > 0):
+        return np.nan, False, "値なし"
+    if not (recent and np.isfinite(f) and f > 1.01 and np.isfinite(implied) and implied > 0):
+        return raw, False, "照合材料不足" if recent else "分割補正対象外"
+
+    def dist(x):
+        return abs(math.log(max(x, 1e-12) / implied))
+
+    candidates = [(raw, "raw"), (raw / f, "divide"), (raw * f, "multiply")]
+    best_val, best_kind = min(candidates, key=lambda z: dist(z[0]))
+    raw_dist, best_dist = dist(raw), dist(best_val)
+    # 分割補正によって誤差が十分に縮み、補正後が暗黙値の±35%以内なら採用。
+    if best_kind != "raw" and best_dist < raw_dist * 0.45 and 0.65 <= best_val / implied <= 1.35:
+        op = f"÷{f:g}" if best_kind == "divide" else f"×{f:g}"
+        return float(best_val), True, f"分割補正{op}"
+    return raw, False, "補正根拠不足"
+
+
+def _adjust_target_for_split(target, current_price, split_factor, recent=True):
+    """
+    アナリスト目標株価は基準日が取得できないため、極端な乖離時だけ分割比率で補正。
+    補正が一意に確認できなければ使用停止して安全側へ倒す。
+    """
+    t = safe_float(target)
+    p = safe_float(current_price)
+    f = safe_float(split_factor)
+    if not (np.isfinite(t) and t > 0):
+        return np.nan, False, False, "目標株価なし"
+    if not (np.isfinite(p) and p > 0):
+        return t, False, False, "現在株価なし"
+    if not (recent and np.isfinite(f) and f > 1.01):
+        return t, False, False, "分割補正対象外"
+
+    raw_ratio = t / p
+    # 0.40〜2.50倍なら、通常の目標株価レンジとしてそのまま採用。
+    if 0.40 <= raw_ratio <= 2.50:
+        return t, False, False, "補正不要"
+
+    candidates = [(t / f, f"÷{f:g}"), (t * f, f"×{f:g}")]
+    plausible = [(v, label) for v, label in candidates if 0.40 <= v / p <= 2.50]
+    if len(plausible) == 1:
+        v, label = plausible[0]
+        # 補正後が現在株価に明確に近づく場合だけ採用。
+        if abs(math.log(v / p)) < abs(math.log(t / p)) * 0.65:
+            return float(v), True, False, f"分割補正{label}"
+    # 分割後基準か分割前基準かを断定できないため、適正株価算定から除外。
+    return np.nan, False, True, "⚠️分割基準不明のため目標株価を除外"
+
+
 @st.cache_data(ttl=21600)
-def fundamental_snapshot(t):
-    """現在情報のみ。過去バックテストには使用しない。"""
+def fundamental_snapshot(t, market_price_hint=np.nan):
+    """現在情報のみ。過去バックテストには使用しない。株式分割ズレを最優先で防止する。"""
     try:
         tk = yf.Ticker(t)
         info = tk.info or {}
-        price = info_num(info, "currentPrice", "regularMarketPrice")
+        info_price = info_num(info, "currentPrice", "regularMarketPrice")
+        hint = safe_float(market_price_hint)
+        price = hint if np.isfinite(hint) and hint > 0 else info_price
         market_cap = info_num(info, "marketCap")
         trailing_pe = info_num(info, "trailingPE")
         forward_pe = info_num(info, "forwardPE")
@@ -1295,6 +1394,27 @@ def fundamental_snapshot(t):
         book_value = info_num(info, "bookValue")
         sector = str(info.get("sector") or "")
         industry = str(info.get("industry") or "")
+
+        # Yahooが返す直近株式分割情報。基準の違うEPS/目標株価を混ぜないため最優先で確認。
+        split_factor_raw = info.get("lastSplitFactor")
+        split_factor = parse_split_factor(split_factor_raw)
+        split_date = split_date_from_info(info.get("lastSplitDate"))
+        split_recent = _split_recent(split_date, max_days=1095)
+        split_notes = []
+        split_adjusted = False
+        split_warning = False
+        if split_recent and np.isfinite(split_factor) and split_factor > 1.01:
+            split_notes.append(f"直近分割 {pd.Timestamp(split_date).date()} / {split_factor:g}:1")
+        elif np.isfinite(split_factor) and split_factor > 1.01:
+            split_notes.append(f"過去分割 {split_factor:g}:1（3年以上前）")
+        else:
+            split_notes.append("直近分割情報なし")
+
+        if np.isfinite(info_price) and np.isfinite(price) and price > 0:
+            price_gap = abs(info_price / price - 1.0)
+            if price_gap >= 0.20:
+                split_warning = True
+                split_notes.append(f"情報株価と日足株価に{price_gap*100:.1f}%差")
 
         # スコア：取得できない項目は中立にし、欠損で過剰に低評価しない。
         scores = []
@@ -1328,8 +1448,8 @@ def fundamental_snapshot(t):
         valuation_score = float(np.mean(valuation_scores)) if valuation_scores else 50.0
 
         # AI参考適正株価レンジ。
-        # 1点の断定値ではなく、アナリスト目標と利益ベース評価を可能な範囲で合成する。
-        # これは現在時点の参考評価であり、過去バックテストへは混ぜない。
+        # 株式分割がある銘柄では「現在株価・EPS・目標株価」が同一株式基準かを先に照合する。
+        # 一致を確認できない材料は、無理に補正せず適正株価計算から除外する。
         sec = (sector + " " + industry).lower()
         if any(k in sec for k in ["bank", "insurance", "financial"]):
             sector_pe = 12.0
@@ -1344,13 +1464,45 @@ def fundamental_snapshot(t):
         else:
             sector_pe = 18.0
 
-        eps_for_value = forward_eps if np.isfinite(forward_eps) and forward_eps > 0 else trailing_eps
+        # EPSはPEから逆算できる場合、分割前/後基準のズレを機械的に照合。
+        trailing_eps_adj = trailing_eps
+        forward_eps_adj = forward_eps
+        trailing_implied = price / trailing_pe if np.isfinite(price) and price > 0 and np.isfinite(trailing_pe) and trailing_pe > 0 else np.nan
+        forward_implied = price / forward_pe if np.isfinite(price) and price > 0 and np.isfinite(forward_pe) and forward_pe > 0 else np.nan
+        if split_recent and np.isfinite(split_factor) and split_factor > 1.01:
+            trailing_eps_adj, tr_adj, tr_note = _adjust_by_split_to_implied(trailing_eps, trailing_implied, split_factor, True)
+            forward_eps_adj, fw_adj, fw_note = _adjust_by_split_to_implied(forward_eps, forward_implied, split_factor, True)
+            if tr_adj or fw_adj:
+                split_adjusted = True
+                split_notes.append("EPS:" + ",".join([n for n in [tr_note if tr_adj else "", fw_note if fw_adj else ""] if n]))
+            # PE照合ができない直近分割銘柄のEPSは安全のため価値算定に使わない。
+            if np.isfinite(forward_eps_adj) and not np.isfinite(forward_implied):
+                forward_eps_adj = np.nan
+                split_warning = True
+                split_notes.append("予想EPSは分割基準を照合できず除外")
+            if np.isfinite(trailing_eps_adj) and not np.isfinite(trailing_implied):
+                trailing_eps_adj = np.nan
+                split_warning = True
+                split_notes.append("実績EPSは分割基準を照合できず除外")
+
+        eps_for_value = forward_eps_adj if np.isfinite(forward_eps_adj) and forward_eps_adj > 0 else trailing_eps_adj
         earnings_fair = eps_for_value * sector_pe if np.isfinite(eps_for_value) and eps_for_value > 0 else np.nan
+
+        target_mean_adj, target_adj, target_blocked, target_note = _adjust_target_for_split(
+            target_mean, price, split_factor, split_recent
+        )
+        if target_adj:
+            split_adjusted = True
+            split_notes.append("目標株価:" + target_note)
+        if target_blocked:
+            split_warning = True
+            split_notes.append(target_note)
+
         fair_candidates = []
         fair_weights = []
         fair_parts = []
-        if np.isfinite(target_mean) and target_mean > 0:
-            fair_candidates.append(target_mean); fair_weights.append(.60); fair_parts.append("アナリスト目標")
+        if np.isfinite(target_mean_adj) and target_mean_adj > 0:
+            fair_candidates.append(target_mean_adj); fair_weights.append(.60); fair_parts.append("アナリスト目標")
         if np.isfinite(earnings_fair) and earnings_fair > 0:
             fair_candidates.append(earnings_fair); fair_weights.append(.40); fair_parts.append(f"EPS×業種PER({sector_pe:.0f}倍)")
 
@@ -1358,14 +1510,29 @@ def fundamental_snapshot(t):
             w = np.array(fair_weights[:len(fair_candidates)], dtype=float)
             w = w / w.sum()
             fair_base = float(np.average(np.array(fair_candidates, dtype=float), weights=w))
-            fair_low = fair_base * .82
-            fair_high = fair_base * 1.18
-            upside = (fair_base / price - 1) * 100
-            fair_source = " + ".join(fair_parts)
+            # 分割警告が残る場合はレンジを広げず「算定不能」に倒す。
+            if split_warning and split_recent:
+                fair_low = fair_high = np.nan
+                fair_base = np.nan
+                upside = np.nan
+                fair_source = "⚠️株式分割基準を確認できず算定停止"
+            else:
+                fair_low = fair_base * .82
+                fair_high = fair_base * 1.18
+                upside = (fair_base / price - 1) * 100
+                fair_source = " + ".join(fair_parts)
         else:
             fair_low = fair_base = fair_high = np.nan
             upside = np.nan
             fair_source = "適正株価レンジ算出材料不足"
+
+        split_status = (
+            "⚠️ 分割補正確認" if split_warning and split_recent else
+            "✅ 分割補正済" if split_adjusted else
+            "✅ 分割影響確認済" if split_recent else
+            "— 直近分割なし"
+        )
+        split_note_text = " / ".join(dict.fromkeys([str(x) for x in split_notes if str(x).strip()]))
 
         value_score = float(np.clip(
             valuation_score * .45 + growth_score * .35 +
@@ -1382,8 +1549,13 @@ def fundamental_snapshot(t):
             "利益成長率":earnings_growth,"D/E":debt_to_equity,
             "流動比率":current_ratio,"FCF":free_cf,"目標株価参考":target_mean,
             "52週高値":fifty_two_high,"52週安値":fifty_two_low,
-            "予想EPS":forward_eps,"実績EPS":trailing_eps,"BPS":book_value,
+            "予想EPS":forward_eps_adj,"実績EPS":trailing_eps_adj,"BPS":book_value,
+            "予想EPS_元値":forward_eps,"実績EPS_元値":trailing_eps,
+            "目標株価参考_補正後":target_mean_adj,
             "セクター":sector,"業種":industry,
+            "株式分割補正":split_status,"直近分割日":str(pd.Timestamp(split_date).date()) if not pd.isna(split_date) else "",
+            "直近分割比率":split_factor if np.isfinite(split_factor) else np.nan,
+            "株式分割メモ":split_note_text,
             "成長性スコア":growth_score,"バリュエーションスコア":valuation_score,
             "企業価値スコア":value_score,"AI参考価値下限":fair_low,
             "AI参考価値":fair_base,"AI参考価値上限":fair_high,
@@ -1812,7 +1984,7 @@ def build_purchase_plan(candidates, buying_power, current_assets, held_codes, ma
 
 
 # ------------------------------------------------------------
-# Ver.17.1 企業価値AI TOP50 — 現在時点の比較検証用
+# Ver.17.3 企業価値AI TOP50 — 株式分割補正ガード付き比較検証用
 # ------------------------------------------------------------
 def _percentile_score(series, higher_better=True):
     s = pd.to_numeric(series, errors="coerce")
@@ -1871,7 +2043,7 @@ def build_value_ai_top50(data, max_rows=50):
     fund_rows = []
     for _, r in base.iterrows():
         t = r["ticker"]
-        f = fundamental_snapshot(t)
+        f = fundamental_snapshot(t, market_price_hint=safe_float(r.get("現在株価_価格")))
         fund_rows.append({
             "ticker": t,
             "企業価値スコア": safe_float(f.get("企業価値スコア"), 50),
@@ -1886,6 +2058,13 @@ def build_value_ai_top50(data, max_rows=50):
             "売上成長率%": safe_float(f.get("売上成長率")) * 100.0,
             "利益成長率%": safe_float(f.get("利益成長率")) * 100.0,
             "適正株価根拠": str(f.get("価値算定根拠", "")),
+            "株式分割補正": str(f.get("株式分割補正", "")),
+            "直近分割日": str(f.get("直近分割日", "")),
+            "直近分割比率": safe_float(f.get("直近分割比率")),
+            "株式分割メモ": str(f.get("株式分割メモ", "")),
+            "目標株価参考_補正後": safe_float(f.get("目標株価参考_補正後")),
+            "予想EPS_元値": safe_float(f.get("予想EPS_元値")),
+            "予想EPS_補正後": safe_float(f.get("予想EPS")),
             "ファンダ取得状態": str(f.get("取得状態", "")),
         })
     out = base.merge(pd.DataFrame(fund_rows), on="ticker", how="left")
@@ -1900,10 +2079,13 @@ def build_value_ai_top50(data, max_rows=50):
         out["トレンドスコア"] * .13 +
         out["値動き安定スコア"] * .10
     ).clip(0, 100)
-    out["割安判定"] = out["参考価値上昇余地%"].apply(
-        lambda u: "算定不能" if not np.isfinite(u) else
-        "🟢 割安" if u >= 20 else "🟡 やや割安" if u >= 5 else
-        "⚪ 適正圏" if u > -10 else "🔴 割高"
+    out["割安判定"] = out.apply(
+        lambda rr: "⚠️ 分割補正確認" if "⚠️" in str(rr.get("株式分割補正", "")) else
+        ("算定不能" if not np.isfinite(safe_float(rr.get("参考価値上昇余地%"))) else
+         "🟢 割安" if safe_float(rr.get("参考価値上昇余地%")) >= 20 else
+         "🟡 やや割安" if safe_float(rr.get("参考価値上昇余地%")) >= 5 else
+         "⚪ 適正圏" if safe_float(rr.get("参考価値上昇余地%")) > -10 else "🔴 割高"),
+        axis=1
     )
     out = out.sort_values(["AI_TOP50スコア", "流動性スコア"], ascending=[False, False]).reset_index(drop=True)
     out.insert(0, "順位", np.arange(1, len(out) + 1))
@@ -2115,14 +2297,15 @@ if data:
                 st.session_state["v17_value_ai_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
         if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
             show_cols = ["順位","コード","銘柄名","現在株価_価格","AI参考価値下限","AI参考価値","AI参考価値上限",
-                         "参考価値上昇余地%","割安判定","企業価値スコア","成長性スコア","流動性スコア","トレンドスコア","AI_TOP50スコア"]
+                         "参考価値上昇余地%","割安判定","株式分割補正","直近分割日","直近分割比率",
+                         "企業価値スコア","成長性スコア","流動性スコア","トレンドスコア","AI_TOP50スコア"]
             vshow = value_top50_df[[c for c in show_cols if c in value_top50_df.columns]].copy()
             for c in ["現在株価_価格","AI参考価値下限","AI参考価値","AI参考価値上限"]:
                 if c in vshow: vshow[c] = pd.to_numeric(vshow[c], errors="coerce").round(0)
             for c in ["参考価値上昇余地%","企業価値スコア","成長性スコア","流動性スコア","トレンドスコア","AI_TOP50スコア"]:
                 if c in vshow: vshow[c] = pd.to_numeric(vshow[c], errors="coerce").round(1)
             st.dataframe(vshow, use_container_width=True, hide_index=True)
-            st.caption("適正株価はアナリスト目標とEPS×業種PERを利用できる範囲で合成した参考レンジです。算定不能銘柄は無理に値を作りません。")
+            st.caption("Ver.17.3では株式分割補正を最優先します。直近分割後のEPS・目標株価が同一株式基準と確認できない場合は、無理に適正株価を出さず『⚠️ 分割補正確認』として算定停止します。")
         else:
             st.warning("企業価値AI TOP50を生成できませんでした。ZIPには空の比較ファイルと状態ファイルを保存します。")
 
@@ -2271,9 +2454,10 @@ try:
             "自動生成": True,
             "ストキャス対象に使用": bool(use_value_top50),
             "TOP50件数": int(len(value_top50_df)) if isinstance(value_top50_df, pd.DataFrame) else 0,
+            "株式分割補正警告件数": int(value_top50_df["株式分割補正"].astype(str).str.contains("⚠️").sum()) if isinstance(value_top50_df, pd.DataFrame) and "株式分割補正" in value_top50_df.columns else 0,
             "生成日時": st.session_state.get("v17_value_ai_generated_at", ""),
             "株価データ署名": st.session_state.get("v17_value_ai_signature", ""),
-            "用途": "比較検証用。設定OFF時は実売買シグナルへ不使用",
+            "用途": "比較検証用。設定OFF時は実売買シグナルへ不使用。Ver17.3は株式分割補正を最優先",
         }])
         zf.writestr("value_ai_status.csv", value_status_df.to_csv(index=False, encoding="utf-8-sig"))
         if data:

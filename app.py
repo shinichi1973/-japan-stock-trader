@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.8 TRUE VALUE AI TOP50 + BT DATA"
-BUILD = "VER17-8-TRUE-VALUE-AI-TOP50-BT-DATA-20260913"
+VERSION = "17.9 ROBUST VALUE AI TOP50"
+BUILD = "VER17-9-ROBUST-TOP50-OOS-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2131,10 +2131,13 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90):
     )
     # 一次選抜は「企業の良し悪し」ではなく、売買対象として十分な流動性があり、
     # 極端に扱いにくい値動きでないかを絞る入口。企業価値はこの後に評価する。
+    # 5年日足（2021-09-13〜2026-09-11）で70/30 OOS検証した堅牢値。
+    # 学習期間の利益最大ではなく、未学習期間でもPF・DDが崩れにくい組み合わせを採用。
+    # 流動性45% / トレンド30% / 値動き安定性25%
     base["一次選抜スコア"] = (
-        base["流動性スコア"] * .62 +
-        base["トレンドスコア"] * .23 +
-        base["値動き安定スコア"] * .15
+        base["流動性スコア"] * .45 +
+        base["トレンドスコア"] * .30 +
+        base["値動き安定スコア"] * .25
     ).clip(0, 100)
     base = base.sort_values(["一次選抜スコア", "流動性スコア"], ascending=[False, False]).reset_index(drop=True)
     base["一次選抜順位"] = np.arange(1, len(base) + 1)
@@ -2412,9 +2415,10 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
     return x
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.8")
+st.title("📈 日本株 AI投資アシスタント Ver.17.9")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("本物の企業価値AI TOP50 → Slow Stochastic 14,3,3 → BUY候補だけをシンプル表示")
+st.caption("一次選抜は5年OOS検証済み：流動性45% / トレンド30% / 値動き安定性25%")
 st.caption("母集団は日本株の売買代金上位を数百銘柄自動取得。旧49銘柄の固定リストは新規BUY選定には使いません。")
 
 # ------------------------------------------------------------
@@ -2497,7 +2501,7 @@ with st.expander("⚙ 管理者設定", expanded=False):
     c1, c2 = st.columns(2)
     universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n")
     fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool")
-    st.caption("標準：350銘柄 → 流動性等で90銘柄へ一次選抜 → 企業価値AIでTOP50。BUYはそのTOP50だけ。")
+    st.caption("標準：350銘柄 → 5年OOS検証済み一次選抜（45/30/25）で90銘柄 → 企業価値AIでTOP50。BUYはそのTOP50だけ。")
 
 run_clicked = st.button("▶ 今日の判定を更新", type="primary", use_container_width=True, key="v177_run")
 
@@ -2658,6 +2662,12 @@ with admin_tab:
                    "企業価値スコア","成長性スコア","流動性スコア","AI_TOP50スコア","適正株価異常値ガード","株式分割補正"]
         admin_show=value_top50_df[[c for c in show_cols if c in value_top50_df.columns]].copy()
         st.dataframe(admin_show, use_container_width=True, hide_index=True)
+    with st.expander("🧪 5年OOS検証メモ", expanded=False):
+        st.caption("過去時点のOHLCVだけで作るTOP50フィルターを70%学習 / 30%未学習で検証。企業価値ファンダメンタル自体の過去再現ではありません。")
+        st.write("採用値：流動性45% / トレンド30% / 値動き安定性25%")
+        st.write("学習期間：+54.27% / PF 2.10 / 最大DD -10.04% / 257決済")
+        st.write("OOS期間：+16.10% / PF 1.89 / 最大DD -5.25% / 81決済")
+        st.write("5年通算参考：60万円 → 約105.6万円 / +76.01% / PF 2.09 / 最大DD -10.04% / 339決済")
     with st.expander("現在保有", expanded=False):
         if confirmed:
             st.dataframe(pd.DataFrame([{"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]} for c,v in confirmed.items()]), use_container_width=True, hide_index=True)
@@ -2731,6 +2741,8 @@ try:
             "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
             "TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
+            "一次選抜_流動性重み":0.45,"一次選抜_トレンド重み":0.30,"一次選抜_安定性重み":0.25,
+            "OOS検証済み":True,"OOS_PF参考":1.89,"5年通算PF参考":2.09,
             "BUY候補件数":len(buy_export),"SELL候補件数":len(sell_view),"エラー":run_error,
             "生成日時":st.session_state.get("v177_generated_at","")
         }])

@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.10",
+    page_title="日本株 AI投資アシスタント Ver.17.11",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.10 ROBUST TOP50 + INDICATOR LAB"
-BUILD = "VER17-10-INDICATOR-COMPARE-20260913"
+VERSION = "17.11 TOP50 + SURGE RADAR"
+BUILD = "VER17-11-TOP50-SURGE-RADAR-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2502,6 +2502,117 @@ def build_indicator_compare(data, top50_codes, held_codes=None):
     out = out.sort_values(["一致数","コード"], ascending=[False, True]).reset_index(drop=True)
     return out
 
+
+def build_top50_surge_radar(data, value_top50_df):
+    """旧Ver.5.5系の急騰予兆センサーを、現在の企業価値AI TOP50だけへ適用する。
+
+    管理者向けの観察センサーであり、正式なBUY/SELL判定には接続しない。
+    旧版にあった「株価2,000円未満」の除外条件は復活させない。
+    ニュース取得も追加せず、取得済みOHLCVだけで軽量に計算する。
+    """
+    columns = [
+        "急騰順位", "TOP50順位", "コード", "銘柄名", "現在株価",
+        "急騰予兆スコア", "急騰予兆判定", "AI_TOP50スコア", "割安判定",
+        "RSI", "5日騰落率", "25日騰落率", "出来高倍率", "MA25乖離率",
+        "MA25傾き", "20日高値更新", "出来高ポイント", "騰落率ポイント",
+        "トレンドポイント", "ブレイクポイント", "過熱減点",
+        "Stoch_BUY", "%K", "%D", "正式売買へ影響",
+    ]
+    if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    meta = value_top50_df.copy()
+    meta["コード"] = meta["コード"].astype(str)
+    meta = meta.head(50).set_index("コード", drop=False)
+    target_codes = set(meta.index.tolist())
+    rows = []
+
+    for t, df0 in (data or {}).items():
+        c = code(t)
+        if c not in target_codes or df0 is None or df0.empty or len(df0) < 30:
+            continue
+
+        x = df0.sort_index().copy()
+        close = pd.to_numeric(x["Close"], errors="coerce")
+        high = pd.to_numeric(x["High"], errors="coerce")
+        volume = pd.to_numeric(x["Volume"], errors="coerce")
+        ma25 = close.rolling(25).mean()
+        vol20 = volume.rolling(20).mean()
+        ma25_slope = ma25 - ma25.shift(5)
+        ret5 = close.pct_change(5) * 100.0
+        ret25 = close.pct_change(25) * 100.0
+        volume_ratio = volume / vol20.replace(0, np.nan)
+
+        # 旧版と同じ14日RSI（単純移動平均方式）。
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).rolling(14).mean()
+        loss = (-delta.clip(upper=0.0)).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi14 = 100.0 - (100.0 / (1.0 + rs))
+
+        px = safe_float(close.iloc[-1])
+        r5 = safe_float(ret5.iloc[-1])
+        r25 = safe_float(ret25.iloc[-1])
+        vr = safe_float(volume_ratio.iloc[-1])
+        m25 = safe_float(ma25.iloc[-1])
+        slope = safe_float(ma25_slope.iloc[-1])
+        rsi = safe_float(rsi14.iloc[-1])
+        if not all(np.isfinite(v) for v in [px, r5, r25, vr, m25, slope]) or px <= 0 or m25 <= 0:
+            continue
+
+        ma25_gap = (px / m25 - 1.0) * 100.0
+        prior20 = safe_float(high.shift(1).rolling(20).max().iloc[-1])
+        breakout = bool(np.isfinite(prior20) and px > prior20)
+
+        # 旧・急騰予兆レーダーのポイント配分を復元（ニュース点は0点）。
+        vol_pts = 30 if vr >= 3 else 22 if vr >= 2 else 14 if vr >= 1.5 else 6 if vr >= 1.2 else 0
+        ret_pts = 24 if 8 <= r5 <= 25 else 18 if 5 <= r5 < 8 else 10 if 0 <= r5 < 5 else 6 if r5 > 25 else 0
+        trend_pts = 18 if slope > 0 and px > m25 else 10 if slope > 0 else 0
+        breakout_pts = 18 if breakout else 0
+        overheat_penalty = 18 if r5 >= 30 or (np.isfinite(rsi) and rsi >= 80) else 10 if r5 >= 20 or (np.isfinite(rsi) and rsi >= 75) else 0
+        score = int(np.clip(vol_pts + ret_pts + trend_pts + breakout_pts - overheat_penalty, 0, 100))
+
+        state = (
+            "🚨 強い急騰予兆" if score >= 70 else
+            "🟠 急騰予兆" if score >= 55 else
+            "🟡 変化検知" if score >= 40 else
+            "⚪ 通常"
+        )
+
+        sx = stoch_prepare_light(df0, 14, 3, 3)
+        sk = sd = np.nan
+        st_buy = False
+        if not sx.empty:
+            sr = sx.iloc[-1]
+            sk, sd = safe_float(sr.get("STOCH_K")), safe_float(sr.get("STOCH_D"))
+            st_buy = bool(sr.get("STOCH_GC", False)) and np.isfinite(sk) and sk <= 20.0
+
+        mr = meta.loc[c]
+        rows.append({
+            "TOP50順位": int(safe_float(mr.get("順位"), 0)),
+            "コード": c, "銘柄名": str(mr.get("銘柄名", name(t))), "現在株価": px,
+            "急騰予兆スコア": score, "急騰予兆判定": state,
+            "AI_TOP50スコア": safe_float(mr.get("AI_TOP50スコア")),
+            "割安判定": str(mr.get("割安判定", "")),
+            "RSI": rsi, "5日騰落率": r5, "25日騰落率": r25,
+            "出来高倍率": vr, "MA25乖離率": ma25_gap, "MA25傾き": slope,
+            "20日高値更新": "🟢 更新" if breakout else "—",
+            "出来高ポイント": vol_pts, "騰落率ポイント": ret_pts,
+            "トレンドポイント": trend_pts, "ブレイクポイント": breakout_pts,
+            "過熱減点": -overheat_penalty,
+            "Stoch_BUY": bool(st_buy), "%K": sk, "%D": sd,
+            "正式売買へ影響": False,
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    out = pd.DataFrame(rows).sort_values(
+        ["急騰予兆スコア", "出来高倍率", "TOP50順位"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+    out.insert(0, "急騰順位", np.arange(1, len(out) + 1))
+    return out[[c for c in columns if c in out.columns]]
+
 def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     """Slow Stochastic 14,3,3。Ver.16で採用したBUY/SELL判定専用。"""
     if df is None or df.empty:
@@ -2730,6 +2841,11 @@ indicator_compare_df = build_indicator_compare(data, true_top50_codes, held_code
 if not isinstance(indicator_compare_df, pd.DataFrame):
     indicator_compare_df = pd.DataFrame()
 
+# 管理者研究用。旧Ver.5.5系の急騰予兆を企業価値AI TOP50だけへ適用。
+surge_top50_df = build_top50_surge_radar(data, value_top50_df) if data and true_top50_codes else pd.DataFrame()
+if not isinstance(surge_top50_df, pd.DataFrame):
+    surge_top50_df = pd.DataFrame()
+
 # ------------------------------------------------------------
 # シンプル画面 + 目立たない管理者タブ
 # ------------------------------------------------------------
@@ -2769,6 +2885,36 @@ with admin_tab:
                    "企業価値スコア","成長性スコア","流動性スコア","AI_TOP50スコア","適正株価異常値ガード","株式分割補正"]
         admin_show=value_top50_df[[c for c in show_cols if c in value_top50_df.columns]].copy()
         st.dataframe(admin_show, use_container_width=True, hide_index=True)
+    with st.expander("🚀 TOP50・急騰予兆センサー", expanded=False):
+        st.caption("旧Ver.5.5系の急騰予兆を企業価値AI TOP50だけに適用。観察専用で、正式なBUY/SELLには影響しません。")
+        st.write("判定：70点以上＝強い急騰予兆、55点以上＝急騰予兆、40点以上＝変化検知。株価2,000円以上も除外しません。")
+        if surge_top50_df.empty:
+            st.info("先に『今日の判定を更新』で企業価値AI TOP50を作成してください。")
+        else:
+            strong_n = int((pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce") >= 70).sum())
+            alert_n = int((pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce") >= 55).sum())
+            change_n = int((pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce") >= 40).sum())
+            stoch_match_n = int((
+                (pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce") >= 55) &
+                surge_top50_df["Stoch_BUY"].fillna(False).astype(bool)
+            ).sum())
+            s1,s2,s3,s4 = st.columns(4)
+            s1.metric("強い急騰予兆", strong_n)
+            s2.metric("急騰予兆以上", alert_n)
+            s3.metric("変化検知以上", change_n)
+            s4.metric("予兆＋Stoch BUY", stoch_match_n)
+
+            surge_show = surge_top50_df.copy()
+            for c in ["現在株価","急騰予兆スコア","AI_TOP50スコア","RSI","5日騰落率","25日騰落率","出来高倍率","MA25乖離率","MA25傾き","%K","%D"]:
+                if c in surge_show.columns:
+                    surge_show[c] = pd.to_numeric(surge_show[c], errors="coerce").round(2)
+            display_cols = [
+                "急騰順位","TOP50順位","コード","銘柄名","現在株価","急騰予兆スコア","急騰予兆判定",
+                "AI_TOP50スコア","割安判定","RSI","5日騰落率","25日騰落率","出来高倍率",
+                "MA25乖離率","20日高値更新","Stoch_BUY","%K","%D"
+            ]
+            st.dataframe(surge_show[[c for c in display_cols if c in surge_show.columns]], use_container_width=True, hide_index=True)
+            st.caption("TOP50全銘柄をスコア順に表示します。詳細な配点は全処理ZIPへ保存します。")
     with st.expander("🧪 インジケーター研究：Stoch vs RSI5 vs BB20", expanded=False):
         st.caption("比較専用です。実売買は従来どおりStoch 14,3,3 / %K≤20 GCのみを使用します。")
         st.write("研究条件：RSI(5)は15以下から15上抜け、BB20は-2σ下抜け後のバンド内復帰。")
@@ -2842,7 +2988,7 @@ try:
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20（実売買には不使用）",
+            "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
             "SELL条件":f"保有銘柄のみ / Slow Stoch DC または 損切り -{float(sl):.1f}%",
             "旧49銘柄固定ユニバース使用":False,
         }])
@@ -2863,6 +3009,20 @@ try:
         zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
         compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()
         zf.writestr("indicator_compare_candidates.csv", compare_export.to_csv(index=False,encoding="utf-8-sig"))
+        surge_export = surge_top50_df.copy() if isinstance(surge_top50_df, pd.DataFrame) else pd.DataFrame()
+        zf.writestr("surge_prediction_top50.csv", surge_export.to_csv(index=False,encoding="utf-8-sig"))
+        surge_summary = pd.DataFrame([{
+            "生成日時": st.session_state.get("v177_generated_at",""),
+            "対象": "企業価値AI TOP50のみ",
+            "強い急騰予兆_70点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 70).sum()),
+            "急騰予兆_55点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55).sum()),
+            "変化検知_40点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 40).sum()),
+            "予兆55点以上かつStoch_BUY": int(((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55) & surge_export.get("Stoch_BUY", pd.Series(False, index=surge_export.index)).fillna(False).astype(bool)).sum()),
+            "株価2000円以上除外": False,
+            "ニュース加点": False,
+            "実売買へ影響": False,
+        }])
+        zf.writestr("surge_prediction_summary.csv", surge_summary.to_csv(index=False,encoding="utf-8-sig"))
         compare_summary = pd.DataFrame([{
             "生成日時": st.session_state.get("v177_generated_at",""),
             "実売買方式": "Stoch 14,3,3 / %K<=20 GC",

@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.7",
+    page_title="日本株 AI投資アシスタント Ver.17.10",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.9 ROBUST VALUE AI TOP50"
-BUILD = "VER17-9-ROBUST-TOP50-OOS-20260913"
+VERSION = "17.10 ROBUST TOP50 + INDICATOR LAB"
+BUILD = "VER17-10-INDICATOR-COMPARE-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2400,6 +2400,108 @@ def batch_stock_data_light(tickers_tuple, months=15):
 # ============================================================
 # Ver.17 MAIN — ストキャスティクス実運用版
 # ============================================================
+
+
+def rsi_prepare_light(df, period=5):
+    """管理者比較用RSI。実売買シグナルには使わない。
+    BUY: RSI(period) が15以下の領域から15を上抜く。
+    """
+    if df is None or df.empty or len(df) < max(20, period + 3):
+        return pd.DataFrame()
+    x = df.sort_index().copy()
+    close = pd.to_numeric(x["Close"], errors="coerce")
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0/period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1.0/period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    x[f"RSI{period}"] = rsi
+    prev = rsi.shift(1)
+    x["RSI_BUY"] = (prev <= 15.0) & (rsi > 15.0)
+    x["RSI_SELL"] = (prev < 65.0) & (rsi >= 65.0)
+    return x
+
+
+def bb_prepare_light(df, period=20, std_mult=2.0):
+    """管理者比較用ボリンジャーバンド。実売買シグナルには使わない。
+    BUY: 前日終値が-2σ以下、当日終値が-2σの内側へ復帰。
+    """
+    if df is None or df.empty or len(df) < period + 3:
+        return pd.DataFrame()
+    x = df.sort_index().copy()
+    close = pd.to_numeric(x["Close"], errors="coerce")
+    mid = close.rolling(period).mean()
+    sd = close.rolling(period).std(ddof=0)
+    lower = mid - std_mult * sd
+    upper = mid + std_mult * sd
+    x["BB_MID"] = mid
+    x["BB_LOWER"] = lower
+    x["BB_UPPER"] = upper
+    x["BB_BUY"] = (close.shift(1) <= lower.shift(1)) & (close > lower)
+    x["BB_SELL"] = close >= mid
+    return x
+
+
+def build_indicator_compare(data, top50_codes, held_codes=None):
+    """管理者研究用: 同一TOP50で Stoch / RSI5 / BB20 の現在シグナルを比較。
+    実売買のBUY/SELL判定には一切接続しない。
+    """
+    held_codes = set(map(str, held_codes or []))
+    rows = []
+    for t, df0 in (data or {}).items():
+        c = code(t)
+        if c not in set(map(str, top50_codes)) or c in held_codes:
+            continue
+        if df0 is None or df0.empty:
+            continue
+        px = safe_float(pd.to_numeric(df0["Close"], errors="coerce").iloc[-1])
+        if not np.isfinite(px) or px <= 0:
+            continue
+
+        sx = stoch_prepare_light(df0, 14, 3, 3)
+        rx = rsi_prepare_light(df0, 5)
+        bx = bb_prepare_light(df0, 20, 2.0)
+
+        sk = sd = rsi5 = bbl = np.nan
+        st_buy = rsi_buy = bb_buy = False
+        if not sx.empty:
+            rr = sx.iloc[-1]
+            sk, sd = safe_float(rr.get("STOCH_K")), safe_float(rr.get("STOCH_D"))
+            st_buy = bool(rr.get("STOCH_GC", False)) and np.isfinite(sk) and sk <= 20.0
+        if not rx.empty:
+            rr = rx.iloc[-1]
+            rsi5 = safe_float(rr.get("RSI5"))
+            rsi_buy = bool(rr.get("RSI_BUY", False))
+        if not bx.empty:
+            rr = bx.iloc[-1]
+            bbl = safe_float(rr.get("BB_LOWER"))
+            bb_buy = bool(rr.get("BB_BUY", False))
+
+        methods = []
+        if st_buy: methods.append("Stoch")
+        if rsi_buy: methods.append("RSI5")
+        if bb_buy: methods.append("BB20")
+        if not methods:
+            continue
+        rows.append({
+            "コード": c, "銘柄名": name(t), "現在株価": px,
+            "Stoch_BUY": bool(st_buy), "%K": sk, "%D": sd,
+            "RSI5_BUY": bool(rsi_buy), "RSI5": rsi5,
+            "BB20_BUY": bool(bb_buy), "BB下限": bbl,
+            "一致数": int(st_buy) + int(rsi_buy) + int(bb_buy),
+            "発火方式": "+".join(methods),
+        })
+    if not rows:
+        return pd.DataFrame(columns=[
+            "コード","銘柄名","現在株価","Stoch_BUY","%K","%D",
+            "RSI5_BUY","RSI5","BB20_BUY","BB下限","一致数","発火方式"
+        ])
+    out = pd.DataFrame(rows)
+    out = out.sort_values(["一致数","コード"], ascending=[False, True]).reset_index(drop=True)
+    return out
+
 def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     """Slow Stochastic 14,3,3。Ver.16で採用したBUY/SELL判定専用。"""
     if df is None or df.empty:
@@ -2623,6 +2725,11 @@ if sell_signal_rows:
 else:
     sell_view=pd.DataFrame(columns=sell_cols)
 
+# 管理者研究用。実売買には一切使わない3方式比較。
+indicator_compare_df = build_indicator_compare(data, true_top50_codes, held_codes) if data and true_top50_codes else pd.DataFrame()
+if not isinstance(indicator_compare_df, pd.DataFrame):
+    indicator_compare_df = pd.DataFrame()
+
 # ------------------------------------------------------------
 # シンプル画面 + 目立たない管理者タブ
 # ------------------------------------------------------------
@@ -2662,6 +2769,24 @@ with admin_tab:
                    "企業価値スコア","成長性スコア","流動性スコア","AI_TOP50スコア","適正株価異常値ガード","株式分割補正"]
         admin_show=value_top50_df[[c for c in show_cols if c in value_top50_df.columns]].copy()
         st.dataframe(admin_show, use_container_width=True, hide_index=True)
+    with st.expander("🧪 インジケーター研究：Stoch vs RSI5 vs BB20", expanded=False):
+        st.caption("比較専用です。実売買は従来どおりStoch 14,3,3 / %K≤20 GCのみを使用します。")
+        st.write("研究条件：RSI(5)は15以下から15上抜け、BB20は-2σ下抜け後のバンド内復帰。")
+        if indicator_compare_df.empty:
+            st.info("現在、TOP50内で3方式のいずれかがBUY点灯している銘柄はありません。")
+        else:
+            comp_show = indicator_compare_df.copy()
+            for c in ["現在株価","%K","%D","RSI5","BB下限"]:
+                if c in comp_show.columns:
+                    comp_show[c] = pd.to_numeric(comp_show[c], errors="coerce").round(2)
+            st.dataframe(comp_show, use_container_width=True, hide_index=True)
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("Stoch BUY", int(comp_show["Stoch_BUY"].sum()) if "Stoch_BUY" in comp_show else 0)
+            c2.metric("RSI5 BUY", int(comp_show["RSI5_BUY"].sum()) if "RSI5_BUY" in comp_show else 0)
+            c3.metric("BB20 BUY", int(comp_show["BB20_BUY"].sum()) if "BB20_BUY" in comp_show else 0)
+            c4.metric("2方式以上一致", int((pd.to_numeric(comp_show.get("一致数", 0), errors="coerce") >= 2).sum()))
+        st.caption("日々の比較結果は全処理ZIP内の indicator_compare_candidates.csv に保存します。")
+
     with st.expander("🧪 5年OOS検証メモ", expanded=False):
         st.caption("過去時点のOHLCVだけで作るTOP50フィルターを70%学習 / 30%未学習で検証。企業価値ファンダメンタル自体の過去再現ではありません。")
         st.write("採用値：流動性45% / トレンド30% / 値動き安定性25%")
@@ -2717,7 +2842,7 @@ try:
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC",
+            "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20（実売買には不使用）",
             "SELL条件":f"保有銘柄のみ / Slow Stoch DC または 損切り -{float(sl):.1f}%",
             "旧49銘柄固定ユニバース使用":False,
         }])
@@ -2736,6 +2861,20 @@ try:
         buy_export=buy_view.copy() if isinstance(buy_view,pd.DataFrame) and not buy_view.empty else pd.DataFrame(columns=buy_cols_default)
         zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
         zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
+        compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()
+        zf.writestr("indicator_compare_candidates.csv", compare_export.to_csv(index=False,encoding="utf-8-sig"))
+        compare_summary = pd.DataFrame([{
+            "生成日時": st.session_state.get("v177_generated_at",""),
+            "実売買方式": "Stoch 14,3,3 / %K<=20 GC",
+            "研究_RSI5": "RSI(5) 15以下から15上抜け",
+            "研究_BB20": "BB20 -2σ外から内側復帰",
+            "Stoch_BUY件数": int(compare_export["Stoch_BUY"].sum()) if not compare_export.empty and "Stoch_BUY" in compare_export else 0,
+            "RSI5_BUY件数": int(compare_export["RSI5_BUY"].sum()) if not compare_export.empty and "RSI5_BUY" in compare_export else 0,
+            "BB20_BUY件数": int(compare_export["BB20_BUY"].sum()) if not compare_export.empty and "BB20_BUY" in compare_export else 0,
+            "2方式以上一致件数": int((pd.to_numeric(compare_export["一致数"], errors="coerce") >= 2).sum()) if not compare_export.empty and "一致数" in compare_export else 0,
+            "実売買へ影響": False,
+        }])
+        zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
         status_df=pd.DataFrame([{
             "本物TOP50モード":True,"母集団最低200銘柄ガード":True,
             "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,

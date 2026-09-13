@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.7 TRUE VALUE AI TOP50"
-BUILD = "VER17-7-TRUE-VALUE-AI-TOP50-SIMPLE-20260913"
+VERSION = "17.8 TRUE VALUE AI TOP50 + BT DATA"
+BUILD = "VER17-8-TRUE-VALUE-AI-TOP50-BT-DATA-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2290,6 +2290,69 @@ def _prepare_light_history_frame(df):
     return x.dropna(subset=["MA25", "MA75", "ATR14", "Return_25d"])
 
 
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def export_backtest_history_5y(tickers_tuple):
+    """管理者検証用。現在の大規模母集団について5年分の日足OHLCVを長形式で取得する。
+    売買ロジックには一切使用しない。
+    """
+    ts = list(dict.fromkeys([str(t) for t in tickers_tuple if str(t).endswith(".T")]))
+    rows = []
+    failed = []
+    if not ts:
+        return pd.DataFrame(), pd.DataFrame(columns=["ticker","コード","理由"])
+    for i in range(0, len(ts), 50):
+        chunk = ts[i:i+50]
+        try:
+            raw = yf.download(
+                tickers=chunk, period="5y", interval="1d",
+                auto_adjust=False, actions=False, progress=False, threads=True,
+                group_by="ticker", timeout=30,
+            )
+        except Exception as e:
+            raw = pd.DataFrame()
+            for t in chunk:
+                failed.append({"ticker":t,"コード":code(t),"理由":f"一括取得失敗: {e}"})
+        if raw is None or raw.empty:
+            continue
+        for t in chunk:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    if t in raw.columns.get_level_values(0):
+                        one = raw[t].copy()
+                    elif t in raw.columns.get_level_values(1):
+                        one = raw.xs(t, axis=1, level=1).copy()
+                    else:
+                        failed.append({"ticker":t,"コード":code(t),"理由":"銘柄列なし"})
+                        continue
+                else:
+                    if len(chunk) != 1:
+                        failed.append({"ticker":t,"コード":code(t),"理由":"列形式不一致"})
+                        continue
+                    one = raw.copy()
+                one = one.rename_axis("日付").reset_index()
+                keep = [c for c in ["日付","Open","High","Low","Close","Adj Close","Volume"] if c in one.columns]
+                one = one[keep].copy()
+                one["ticker"] = t
+                one["コード"] = code(t)
+                one["銘柄名"] = name(t)
+                for c in ["Open","High","Low","Close","Adj Close","Volume"]:
+                    if c in one.columns:
+                        one[c] = pd.to_numeric(one[c], errors="coerce")
+                one = one.dropna(subset=[c for c in ["Open","High","Low","Close"] if c in one.columns])
+                if one.empty:
+                    failed.append({"ticker":t,"コード":code(t),"理由":"有効日足なし"})
+                    continue
+                rows.append(one)
+            except Exception as e:
+                failed.append({"ticker":t,"コード":code(t),"理由":str(e)[:160]})
+    hist = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if not hist.empty:
+        hist["日付"] = pd.to_datetime(hist["日付"], errors="coerce").dt.strftime("%Y-%m-%d")
+        hist = hist.sort_values(["コード","日付"]).reset_index(drop=True)
+    return hist, pd.DataFrame(failed)
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def batch_stock_data_light(tickers_tuple, months=15):
     """数百銘柄の日足をyfinanceで分割一括取得。1銘柄ずつ取得するより大幅に軽量。"""
@@ -2349,7 +2412,7 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
     return x
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.7")
+st.title("📈 日本株 AI投資アシスタント Ver.17.8")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("本物の企業価値AI TOP50 → Slow Stochastic 14,3,3 → BUY候補だけをシンプル表示")
 st.caption("母集団は日本株の売買代金上位を数百銘柄自動取得。旧49銘柄の固定リストは新規BUY選定には使いません。")
@@ -2600,6 +2663,38 @@ with admin_tab:
             st.dataframe(pd.DataFrame([{"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]} for c,v in confirmed.items()]), use_container_width=True, hide_index=True)
         else:
             st.caption("保有情報なし")
+
+
+    with st.expander("🧪 バックテスト用5年日足データ（管理者）", expanded=False):
+        st.caption("この出力は検証専用です。売買判定には使いません。現在の大規模母集団の5年OHLCVを取得します。")
+        st.warning("企業価値AIを過去時点で完全再現するには、当時のファンダメンタル/目標株価データが別途必要です。このデータだけでできるのは347銘柄ストキャス検証と、現TOP50を固定した参考検証です。")
+        if isinstance(universe_df, pd.DataFrame) and not universe_df.empty:
+            bt_tickers = tuple(universe_df["ticker"].astype(str).tolist()) if "ticker" in universe_df.columns else tuple(tickers(",".join(universe_df["コード"].astype(str).tolist())))
+            if st.button("5年日足バックテストデータを作成", key="v178_make_btdata"):
+                with st.spinner(f"{len(bt_tickers)}銘柄の5年日足を取得中… 数分かかる場合があります。"):
+                    bt_hist, bt_failed = export_backtest_history_5y(bt_tickers)
+                bbuf = io.BytesIO()
+                with ZipFile(bbuf, "w") as bzf:
+                    bzf.writestr("backtest_history_5y.csv", bt_hist.to_csv(index=False, encoding="utf-8-sig"))
+                    bzf.writestr("backtest_universe.csv", universe_df.to_csv(index=False, encoding="utf-8-sig"))
+                    if isinstance(value_top50_df, pd.DataFrame):
+                        bzf.writestr("current_value_ai_top50.csv", value_top50_df.to_csv(index=False, encoding="utf-8-sig"))
+                    bzf.writestr("backtest_history_failures.csv", bt_failed.to_csv(index=False, encoding="utf-8-sig"))
+                    manifest = pd.DataFrame([{
+                        "Version": VERSION, "Build": BUILD,
+                        "母集団件数": len(universe_df),
+                        "5年日足取得成功銘柄数": int(bt_hist["コード"].nunique()) if not bt_hist.empty and "コード" in bt_hist.columns else 0,
+                        "総日足行数": len(bt_hist),
+                        "取得失敗件数": len(bt_failed),
+                        "用途": "この場での347銘柄ストキャス5年バックテスト用",
+                        "注意": "過去時点の企業価値AI TOP50完全再現にはpoint-in-timeファンダメンタルが必要",
+                    }])
+                    bzf.writestr("backtest_manifest.csv", manifest.to_csv(index=False, encoding="utf-8-sig"))
+                bbuf.seek(0)
+                st.success(f"5年日足：{bt_hist['コード'].nunique() if not bt_hist.empty and 'コード' in bt_hist.columns else 0}銘柄 / {len(bt_hist):,}行")
+                st.download_button("📦 バックテスト用5年日足ZIP", data=bbuf.getvalue(), file_name="ver17_backtest_history_5y.zip", mime="application/zip", use_container_width=True, key="v178_btzip")
+        else:
+            st.info("先に『今日の判定を更新』で大規模母集団を作成してください。")
 
 # ------------------------------------------------------------
 # ZIP — メイン画面の最下部に1ボタンだけ

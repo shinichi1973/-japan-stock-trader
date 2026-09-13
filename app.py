@@ -39,8 +39,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.5 STOCH + VALUE AI SELL EXPORT FIX"
-BUILD = "VER17-5-STOCH-VALUE-AI-SELL-EXPORT-FIX-20260913"
+VERSION = "17.6 STOCH + VALUE AI BUY COMPARE"
+BUILD = "VER17-6-STOCH-VALUE-AI-BUY-COMPARE-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2200,10 +2200,10 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
     return x
 
-st.title("📉 日本株 AI投資アシスタント Ver.17.2")
+st.title("📉 日本株 AI投資アシスタント Ver.17.6")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("メインロジック：AI選定TOP50 × Slow Stochastic 14,3,3｜BUY=%K≤20のGC｜SELL=DC＋損切りセンサー")
-st.info("Ver.17.2：企業価値AI TOP50を比較用として自動生成・ZIP保存。既存ストキャス売買ルールは変更していません。")
+st.info("Ver.17.6：従来ストキャスBUYに加え、企業価値AI TOP50を採用した場合のBUY候補を比較表示・ZIP保存します。実売買への採用OFFなら従来売買ロジックは変更しません。")
 st.caption("旧ロジック一式はVer.16として別ファイル保存。Ver.17ではストキャス実トレードに必要な処理だけを優先し、重い逆算探索・旧バックテスト画面は実行しません。")
 
 # ------------------------------------------------------------
@@ -2396,7 +2396,7 @@ if data:
             for c in ["参考価値上昇余地%","企業価値スコア","成長性スコア","流動性スコア","トレンドスコア","AI_TOP50スコア"]:
                 if c in vshow: vshow[c] = pd.to_numeric(vshow[c], errors="coerce").round(1)
             st.dataframe(vshow, use_container_width=True, hide_index=True)
-            st.caption("Ver.17.4では株式分割補正に加え、現在株価・EPS理論株価・目標株価をクロスチェックします。3倍超/1/3未満の極端値や、EPSと目標株価が1.8倍以上食い違う場合は異常側を自動除外します。")
+            st.caption("Ver.17.6では株式分割補正に加え、現在株価・EPS理論株価・目標株価をクロスチェックします。3倍超/1/3未満の極端値や、EPSと目標株価が1.8倍以上食い違う場合は異常側を自動除外します。")
         else:
             st.warning("企業価値AI TOP50を生成できませんでした。ZIPには空の比較ファイルと状態ファイルを保存します。")
 
@@ -2406,6 +2406,60 @@ if data and use_value_top50 and isinstance(value_top50_df, pd.DataFrame) and not
     data_for_signal = {t:d for t,d in data.items() if code(t) in selected_codes}
 else:
     data_for_signal = data
+
+# ------------------------------------------------------------
+# ②-B 比較専用：企業価値AI TOP50を採用した場合のストキャスBUY
+# 実売買設定がOFFでも毎回計算し、従来BUYとの比較材料として表示・ZIP保存する。
+# ------------------------------------------------------------
+value_ai_buy_view = pd.DataFrame()
+value_ai_buy_signal_rows = []
+if data and isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
+    value_rank_codes = set(value_top50_df["コード"].astype(str).head(50).tolist())
+    held_code_set_compare = set(map(str, held_codes))
+    for t, df0 in data.items():
+        c = code(t)
+        if c not in value_rank_codes or c in held_code_set_compare:
+            continue
+        sx = stoch_prepare_light(df0, 14, 3, 3)
+        if sx.empty:
+            continue
+        rr = sx.iloc[-1]
+        sk = safe_float(rr.get("STOCH_K"))
+        sd = safe_float(rr.get("STOCH_D"))
+        px = safe_float(rr.get("Close"))
+        if (np.isfinite(px) and px > 0 and bool(rr.get("STOCH_GC", False))
+                and np.isfinite(sk) and sk <= 20):
+            value_ai_buy_signal_rows.append({
+                "コード": c, "銘柄名": name(t), "総合AIスコア": 100.0 - float(sk),
+                "現在株価": float(px), "%K": float(sk), "%D": float(sd), "条件": "%K≤20 GC",
+            })
+
+    if value_ai_buy_signal_rows:
+        _value_buy_df = pd.DataFrame(value_ai_buy_signal_rows).sort_values(["%K","コード"]).reset_index(drop=True)
+        _value_plan = build_purchase_plan(
+            _value_buy_df, buying_power, current_assets, held_codes,
+            max(int(maxpos), len(held_code_set_compare) + 3), maxbuy, sl,
+            reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
+            allow_addon=False, market_block=False,
+        )
+        value_ai_buy_view = _value_plan.merge(_value_buy_df[["コード","%K","%D","条件"]], on="コード", how="left")
+        value_ai_buy_view = value_ai_buy_view.rename(columns={"購入株数":"参考S株数","予定購入額":"概算購入額"})
+        _rank_cols = [c for c in ["コード","順位","AI_TOP50スコア","割安判定","AI参考価値","参考価値上昇余地%"] if c in value_top50_df.columns]
+        if _rank_cols:
+            _rank_meta = value_top50_df[_rank_cols].copy()
+            _rank_meta["コード"] = _rank_meta["コード"].astype(str)
+            value_ai_buy_view["コード"] = value_ai_buy_view["コード"].astype(str)
+            value_ai_buy_view = value_ai_buy_view.merge(_rank_meta, on="コード", how="left")
+        _value_cols = ["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額",
+                       "購入後推定余力","買付余力使用率","%K","%D","AI_TOP50スコア","割安判定",
+                       "AI参考価値","参考価値上昇余地%","買付可否","見送り理由"]
+        value_ai_buy_view = value_ai_buy_view[[c for c in _value_cols if c in value_ai_buy_view.columns]].head(3).copy()
+        for c in ["現在株価","概算購入額","購入後推定余力","AI参考価値"]:
+            if c in value_ai_buy_view:
+                value_ai_buy_view[c] = pd.to_numeric(value_ai_buy_view[c], errors="coerce").round(0)
+        for c in ["買付余力使用率","%K","%D","AI_TOP50スコア","参考価値上昇余地%"]:
+            if c in value_ai_buy_view:
+                value_ai_buy_view[c] = pd.to_numeric(value_ai_buy_view[c], errors="coerce").round(2)
 
 if not data:
     st.info("上の『ストキャス判定を更新』を押すと、買い・売り候補を表示します。")
@@ -2505,6 +2559,13 @@ else:
     else:
         st.info("現在、%K≤20のゴールデンクロスに一致する買い候補はありません。")
 
+    st.subheader("🧪 比較 — 企業価値AI TOP50を採用した場合のBUY候補")
+    st.caption("ここは比較専用です。上の『企業価値AI TOP50をストキャス対象に使う』がOFFなら、実売買候補には反映しません。")
+    if isinstance(value_ai_buy_view, pd.DataFrame) and not value_ai_buy_view.empty:
+        st.dataframe(value_ai_buy_view, use_container_width=True, hide_index=True)
+    else:
+        st.info("企業価値AI TOP50内には、現在 %K≤20のゴールデンクロスに一致する新規BUY候補はありません。")
+
     st.caption(f"取得成功：{len(data)}/{len(analysis_tickers)}銘柄。シグナル監視：{len(data_for_signal)}銘柄。企業価値AI TOP50は比較記録用に自動生成し、実売買への採用は設定ON時のみです。")
 
 # ------------------------------------------------------------
@@ -2554,13 +2615,17 @@ try:
             "適正株価異常値ガード件数": int(value_top50_df["適正株価異常値ガード"].astype(str).str.contains("⚠️").sum()) if isinstance(value_top50_df, pd.DataFrame) and "適正株価異常値ガード" in value_top50_df.columns else 0,
             "生成日時": st.session_state.get("v17_value_ai_generated_at", ""),
             "株価データ署名": st.session_state.get("v17_value_ai_signature", ""),
-            "用途": "比較検証用。設定OFF時は実売買シグナルへ不使用。Ver17.5は株式分割補正＋適正株価異常値クロスチェック＋BUY/SELL ZIP分離ガード",
+            "用途": "比較検証用。設定OFF時は実売買シグナルへ不使用。Ver17.6は株式分割補正＋適正株価異常値クロスチェック＋BUY/SELL ZIP分離ガード＋企業価値AI TOP50採用時BUY比較",
         }])
         zf.writestr("value_ai_status.csv", value_status_df.to_csv(index=False, encoding="utf-8-sig"))
         if data:
             # Ver.17.5: ZIPは表示変数の存在判定に頼らず、当回に初期化・生成したDataFrameだけを書き出す。
-            buy_export_df = buy_view.copy() if isinstance(buy_view, pd.DataFrame) else pd.DataFrame()
-            sell_export_df = sell_view.copy() if isinstance(sell_view, pd.DataFrame) else pd.DataFrame()
+            buy_cols_default = ["購入優先度","コード","銘柄名","現在株価","参考S株数","概算購入額","購入後推定余力","買付余力使用率","%K","%D","買付可否","見送り理由"]
+            sell_cols_default = ["優先","コード","銘柄名","保有株数","取得単価","現在株価","損益率%","%K","%D","売り理由"]
+            value_buy_cols_default = ["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","購入後推定余力","買付余力使用率","%K","%D","AI_TOP50スコア","割安判定","AI参考価値","参考価値上昇余地%","買付可否","見送り理由"]
+            buy_export_df = buy_view.copy() if isinstance(buy_view, pd.DataFrame) and not buy_view.empty else pd.DataFrame(columns=buy_cols_default)
+            sell_export_df = sell_view.copy() if isinstance(sell_view, pd.DataFrame) and not sell_view.empty else pd.DataFrame(columns=sell_cols_default)
+            value_buy_export_df = value_ai_buy_view.copy() if isinstance(value_ai_buy_view, pd.DataFrame) and not value_ai_buy_view.empty else pd.DataFrame(columns=value_buy_cols_default)
 
             # SELL候補は「現在保有中のみ」という仕様をZIP側でも二重保証する。
             held_code_str_set = {str(x) for x in held_codes}
@@ -2571,16 +2636,19 @@ try:
             # BUY用の列がSELL CSVへ混入していたら安全側で破棄する。
             forbidden_sell_cols = {"参考S株数", "概算購入額", "購入後推定余力", "買付余力使用率", "買付可否", "見送り理由"}
             if any(c in sell_export_df.columns for c in forbidden_sell_cols):
-                sell_export_df = pd.DataFrame(columns=["優先","コード","銘柄名","保有株数","取得単価","現在株価","損益率%","%K","%D","売り理由"])
+                sell_export_df = pd.DataFrame(columns=sell_cols_default)
 
             zf.writestr("stoch_buy_candidates.csv", buy_export_df.to_csv(index=False, encoding="utf-8-sig"))
             zf.writestr("stoch_sell_candidates.csv", sell_export_df.to_csv(index=False, encoding="utf-8-sig"))
+            zf.writestr("value_ai_stoch_buy_candidates.csv", value_buy_export_df.to_csv(index=False, encoding="utf-8-sig"))
 
             signal_export_status = pd.DataFrame([{
                 "BUY候補件数": int(len(buy_export_df)),
                 "SELL候補件数": int(len(sell_export_df)),
+                "企業価値AI_TOP50採用時BUY候補件数": int(len(value_buy_export_df)),
                 "SELLは保有銘柄のみ": True,
                 "BUY_SELL変数分離": True,
+                "空SELL_CSVヘッダー保持": True,
                 "Version": VERSION,
             }])
             zf.writestr("stoch_signal_export_status.csv", signal_export_status.to_csv(index=False, encoding="utf-8-sig"))

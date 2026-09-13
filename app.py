@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.1",
+    page_title="日本株 AI投資アシスタント Ver.17.2",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.1 STOCH + VALUE AI"
-BUILD = "VER17-1-STOCH-VALUE-AI-COMPARE-20260913"
+VERSION = "17.2 STOCH + VALUE AI AUTO"
+BUILD = "VER17-2-STOCH-VALUE-AI-AUTO-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1927,10 +1927,10 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
     return x
 
-st.title("📉 日本株 AI投資アシスタント Ver.17.1")
+st.title("📉 日本株 AI投資アシスタント Ver.17.2")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("メインロジック：AI選定TOP50 × Slow Stochastic 14,3,3｜BUY=%K≤20のGC｜SELL=DC＋損切りセンサー")
-st.info("Ver.17.1：企業価値・業績・流動性から作る『企業価値AI TOP50』を比較検証として追加。既存ストキャス売買ルールは変更していません。")
+st.info("Ver.17.2：企業価値AI TOP50を比較用として自動生成・ZIP保存。既存ストキャス売買ルールは変更していません。")
 st.caption("旧ロジック一式はVer.16として別ファイル保存。Ver.17ではストキャス実トレードに必要な処理だけを優先し、重い逆算探索・旧バックテスト画面は実行しません。")
 
 # ------------------------------------------------------------
@@ -2070,16 +2070,49 @@ else:
     data = st.session_state.get("v17_data", {})
 
 # ------------------------------------------------------------
-# ②-A 企業価値AI TOP50（任意実行・比較検証）
+# ②-A 企業価値AI TOP50（自動生成・比較検証）
 # ------------------------------------------------------------
+def _value_ai_data_signature(data_dict):
+    """同じ株価データでStreamlitが再実行されても企業価値AIを再計算しないための署名。"""
+    parts = []
+    for t, df0 in sorted((data_dict or {}).items()):
+        if df0 is None or df0.empty:
+            continue
+        try:
+            latest = pd.Timestamp(df0.index.max()).strftime("%Y-%m-%d")
+            close0 = safe_float(df0.iloc[-1].get("Close"))
+            parts.append(f"{t}:{latest}:{close0:.4f}")
+        except Exception:
+            parts.append(str(t))
+    return "|".join(parts)
+
 value_top50_df = st.session_state.get("v17_value_top50", pd.DataFrame())
+value_ai_signature = _value_ai_data_signature(data) if data else ""
+stored_value_ai_signature = st.session_state.get("v17_value_ai_signature", "")
+
+# Ver.17.2: ストキャス対象に採用する/しないに関係なく、
+# 最新データに変わった時だけ企業価値AI TOP50を自動生成する。
+if data and (
+    not isinstance(value_top50_df, pd.DataFrame)
+    or value_top50_df.empty
+    or value_ai_signature != stored_value_ai_signature
+):
+    with st.spinner("比較用の企業価値AI TOP50を自動更新中…"):
+        value_top50_df = build_value_ai_top50(data, max_rows=50)
+        st.session_state["v17_value_top50"] = value_top50_df
+        st.session_state["v17_value_ai_signature"] = value_ai_signature
+        st.session_state["v17_value_ai_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
+
 if data:
     with st.expander("🧠 企業価値AI TOP50 — 割安度・業績・流動性で比較", expanded=False):
-        st.caption("ここは任意実行です。ファンダメンタル取得があるため通常のストキャス判定より時間がかかります。現行売買ロジックは変更しません。")
-        if st.button("🧠 企業価値AI TOP50を更新", use_container_width=True, key="v17_value_rank_run"):
-            with st.spinner("企業価値・業績・流動性を採点中…（銘柄数により数分かかる場合があります）"):
+        generated_at = st.session_state.get("v17_value_ai_generated_at", "未生成")
+        st.caption(f"比較用TOP50は最新株価データ更新時に自動生成します。ストキャス実売買への採用は下の設定がOFFなら行いません。最終生成: {generated_at}")
+        if st.button("🔄 企業価値AI TOP50を手動再計算", use_container_width=True, key="v17_value_rank_run"):
+            with st.spinner("企業価値・業績・流動性を再採点中…"):
                 value_top50_df = build_value_ai_top50(data, max_rows=50)
                 st.session_state["v17_value_top50"] = value_top50_df
+                st.session_state["v17_value_ai_signature"] = value_ai_signature
+                st.session_state["v17_value_ai_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
         if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
             show_cols = ["順位","コード","銘柄名","現在株価_価格","AI参考価値下限","AI参考価値","AI参考価値上限",
                          "参考価値上昇余地%","割安判定","企業価値スコア","成長性スコア","流動性スコア","トレンドスコア","AI_TOP50スコア"]
@@ -2090,6 +2123,8 @@ if data:
                 if c in vshow: vshow[c] = pd.to_numeric(vshow[c], errors="coerce").round(1)
             st.dataframe(vshow, use_container_width=True, hide_index=True)
             st.caption("適正株価はアナリスト目標とEPS×業種PERを利用できる範囲で合成した参考レンジです。算定不能銘柄は無理に値を作りません。")
+        else:
+            st.warning("企業価値AI TOP50を生成できませんでした。ZIPには空の比較ファイルと状態ファイルを保存します。")
 
 # 比較検証ONなら企業価値AI TOP50だけを新規BUY監視に使う。保有銘柄はSELL用に必ず残す。
 if data and use_value_top50 and isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
@@ -2191,7 +2226,7 @@ else:
     else:
         st.info("現在、%K≤20のゴールデンクロスに一致する買い候補はありません。")
 
-    st.caption(f"取得成功：{len(data)}/{len(analysis_tickers)}銘柄。シグナル監視：{len(data_for_signal)}銘柄。企業価値AIは任意実行なので、通常時はストキャスの軽さを維持します。")
+    st.caption(f"取得成功：{len(data)}/{len(analysis_tickers)}銘柄。シグナル監視：{len(data_for_signal)}銘柄。企業価値AI TOP50は比較記録用に自動生成し、実売買への採用は設定ON時のみです。")
 
 # ------------------------------------------------------------
 # ③ 全処理結果ZIP — 朝の実トレード記録用
@@ -2227,8 +2262,20 @@ try:
             zf.writestr("current_holdings.csv", hold_export.to_csv(index=False, encoding="utf-8-sig"))
         if not sbi_warning_df.empty:
             zf.writestr("sbi_history_warnings.csv", sbi_warning_df.to_csv(index=False, encoding="utf-8-sig"))
-        if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
+        # Ver.17.2: 比較用企業価値AI TOP50は設定OFFでも必ずZIPへ保存する。
+        if isinstance(value_top50_df, pd.DataFrame):
             zf.writestr("value_ai_top50.csv", value_top50_df.to_csv(index=False, encoding="utf-8-sig"))
+        else:
+            zf.writestr("value_ai_top50.csv", pd.DataFrame().to_csv(index=False, encoding="utf-8-sig"))
+        value_status_df = pd.DataFrame([{
+            "自動生成": True,
+            "ストキャス対象に使用": bool(use_value_top50),
+            "TOP50件数": int(len(value_top50_df)) if isinstance(value_top50_df, pd.DataFrame) else 0,
+            "生成日時": st.session_state.get("v17_value_ai_generated_at", ""),
+            "株価データ署名": st.session_state.get("v17_value_ai_signature", ""),
+            "用途": "比較検証用。設定OFF時は実売買シグナルへ不使用",
+        }])
+        zf.writestr("value_ai_status.csv", value_status_df.to_csv(index=False, encoding="utf-8-sig"))
         if data:
             if 'buy_view' in locals() and isinstance(buy_view, pd.DataFrame):
                 zf.writestr("stoch_buy_candidates.csv", buy_view.to_csv(index=False, encoding="utf-8-sig"))
@@ -2268,4 +2315,4 @@ except Exception as e:
     st.warning(f"ZIP作成エラー: {e}")
 
 st.divider()
-st.caption("Ver.17.1は売買判断補助です。自動発注は行いません。企業価値AI TOP50は現在情報による比較検証で、未来情報混入を避けるため過去バックテストには直接混ぜていません。")
+st.caption("Ver.17.2は売買判断補助です。自動発注は行いません。企業価値AI TOP50は比較用に自動生成・ZIP保存しますが、設定OFF時はストキャス実売買へ使用しません。未来情報混入を避けるため過去バックテストには直接混ぜていません。")

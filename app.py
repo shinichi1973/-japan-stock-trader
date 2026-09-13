@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.6.0",
+    page_title="日本株 AI投資アシスタント Ver.17.1",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.0 STOCH MAIN"
-BUILD = "VER17-STOCH-MAIN-LIGHT-20260912"
+VERSION = "17.1 STOCH + VALUE AI"
+BUILD = "VER17-1-STOCH-VALUE-AI-COMPARE-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1290,6 +1290,11 @@ def fundamental_snapshot(t):
         shares = info_num(info, "sharesOutstanding")
         fifty_two_high = info_num(info, "fiftyTwoWeekHigh")
         fifty_two_low = info_num(info, "fiftyTwoWeekLow")
+        trailing_eps = info_num(info, "trailingEps")
+        forward_eps = info_num(info, "forwardEps")
+        book_value = info_num(info, "bookValue")
+        sector = str(info.get("sector") or "")
+        industry = str(info.get("industry") or "")
 
         # スコア：取得できない項目は中立にし、欠損で過剰に低評価しない。
         scores = []
@@ -1322,14 +1327,41 @@ def fundamental_snapshot(t):
                                     else 65 if price_to_book <= 4 else 40)
         valuation_score = float(np.mean(valuation_scores)) if valuation_scores else 50.0
 
-        # 現在価値レンジ：市場アナリスト目標価格がある場合は参考値として表示。
-        # ない場合は「算出不能」とする。無理に一点の適正株価を作らない。
-        if np.isfinite(target_mean) and target_mean > 0 and np.isfinite(price) and price > 0:
-            fair_low = target_mean * .80
-            fair_base = target_mean
-            fair_high = target_mean * 1.20
+        # AI参考適正株価レンジ。
+        # 1点の断定値ではなく、アナリスト目標と利益ベース評価を可能な範囲で合成する。
+        # これは現在時点の参考評価であり、過去バックテストへは混ぜない。
+        sec = (sector + " " + industry).lower()
+        if any(k in sec for k in ["bank", "insurance", "financial"]):
+            sector_pe = 12.0
+        elif any(k in sec for k in ["semiconductor", "software", "technology", "electronic"]):
+            sector_pe = 24.0
+        elif any(k in sec for k in ["pharmaceutical", "biotech", "healthcare"]):
+            sector_pe = 22.0
+        elif any(k in sec for k in ["utility", "telecom", "communication"]):
+            sector_pe = 15.0
+        elif any(k in sec for k in ["industrial", "machinery", "steel", "metal", "auto"]):
+            sector_pe = 16.0
+        else:
+            sector_pe = 18.0
+
+        eps_for_value = forward_eps if np.isfinite(forward_eps) and forward_eps > 0 else trailing_eps
+        earnings_fair = eps_for_value * sector_pe if np.isfinite(eps_for_value) and eps_for_value > 0 else np.nan
+        fair_candidates = []
+        fair_weights = []
+        fair_parts = []
+        if np.isfinite(target_mean) and target_mean > 0:
+            fair_candidates.append(target_mean); fair_weights.append(.60); fair_parts.append("アナリスト目標")
+        if np.isfinite(earnings_fair) and earnings_fair > 0:
+            fair_candidates.append(earnings_fair); fair_weights.append(.40); fair_parts.append(f"EPS×業種PER({sector_pe:.0f}倍)")
+
+        if fair_candidates and np.isfinite(price) and price > 0:
+            w = np.array(fair_weights[:len(fair_candidates)], dtype=float)
+            w = w / w.sum()
+            fair_base = float(np.average(np.array(fair_candidates, dtype=float), weights=w))
+            fair_low = fair_base * .82
+            fair_high = fair_base * 1.18
             upside = (fair_base / price - 1) * 100
-            fair_source = "Yahoo Finance targetMeanPriceを参考"
+            fair_source = " + ".join(fair_parts)
         else:
             fair_low = fair_base = fair_high = np.nan
             upside = np.nan
@@ -1350,6 +1382,8 @@ def fundamental_snapshot(t):
             "利益成長率":earnings_growth,"D/E":debt_to_equity,
             "流動比率":current_ratio,"FCF":free_cf,"目標株価参考":target_mean,
             "52週高値":fifty_two_high,"52週安値":fifty_two_low,
+            "予想EPS":forward_eps,"実績EPS":trailing_eps,"BPS":book_value,
+            "セクター":sector,"業種":industry,
             "成長性スコア":growth_score,"バリュエーションスコア":valuation_score,
             "企業価値スコア":value_score,"AI参考価値下限":fair_low,
             "AI参考価値":fair_base,"AI参考価値上限":fair_high,
@@ -1777,6 +1811,104 @@ def build_purchase_plan(candidates, buying_power, current_assets, held_codes, ma
     return pd.DataFrame(rows, columns=cols)
 
 
+# ------------------------------------------------------------
+# Ver.17.1 企業価値AI TOP50 — 現在時点の比較検証用
+# ------------------------------------------------------------
+def _percentile_score(series, higher_better=True):
+    s = pd.to_numeric(series, errors="coerce")
+    if s.notna().sum() <= 1:
+        return pd.Series(50.0, index=series.index)
+    r = s.rank(pct=True, method="average") * 100.0
+    if not higher_better:
+        r = 100.0 - r
+    return r.fillna(50.0).clip(0, 100)
+
+
+def build_value_ai_top50(data, max_rows=50):
+    """現在情報だけで企業価値＋業績＋流動性を採点。過去BTには使わない。"""
+    tech_rows = []
+    for t, df in data.items():
+        if df is None or df.empty or len(df) < 60:
+            continue
+        x = df.sort_index().copy()
+        r = x.iloc[-1]
+        close = safe_float(r.get("Close"))
+        if not np.isfinite(close) or close <= 0:
+            continue
+        turnover20 = pd.to_numeric(x.get("Turnover", x["Close"] * x["Volume"]), errors="coerce").tail(20).mean()
+        volume20 = pd.to_numeric(x["Volume"], errors="coerce").tail(20).mean()
+        ret25 = safe_float(r.get("Return_25d"), 0.0)
+        atr = safe_float(r.get("ATR14"))
+        atr_pct = (atr / close * 100.0) if np.isfinite(atr) and close > 0 else np.nan
+        ma25 = safe_float(r.get("MA25"))
+        ma75 = safe_float(r.get("MA75"))
+        trend_raw = 0.0
+        if np.isfinite(ma25) and close > ma25: trend_raw += 1.0
+        if np.isfinite(ma75) and close > ma75: trend_raw += 1.0
+        if np.isfinite(ma25) and np.isfinite(ma75) and ma25 > ma75: trend_raw += 1.0
+        trend_raw += np.clip(ret25 / 10.0, -1.0, 1.0)
+        tech_rows.append({
+            "ticker": t, "コード": code(t), "銘柄名": name(t), "現在株価_価格": close,
+            "20日平均売買代金": turnover20, "20日平均出来高": volume20,
+            "25日騰落率%": ret25, "ATR%": atr_pct, "トレンド原点": trend_raw,
+        })
+    if not tech_rows:
+        return pd.DataFrame()
+
+    base = pd.DataFrame(tech_rows)
+    base["売買代金スコア"] = _percentile_score(base["20日平均売買代金"], True)
+    base["出来高スコア"] = _percentile_score(base["20日平均出来高"], True)
+    base["流動性スコア"] = (base["売買代金スコア"] * .70 + base["出来高スコア"] * .30).clip(0, 100)
+    base["トレンドスコア"] = ((base["トレンド原点"] + 1.0) / 5.0 * 100.0).clip(0, 100)
+    # ATRは低すぎても動かず、高すぎても扱いにくい。2〜5%付近を中心に評価。
+    base["値動き安定スコア"] = base["ATR%"].apply(
+        lambda a: 50.0 if not np.isfinite(a) else
+        90.0 if 1.5 <= a <= 4.5 else
+        75.0 if 0.8 <= a < 1.5 or 4.5 < a <= 6.5 else
+        55.0 if 0.4 <= a < 0.8 or 6.5 < a <= 9.0 else 30.0
+    )
+
+    fund_rows = []
+    for _, r in base.iterrows():
+        t = r["ticker"]
+        f = fundamental_snapshot(t)
+        fund_rows.append({
+            "ticker": t,
+            "企業価値スコア": safe_float(f.get("企業価値スコア"), 50),
+            "成長性スコア": safe_float(f.get("成長性スコア"), 50),
+            "バリュエーションスコア": safe_float(f.get("バリュエーションスコア"), 50),
+            "AI参考価値下限": safe_float(f.get("AI参考価値下限")),
+            "AI参考価値": safe_float(f.get("AI参考価値")),
+            "AI参考価値上限": safe_float(f.get("AI参考価値上限")),
+            "参考価値上昇余地%": safe_float(f.get("参考価値上昇余地")),
+            "PER": safe_float(f.get("PER")), "予想PER": safe_float(f.get("予想PER")),
+            "PBR": safe_float(f.get("PBR")), "ROE%": safe_float(f.get("ROE")) * 100.0,
+            "売上成長率%": safe_float(f.get("売上成長率")) * 100.0,
+            "利益成長率%": safe_float(f.get("利益成長率")) * 100.0,
+            "適正株価根拠": str(f.get("価値算定根拠", "")),
+            "ファンダ取得状態": str(f.get("取得状態", "")),
+        })
+    out = base.merge(pd.DataFrame(fund_rows), on="ticker", how="left")
+    for c in ["企業価値スコア", "成長性スコア", "バリュエーションスコア"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(50).clip(0, 100)
+
+    # 企業価値・成長を主役にしつつ、実際に売買しやすい流動性を強く残す。
+    out["AI_TOP50スコア"] = (
+        out["企業価値スコア"] * .30 +
+        out["成長性スコア"] * .22 +
+        out["流動性スコア"] * .25 +
+        out["トレンドスコア"] * .13 +
+        out["値動き安定スコア"] * .10
+    ).clip(0, 100)
+    out["割安判定"] = out["参考価値上昇余地%"].apply(
+        lambda u: "算定不能" if not np.isfinite(u) else
+        "🟢 割安" if u >= 20 else "🟡 やや割安" if u >= 5 else
+        "⚪ 適正圏" if u > -10 else "🔴 割高"
+    )
+    out = out.sort_values(["AI_TOP50スコア", "流動性スコア"], ascending=[False, False]).reset_index(drop=True)
+    out.insert(0, "順位", np.arange(1, len(out) + 1))
+    return out.head(int(max_rows)).copy()
+
 # ============================================================
 # Ver.17 MAIN — ストキャスティクス実運用版
 # ============================================================
@@ -1795,9 +1927,10 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
     return x
 
-st.title("📉 日本株 AI投資アシスタント Ver.17")
+st.title("📉 日本株 AI投資アシスタント Ver.17.1")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("メインロジック：AI選定TOP50 × Slow Stochastic 14,3,3｜BUY=%K≤20のGC｜SELL=DC＋損切りセンサー")
+st.info("Ver.17.1：企業価値・業績・流動性から作る『企業価値AI TOP50』を比較検証として追加。既存ストキャス売買ルールは変更していません。")
 st.caption("旧ロジック一式はVer.16として別ファイル保存。Ver.17ではストキャス実トレードに必要な処理だけを優先し、重い逆算探索・旧バックテスト画面は実行しません。")
 
 # ------------------------------------------------------------
@@ -1910,6 +2043,12 @@ with st.expander("⚙️ 資金管理・ストキャス設定", expanded=False):
         key="v17_universe",
         help="既存のAI選定ユニバース。保有銘柄はCSVから自動追加されます。",
     )
+    use_value_top50 = st.checkbox(
+        "企業価値AI TOP50をストキャス対象に使う（比較検証）",
+        value=False,
+        key="v17_use_value_top50",
+        help="OFFなら従来対象。ONでも企業価値AI TOP50を作成済みの場合だけ適用し、保有銘柄は必ず監視します。",
+    )
 
 # ------------------------------------------------------------
 # ③ 軽量データ取得：市場/海外/1億円探索を外し、ストキャスに必要な個別株だけ
@@ -1930,13 +2069,42 @@ if st.button("▶️ ストキャス判定を更新", type="primary", use_contai
 else:
     data = st.session_state.get("v17_data", {})
 
+# ------------------------------------------------------------
+# ②-A 企業価値AI TOP50（任意実行・比較検証）
+# ------------------------------------------------------------
+value_top50_df = st.session_state.get("v17_value_top50", pd.DataFrame())
+if data:
+    with st.expander("🧠 企業価値AI TOP50 — 割安度・業績・流動性で比較", expanded=False):
+        st.caption("ここは任意実行です。ファンダメンタル取得があるため通常のストキャス判定より時間がかかります。現行売買ロジックは変更しません。")
+        if st.button("🧠 企業価値AI TOP50を更新", use_container_width=True, key="v17_value_rank_run"):
+            with st.spinner("企業価値・業績・流動性を採点中…（銘柄数により数分かかる場合があります）"):
+                value_top50_df = build_value_ai_top50(data, max_rows=50)
+                st.session_state["v17_value_top50"] = value_top50_df
+        if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
+            show_cols = ["順位","コード","銘柄名","現在株価_価格","AI参考価値下限","AI参考価値","AI参考価値上限",
+                         "参考価値上昇余地%","割安判定","企業価値スコア","成長性スコア","流動性スコア","トレンドスコア","AI_TOP50スコア"]
+            vshow = value_top50_df[[c for c in show_cols if c in value_top50_df.columns]].copy()
+            for c in ["現在株価_価格","AI参考価値下限","AI参考価値","AI参考価値上限"]:
+                if c in vshow: vshow[c] = pd.to_numeric(vshow[c], errors="coerce").round(0)
+            for c in ["参考価値上昇余地%","企業価値スコア","成長性スコア","流動性スコア","トレンドスコア","AI_TOP50スコア"]:
+                if c in vshow: vshow[c] = pd.to_numeric(vshow[c], errors="coerce").round(1)
+            st.dataframe(vshow, use_container_width=True, hide_index=True)
+            st.caption("適正株価はアナリスト目標とEPS×業種PERを利用できる範囲で合成した参考レンジです。算定不能銘柄は無理に値を作りません。")
+
+# 比較検証ONなら企業価値AI TOP50だけを新規BUY監視に使う。保有銘柄はSELL用に必ず残す。
+if data and use_value_top50 and isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
+    selected_codes = set(value_top50_df["コード"].astype(str).head(50).tolist()) | set(map(str, held_codes))
+    data_for_signal = {t:d for t,d in data.items() if code(t) in selected_codes}
+else:
+    data_for_signal = data
+
 if not data:
     st.info("上の『ストキャス判定を更新』を押すと、買い・売り候補を表示します。")
 else:
     buy_signal_rows, sell_signal_rows = [], []
     held_code_set = set(map(str, held_codes))
 
-    for t, df0 in data.items():
+    for t, df0 in data_for_signal.items():
         sx = stoch_prepare_light(df0, 14, 3, 3)
         if sx.empty:
             continue
@@ -2023,7 +2191,7 @@ else:
     else:
         st.info("現在、%K≤20のゴールデンクロスに一致する買い候補はありません。")
 
-    st.caption(f"取得成功：{len(data)}/{len(analysis_tickers)}銘柄。Ver.17では市場・海外・ファンダメンタル・逆算探索を毎回走らせず、ストキャス実運用へ処理を集中しています。")
+    st.caption(f"取得成功：{len(data)}/{len(analysis_tickers)}銘柄。シグナル監視：{len(data_for_signal)}銘柄。企業価値AIは任意実行なので、通常時はストキャスの軽さを維持します。")
 
 # ------------------------------------------------------------
 # ③ 全処理結果ZIP — 朝の実トレード記録用
@@ -2046,6 +2214,7 @@ try:
             "保有銘柄買い増し": False,
             "BUY条件": "Slow Stoch 14,3,3 / %K<=20 GC",
             "SELL条件": f"Slow Stoch DC または 損切り -{float(sl):.1f}%",
+            "企業価値AI_TOP50使用": bool(use_value_top50),
         }])
         zf.writestr("ver17_settings.csv", settings_df.to_csv(index=False, encoding="utf-8-sig"))
         if not sbi_trades_df.empty:
@@ -2058,6 +2227,8 @@ try:
             zf.writestr("current_holdings.csv", hold_export.to_csv(index=False, encoding="utf-8-sig"))
         if not sbi_warning_df.empty:
             zf.writestr("sbi_history_warnings.csv", sbi_warning_df.to_csv(index=False, encoding="utf-8-sig"))
+        if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
+            zf.writestr("value_ai_top50.csv", value_top50_df.to_csv(index=False, encoding="utf-8-sig"))
         if data:
             if 'buy_view' in locals() and isinstance(buy_view, pd.DataFrame):
                 zf.writestr("stoch_buy_candidates.csv", buy_view.to_csv(index=False, encoding="utf-8-sig"))
@@ -2097,4 +2268,4 @@ except Exception as e:
     st.warning(f"ZIP作成エラー: {e}")
 
 st.divider()
-st.caption("Ver.17は売買判断補助です。自動発注は行いません。旧Ver.16は別ファイルで保存し、比較・復元できるようにしています。")
+st.caption("Ver.17.1は売買判断補助です。自動発注は行いません。企業価値AI TOP50は現在情報による比較検証で、未来情報混入を避けるため過去バックテストには直接混ぜていません。")

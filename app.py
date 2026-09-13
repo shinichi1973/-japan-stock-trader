@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.4",
+    page_title="日本株 AI投資アシスタント Ver.17.5",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.4 STOCH + VALUE AI VALUATION GUARD"
-BUILD = "VER17-4-STOCH-VALUE-AI-VALUATION-GUARD-20260913"
+VERSION = "17.5 STOCH + VALUE AI SELL EXPORT FIX"
+BUILD = "VER17-5-STOCH-VALUE-AI-SELL-EXPORT-FIX-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2464,11 +2464,16 @@ else:
                     "売り理由": "＋".join(reasons),
                 })
 
+    # Ver.17.5: BUY/SELL表示・ZIP出力の変数混線を防ぐため、毎回必ず空DataFrameから初期化する。
+    # Streamlitの再実行時に古い表示用DataFrameが残っても、ZIPへ誤って流用しない。
+    sell_view = pd.DataFrame()
+    buy_view = pd.DataFrame()
+
     # SELLを先に表示：実トレードで既存ポジションの安全確認を優先
     st.subheader("🔻 売り候補 — 現在保有中のみ")
     if sell_signal_rows:
-        sell_view = pd.DataFrame(sell_signal_rows)
-        sell_view["優先"] = sell_view["売り理由"].str.contains("損切りセンサー").map({True:"🚨 最優先",False:"🔻 SELL"})
+        sell_view = pd.DataFrame(sell_signal_rows).copy()
+        sell_view["優先"] = sell_view["売り理由"].str.contains("損切りセンサー", na=False).map({True:"🚨 最優先",False:"🔻 SELL"})
         sell_view = sell_view[["優先","コード","銘柄名","保有株数","取得単価","現在株価","損益率%","%K","%D","売り理由"]]
         for c in ["取得単価","現在株価","損益率%","%K","%D"]:
             sell_view[c] = pd.to_numeric(sell_view[c], errors="coerce").round(2)
@@ -2549,18 +2554,37 @@ try:
             "適正株価異常値ガード件数": int(value_top50_df["適正株価異常値ガード"].astype(str).str.contains("⚠️").sum()) if isinstance(value_top50_df, pd.DataFrame) and "適正株価異常値ガード" in value_top50_df.columns else 0,
             "生成日時": st.session_state.get("v17_value_ai_generated_at", ""),
             "株価データ署名": st.session_state.get("v17_value_ai_signature", ""),
-            "用途": "比較検証用。設定OFF時は実売買シグナルへ不使用。Ver17.4は株式分割補正＋適正株価異常値クロスチェック",
+            "用途": "比較検証用。設定OFF時は実売買シグナルへ不使用。Ver17.5は株式分割補正＋適正株価異常値クロスチェック＋BUY/SELL ZIP分離ガード",
         }])
         zf.writestr("value_ai_status.csv", value_status_df.to_csv(index=False, encoding="utf-8-sig"))
         if data:
-            if 'buy_view' in locals() and isinstance(buy_view, pd.DataFrame):
-                zf.writestr("stoch_buy_candidates.csv", buy_view.to_csv(index=False, encoding="utf-8-sig"))
-            else:
-                zf.writestr("stoch_buy_candidates.csv", pd.DataFrame().to_csv(index=False, encoding="utf-8-sig"))
-            if 'sell_view' in locals() and isinstance(sell_view, pd.DataFrame):
-                zf.writestr("stoch_sell_candidates.csv", sell_view.to_csv(index=False, encoding="utf-8-sig"))
-            else:
-                zf.writestr("stoch_sell_candidates.csv", pd.DataFrame().to_csv(index=False, encoding="utf-8-sig"))
+            # Ver.17.5: ZIPは表示変数の存在判定に頼らず、当回に初期化・生成したDataFrameだけを書き出す。
+            buy_export_df = buy_view.copy() if isinstance(buy_view, pd.DataFrame) else pd.DataFrame()
+            sell_export_df = sell_view.copy() if isinstance(sell_view, pd.DataFrame) else pd.DataFrame()
+
+            # SELL候補は「現在保有中のみ」という仕様をZIP側でも二重保証する。
+            held_code_str_set = {str(x) for x in held_codes}
+            if not sell_export_df.empty and "コード" in sell_export_df.columns:
+                sell_export_df["コード"] = sell_export_df["コード"].astype(str)
+                sell_export_df = sell_export_df[sell_export_df["コード"].isin(held_code_str_set)].copy()
+
+            # BUY用の列がSELL CSVへ混入していたら安全側で破棄する。
+            forbidden_sell_cols = {"参考S株数", "概算購入額", "購入後推定余力", "買付余力使用率", "買付可否", "見送り理由"}
+            if any(c in sell_export_df.columns for c in forbidden_sell_cols):
+                sell_export_df = pd.DataFrame(columns=["優先","コード","銘柄名","保有株数","取得単価","現在株価","損益率%","%K","%D","売り理由"])
+
+            zf.writestr("stoch_buy_candidates.csv", buy_export_df.to_csv(index=False, encoding="utf-8-sig"))
+            zf.writestr("stoch_sell_candidates.csv", sell_export_df.to_csv(index=False, encoding="utf-8-sig"))
+
+            signal_export_status = pd.DataFrame([{
+                "BUY候補件数": int(len(buy_export_df)),
+                "SELL候補件数": int(len(sell_export_df)),
+                "SELLは保有銘柄のみ": True,
+                "BUY_SELL変数分離": True,
+                "Version": VERSION,
+            }])
+            zf.writestr("stoch_signal_export_status.csv", signal_export_status.to_csv(index=False, encoding="utf-8-sig"))
+
             latest_rows = []
             for t, df0 in data.items():
                 sx = stoch_prepare_light(df0, 14, 3, 3)

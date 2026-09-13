@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.5",
+    page_title="日本株 AI投資アシスタント Ver.17.7",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.6 STOCH + VALUE AI BUY COMPARE"
-BUILD = "VER17-6-STOCH-VALUE-AI-BUY-COMPARE-20260913"
+VERSION = "17.7 TRUE VALUE AI TOP50"
+BUILD = "VER17-7-TRUE-VALUE-AI-TOP50-SIMPLE-20260913"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2081,10 +2081,15 @@ def _percentile_score(series, higher_better=True):
     return r.fillna(50.0).clip(0, 100)
 
 
-def build_value_ai_top50(data, max_rows=50):
-    """現在情報だけで企業価値＋業績＋流動性を採点。過去BTには使わない。"""
+def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90):
+    """数百銘柄の母集団から一次選抜→企業価値AIで最終TOP50。
+
+    重いファンダ取得を全銘柄へ直列実行するとStreamlit Cloudでタイムアウトしやすいため、
+    まず全母集団を流動性・トレンド・値動き安定性で一次選抜し、上位だけ詳細な企業価値評価を行う。
+    これにより「49銘柄全部がTOP50」という旧状態を避けつつ、数百銘柄から本当の50銘柄を選ぶ。
+    """
     tech_rows = []
-    for t, df in data.items():
+    for t, df in (data or {}).items():
         if df is None or df.empty or len(df) < 60:
             continue
         x = df.sort_index().copy()
@@ -2113,20 +2118,31 @@ def build_value_ai_top50(data, max_rows=50):
         return pd.DataFrame()
 
     base = pd.DataFrame(tech_rows)
+    mother_count = len(base)
     base["売買代金スコア"] = _percentile_score(base["20日平均売買代金"], True)
     base["出来高スコア"] = _percentile_score(base["20日平均出来高"], True)
     base["流動性スコア"] = (base["売買代金スコア"] * .70 + base["出来高スコア"] * .30).clip(0, 100)
     base["トレンドスコア"] = ((base["トレンド原点"] + 1.0) / 5.0 * 100.0).clip(0, 100)
-    # ATRは低すぎても動かず、高すぎても扱いにくい。2〜5%付近を中心に評価。
     base["値動き安定スコア"] = base["ATR%"].apply(
         lambda a: 50.0 if not np.isfinite(a) else
         90.0 if 1.5 <= a <= 4.5 else
         75.0 if 0.8 <= a < 1.5 or 4.5 < a <= 6.5 else
         55.0 if 0.4 <= a < 0.8 or 6.5 < a <= 9.0 else 30.0
     )
+    # 一次選抜は「企業の良し悪し」ではなく、売買対象として十分な流動性があり、
+    # 極端に扱いにくい値動きでないかを絞る入口。企業価値はこの後に評価する。
+    base["一次選抜スコア"] = (
+        base["流動性スコア"] * .62 +
+        base["トレンドスコア"] * .23 +
+        base["値動き安定スコア"] * .15
+    ).clip(0, 100)
+    base = base.sort_values(["一次選抜スコア", "流動性スコア"], ascending=[False, False]).reset_index(drop=True)
+    base["一次選抜順位"] = np.arange(1, len(base) + 1)
 
+    pool_n = min(max(int(fundamental_pool_size), int(max_rows)), len(base))
+    pool = base.head(pool_n).copy()
     fund_rows = []
-    for _, r in base.iterrows():
+    for _, r in pool.iterrows():
         t = r["ticker"]
         f = fundamental_snapshot(t, market_price_hint=safe_float(r.get("現在株価_価格")))
         fund_rows.append({
@@ -2157,11 +2173,10 @@ def build_value_ai_top50(data, max_rows=50):
             "適正株価クロスチェック": str(f.get("適正株価クロスチェック", "")),
             "ファンダ取得状態": str(f.get("取得状態", "")),
         })
-    out = base.merge(pd.DataFrame(fund_rows), on="ticker", how="left")
+    out = pool.merge(pd.DataFrame(fund_rows), on="ticker", how="left")
     for c in ["企業価値スコア", "成長性スコア", "バリュエーションスコア"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(50).clip(0, 100)
 
-    # 企業価値・成長を主役にしつつ、実際に売買しやすい流動性を強く残す。
     out["AI_TOP50スコア"] = (
         out["企業価値スコア"] * .30 +
         out["成長性スコア"] * .22 +
@@ -2178,9 +2193,143 @@ def build_value_ai_top50(data, max_rows=50):
          "⚪ 適正圏" if safe_float(rr.get("参考価値上昇余地%")) > -10 else "🔴 割高"),
         axis=1
     )
+    out["母集団件数"] = int(mother_count)
+    out["詳細企業価値評価件数"] = int(pool_n)
     out = out.sort_values(["AI_TOP50スコア", "流動性スコア"], ascending=[False, False]).reset_index(drop=True)
     out.insert(0, "順位", np.arange(1, len(out) + 1))
     return out.head(int(max_rows)).copy()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def discover_japan_stock_universe(limit=350):
+    """TradingView日本株スキャナーから売買代金上位の普通株を数百銘柄取得する。
+    旧49銘柄へ黙ってフォールバックすると「本物のTOP50」ではなくなるため、失敗時は空を返す。
+    """
+    limit = int(np.clip(limit, 200, 500))
+    columns = ["name", "description", "close", "volume", "Value.Traded", "market_cap_basic", "exchange"]
+    payload = {
+        "filter": [{"left": "type", "operation": "equal", "right": "stock"}],
+        "options": {"lang": "ja"},
+        "markets": ["japan"],
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "columns": columns,
+        "sort": {"sortBy": "Value.Traded", "sortOrder": "desc"},
+        "range": [0, limit],
+    }
+    headers = {
+        "Accept": "application/json", "Content-Type": "application/json",
+        "Origin": "https://www.tradingview.com", "Referer": "https://www.tradingview.com/",
+        "User-Agent": "Mozilla/5.0 (compatible; JPStockAssistant/17.7)",
+    }
+    try:
+        r = requests.post("https://scanner.tradingview.com/japan/scan", headers=headers, json=payload, timeout=25)
+        r.raise_for_status()
+        rows = []
+        for item in (r.json().get("data") or []):
+            sym = str(item.get("s", ""))
+            vals = list(item.get("d") or [])
+            if ":" not in sym or len(vals) < len(columns):
+                continue
+            ex, raw_code = sym.split(":", 1)
+            c = raw_code.strip().upper()
+            # 東証の通常の4桁/英数字コードだけを採用。ETF等はscanner側type=stockで大半を除外。
+            if not re.fullmatch(r"[0-9A-Z]{4}", c):
+                continue
+            d = dict(zip(columns, vals))
+            px = safe_float(d.get("close"))
+            vol = safe_float(d.get("volume"), 0.0)
+            traded = safe_float(d.get("Value.Traded"))
+            if not np.isfinite(px) or px <= 0 or vol <= 0:
+                continue
+            if not np.isfinite(traded) or traded <= 0:
+                traded = px * vol
+            rows.append({
+                "コード": c,
+                "銘柄名": str(d.get("description") or c),
+                "ticker": c + ".T",
+                "現在値": px,
+                "出来高": vol,
+                "売買代金": traded,
+                "時価総額": safe_float(d.get("market_cap_basic")),
+                "取引所": str(d.get("exchange") or ex),
+            })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).drop_duplicates("コード", keep="first")
+        return df.sort_values("売買代金", ascending=False).head(limit).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _prepare_light_history_frame(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    if isinstance(x.columns, pd.MultiIndex):
+        x.columns = x.columns.get_level_values(-1)
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(c in x.columns for c in cols):
+        return pd.DataFrame()
+    x = x[cols].copy()
+    for c in cols:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+    x = x.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).sort_index()
+    if len(x) < 80:
+        return pd.DataFrame()
+    x["MA25"] = x["Close"].rolling(25).mean()
+    x["MA75"] = x["Close"].rolling(75).mean()
+    x["VOL20"] = x["Volume"].rolling(20).mean()
+    x["Turnover"] = x["Close"] * x["Volume"]
+    tr = pd.concat([
+        x["High"] - x["Low"],
+        (x["High"] - x["Close"].shift()).abs(),
+        (x["Low"] - x["Close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    x["ATR14"] = tr.rolling(14).mean()
+    x["Return_25d"] = x["Close"].pct_change(25) * 100.0
+    return x.dropna(subset=["MA25", "MA75", "ATR14", "Return_25d"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def batch_stock_data_light(tickers_tuple, months=15):
+    """数百銘柄の日足をyfinanceで分割一括取得。1銘柄ずつ取得するより大幅に軽量。"""
+    ts = list(dict.fromkeys([str(t) for t in tickers_tuple if str(t).endswith(".T")]))
+    out = {}
+    if not ts:
+        return out
+    # 大きすぎる一括DLは不安定なので60銘柄ずつ。
+    for i in range(0, len(ts), 60):
+        chunk = ts[i:i+60]
+        try:
+            raw = yf.download(
+                tickers=chunk, period=f"{int(months)}mo", interval="1d",
+                auto_adjust=False, actions=False, progress=False, threads=True,
+                group_by="ticker", timeout=25,
+            )
+        except Exception:
+            raw = pd.DataFrame()
+        if raw is None or raw.empty:
+            continue
+        for t in chunk:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    if t in raw.columns.get_level_values(0):
+                        one = raw[t].copy()
+                    elif t in raw.columns.get_level_values(1):
+                        one = raw.xs(t, axis=1, level=1).copy()
+                    else:
+                        continue
+                else:
+                    if len(chunk) != 1:
+                        continue
+                    one = raw.copy()
+                fx = _prepare_light_history_frame(one)
+                if not fx.empty:
+                    out[t] = fx
+            except Exception:
+                continue
+    return out
+
 
 # ============================================================
 # Ver.17 MAIN — ストキャスティクス実運用版
@@ -2200,54 +2349,38 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
     return x
 
-st.title("📉 日本株 AI投資アシスタント Ver.17.6")
+st.title("📈 日本株 AI投資アシスタント Ver.17.7")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
-st.success("メインロジック：AI選定TOP50 × Slow Stochastic 14,3,3｜BUY=%K≤20のGC｜SELL=DC＋損切りセンサー")
-st.info("Ver.17.6：従来ストキャスBUYに加え、企業価値AI TOP50を採用した場合のBUY候補を比較表示・ZIP保存します。実売買への採用OFFなら従来売買ロジックは変更しません。")
-st.caption("旧ロジック一式はVer.16として別ファイル保存。Ver.17ではストキャス実トレードに必要な処理だけを優先し、重い逆算探索・旧バックテスト画面は実行しません。")
+st.success("本物の企業価値AI TOP50 → Slow Stochastic 14,3,3 → BUY候補だけをシンプル表示")
+st.caption("母集団は日本株の売買代金上位を数百銘柄自動取得。旧49銘柄の固定リストは新規BUY選定には使いません。")
 
 # ------------------------------------------------------------
-# ① 実トレード入力を最上部に集約
+# 朝の入力：ここだけは常に見える
 # ------------------------------------------------------------
-st.header("① 朝の入力 — 取引履歴と買付余力")
-st.caption("この2項目を近くにまとめました。入力後、そのまま下のストキャス判定へ進みます。")
+st.header("朝の入力")
 input_left, input_right = st.columns([1.35, 1.0], gap="large")
-
 with input_left:
-    st.subheader("📄 SBI 約定履歴CSV")
     trade_files = st.file_uploader(
-        "約定履歴CSVを追加",
-        type=["csv"],
-        accept_multiple_files=True,
-        key="sbi_execution_csvs_v17",
+        "SBI 約定履歴CSV", type=["csv"], accept_multiple_files=True, key="sbi_execution_csvs_v177"
     )
-
 with input_right:
-    st.subheader("💴 SBI 買付余力")
     bp_file = st.file_uploader(
-        "余力ファイル（任意）",
-        type=["csv", "txt", "html", "htm", "webarchive"],
-        key="sbi_buying_power_file_v17",
+        "買付余力ファイル（任意）", type=["csv", "txt", "html", "htm", "webarchive"], key="sbi_buying_power_file_v177"
     )
-    if "sbi_buying_power_yen_v17" not in st.session_state:
-        st.session_state["sbi_buying_power_yen_v17"] = 0
-    detected_buying_power = None
+    if "sbi_buying_power_yen_v177" not in st.session_state:
+        st.session_state["sbi_buying_power_yen_v177"] = 0
     if bp_file is not None:
         try:
             detected_buying_power, _ = extract_buying_power_from_file(bp_file)
-            st.session_state["sbi_buying_power_yen_v17"] = int(detected_buying_power)
-            st.success(f"自動取得：¥{int(detected_buying_power):,}")
+            st.session_state["sbi_buying_power_yen_v177"] = int(detected_buying_power)
         except Exception as e:
             st.warning(f"余力自動読取不可：{e}")
     buying_power = st.number_input(
-        "現物買付余力（円）",
-        min_value=0,
-        max_value=1_000_000_000,
-        step=1000,
-        key="sbi_buying_power_yen_v17",
+        "現物買付余力（円）", min_value=0, max_value=1_000_000_000, step=1000,
+        key="sbi_buying_power_yen_v177"
     )
 
-# 約定履歴 → 現在保有を復元
+# 約定履歴 → 保有復元
 confirmed = {}
 sbi_trades_df = pd.DataFrame()
 sbi_warning_df = pd.DataFrame()
@@ -2267,232 +2400,114 @@ if trade_files:
         if not holdings_auto_df.empty:
             confirmed = {
                 str(r["code"]): {
-                    "shares": int(r["shares"]),
-                    "avg_price": float(r["avg_price"]),
-                    "source": str(r["source"]),
-                    "account_types": str(r.get("account_types", "")),
+                    "shares": int(r["shares"]), "avg_price": float(r["avg_price"]),
+                    "source": str(r["source"]), "account_types": str(r.get("account_types", "")),
                 }
                 for _, r in holdings_auto_df.iterrows()
             }
         if parse_errors:
             st.warning("一部CSVを読めませんでした：\n- " + "\n- ".join(parse_errors))
-
 held_codes = list(confirmed.keys())
-summary_a, summary_b, summary_c = st.columns(3)
-summary_a.metric("現在保有", f"{len(held_codes)}銘柄")
-summary_b.metric("買付余力", f"¥{int(buying_power):,}")
-summary_c.metric("約定明細", f"{len(sbi_trades_df)}件")
 
+m1, m2 = st.columns(2)
+m1.metric("現在保有", f"{len(held_codes)}銘柄")
+m2.metric("買付余力", f"¥{int(buying_power):,}")
 if int(buying_power) <= 0:
-    st.error("⚠️ 買付余力が0円／未入力です。BUYシグナルの参考S株数を計算できません。ストキャス判定の前に最新の買付余力を入力してください。")
-
-if confirmed:
-    with st.expander("現在保有を確認", expanded=False):
-        hrows = []
-        for c, v in confirmed.items():
-            hrows.append({"コード":c,"銘柄名":STOCK_NAMES.get(c,c),"株数":v["shares"],"取得単価":v["avg_price"]})
-        st.dataframe(pd.DataFrame(hrows), use_container_width=True, hide_index=True)
+    st.warning("買付余力を入力すると参考S株数を計算できます。")
 if not sbi_warning_df.empty:
-    st.error("履歴不足の可能性がある銘柄があります。安全のため警告対象は保有復元から除外されています。")
+    st.error("履歴不足の可能性がある銘柄があります。警告対象は安全のため保有復元から除外しています。")
 
 # ------------------------------------------------------------
-# ② 資金管理（普段は触らなくてよい設定）
+# 管理者設定は目立たせない
 # ------------------------------------------------------------
-with st.expander("⚙️ 資金管理・ストキャス設定", expanded=False):
-    s1, s2, s3, s4 = st.columns(4)
-    current_assets = s1.number_input("現在資産（円）", 10000, 200000000, 600000, 10000, key="v17_assets")
-    maxbuy = s2.number_input("1銘柄最大購入額（円）", 1000, 20000000, 100000, 1000, key="v17_maxbuy")
-    sl = s3.slider("損切りセンサー（%）", 3.0, 15.0, 7.0, .5, key="v17_sl")
-    maxpos = s4.number_input("最大保有銘柄数", 1, 50, 10, key="v17_maxpos")
-    p1, p2, p3, p4 = st.columns(4)
-    reserve_pct = p1.slider("現金温存率（%）", 0, 80, 20, 5, key="v17_reserve")
-    daily_deploy_pct = p2.slider("1日使用上限（%）", 10, 100, 50, 5, key="v17_daily")
-    risk_per_trade_pct = p3.slider("1銘柄許容損失（資産比%）", 0.25, 3.0, 1.0, 0.25, key="v17_risk")
-    price_buffer_pct = p4.slider("価格上振れバッファ（%）", 0.0, 10.0, 3.0, .5, key="v17_buffer")
-    universe_text = st.text_area(
-        "AI選定TOP50 / 分析対象コード",
-        DEFAULT_UNIVERSE,
-        height=100,
-        key="v17_universe",
-        help="既存のAI選定ユニバース。保有銘柄はCSVから自動追加されます。",
-    )
-    use_value_top50 = st.checkbox(
-        "企業価値AI TOP50をストキャス対象に使う（比較検証）",
-        value=False,
-        key="v17_use_value_top50",
-        help="OFFなら従来対象。ONでも企業価値AI TOP50を作成済みの場合だけ適用し、保有銘柄は必ず監視します。",
-    )
+with st.expander("⚙ 管理者設定", expanded=False):
+    a1, a2, a3, a4 = st.columns(4)
+    current_assets = a1.number_input("現在資産（円）", 10000, 200000000, 600000, 10000, key="v177_assets")
+    maxbuy = a2.number_input("1銘柄最大購入額（円）", 1000, 20000000, 100000, 1000, key="v177_maxbuy")
+    sl = a3.slider("損切りセンサー（%）", 3.0, 15.0, 7.0, .5, key="v177_sl")
+    maxpos = a4.number_input("最大保有銘柄数", 1, 50, 10, key="v177_maxpos")
+    b1, b2, b3, b4 = st.columns(4)
+    reserve_pct = b1.slider("現金温存率（%）", 0, 80, 20, 5, key="v177_reserve")
+    daily_deploy_pct = b2.slider("1日使用上限（%）", 10, 100, 50, 5, key="v177_daily")
+    risk_per_trade_pct = b3.slider("1銘柄許容損失（資産比%）", 0.25, 3.0, 1.0, 0.25, key="v177_risk")
+    price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 3.0, .5, key="v177_buffer")
+    c1, c2 = st.columns(2)
+    universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n")
+    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool")
+    st.caption("標準：350銘柄 → 流動性等で90銘柄へ一次選抜 → 企業価値AIでTOP50。BUYはそのTOP50だけ。")
 
-# ------------------------------------------------------------
-# ③ 軽量データ取得：市場/海外/1億円探索を外し、ストキャスに必要な個別株だけ
-# ------------------------------------------------------------
-st.header("② 今日のストキャス判定")
-analysis_codes = list(dict.fromkeys(parse_codes(universe_text) + held_codes))
-analysis_tickers = tickers(",".join(analysis_codes))
+run_clicked = st.button("▶ 今日の判定を更新", type="primary", use_container_width=True, key="v177_run")
 
-if st.button("▶️ ストキャス判定を更新", type="primary", use_container_width=True, key="v17_run"):
-    with st.spinner("AI選定TOP50＋保有銘柄のストキャスだけを軽量計算中…"):
-        tv_quotes, _tv_diag = tradingview_batch_quotes(tuple(analysis_tickers))
-        TRADINGVIEW_QUOTES_CACHE.clear()
-        TRADINGVIEW_QUOTES_CACHE.update(tv_quotes)
-        # Ver.17は5年分を毎回取らず、ストキャス判定に十分な1年だけ取得。
-        data = {t: stock_data(t, years=1) for t in analysis_tickers}
-        data = {t:d for t,d in data.items() if d is not None and not d.empty}
-    st.session_state["v17_data"] = data
-else:
-    data = st.session_state.get("v17_data", {})
+if run_clicked:
+    # 1) 数百銘柄の母集団を動的取得
+    with st.spinner("日本株の大きな母集団を取得中…"):
+        universe_df = discover_japan_stock_universe(int(universe_size))
+    st.session_state["v177_universe_df"] = universe_df
+    if isinstance(universe_df, pd.DataFrame) and not universe_df.empty:
+        for _, rr in universe_df.iterrows():
+            STOCK_NAMES[str(rr["コード"])] = str(rr["銘柄名"])
 
-# ------------------------------------------------------------
-# ②-A 企業価値AI TOP50（自動生成・比較検証）
-# ------------------------------------------------------------
-def _value_ai_data_signature(data_dict):
-    """同じ株価データでStreamlitが再実行されても企業価値AIを再計算しないための署名。"""
-    parts = []
-    for t, df0 in sorted((data_dict or {}).items()):
-        if df0 is None or df0.empty:
-            continue
-        try:
-            latest = pd.Timestamp(df0.index.max()).strftime("%Y-%m-%d")
-            close0 = safe_float(df0.iloc[-1].get("Close"))
-            parts.append(f"{t}:{latest}:{close0:.4f}")
-        except Exception:
-            parts.append(str(t))
-    return "|".join(parts)
-
-value_top50_df = st.session_state.get("v17_value_top50", pd.DataFrame())
-value_ai_signature = _value_ai_data_signature(data) if data else ""
-stored_value_ai_signature = st.session_state.get("v17_value_ai_signature", "")
-
-# Ver.17.2: ストキャス対象に採用する/しないに関係なく、
-# 最新データに変わった時だけ企業価値AI TOP50を自動生成する。
-if data and (
-    not isinstance(value_top50_df, pd.DataFrame)
-    or value_top50_df.empty
-    or value_ai_signature != stored_value_ai_signature
-):
-    with st.spinner("比較用の企業価値AI TOP50を自動更新中…"):
-        value_top50_df = build_value_ai_top50(data, max_rows=50)
-        st.session_state["v17_value_top50"] = value_top50_df
-        st.session_state["v17_value_ai_signature"] = value_ai_signature
-        st.session_state["v17_value_ai_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
-
-if data:
-    with st.expander("🧠 企業価値AI TOP50 — 割安度・業績・流動性で比較", expanded=False):
-        generated_at = st.session_state.get("v17_value_ai_generated_at", "未生成")
-        st.caption(f"比較用TOP50は最新株価データ更新時に自動生成します。ストキャス実売買への採用は下の設定がOFFなら行いません。最終生成: {generated_at}")
-        if st.button("🔄 企業価値AI TOP50を手動再計算", use_container_width=True, key="v17_value_rank_run"):
-            with st.spinner("企業価値・業績・流動性を再採点中…"):
-                value_top50_df = build_value_ai_top50(data, max_rows=50)
-                st.session_state["v17_value_top50"] = value_top50_df
-                st.session_state["v17_value_ai_signature"] = value_ai_signature
-                st.session_state["v17_value_ai_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
-        if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
-            show_cols = ["順位","コード","銘柄名","現在株価_価格","AI参考価値下限","AI参考価値","AI参考価値上限",
-                         "参考価値上昇余地%","割安判定","適正株価異常値ガード","株式分割補正","直近分割日","直近分割比率",
-                         "企業価値スコア","成長性スコア","流動性スコア","トレンドスコア","AI_TOP50スコア"]
-            vshow = value_top50_df[[c for c in show_cols if c in value_top50_df.columns]].copy()
-            for c in ["現在株価_価格","AI参考価値下限","AI参考価値","AI参考価値上限"]:
-                if c in vshow: vshow[c] = pd.to_numeric(vshow[c], errors="coerce").round(0)
-            for c in ["参考価値上昇余地%","企業価値スコア","成長性スコア","流動性スコア","トレンドスコア","AI_TOP50スコア"]:
-                if c in vshow: vshow[c] = pd.to_numeric(vshow[c], errors="coerce").round(1)
-            st.dataframe(vshow, use_container_width=True, hide_index=True)
-            st.caption("Ver.17.6では株式分割補正に加え、現在株価・EPS理論株価・目標株価をクロスチェックします。3倍超/1/3未満の極端値や、EPSと目標株価が1.8倍以上食い違う場合は異常側を自動除外します。")
+    # 「本物TOP50」の最低条件。失敗時に旧49銘柄へ戻さない。
+    if not isinstance(universe_df, pd.DataFrame) or len(universe_df) < 200:
+        st.session_state["v177_data"] = {}
+        st.session_state["v177_value_top50"] = pd.DataFrame()
+        st.session_state["v177_run_error"] = "大規模母集団を200銘柄以上取得できなかったため、BUY判定を安全停止しました。旧49銘柄へは戻していません。"
+    else:
+        universe_codes = universe_df["コード"].astype(str).tolist()
+        # SELL監視のため保有銘柄は母集団外でも追加する。
+        all_codes = list(dict.fromkeys(universe_codes + [str(c) for c in held_codes]))
+        all_tickers = tuple(tickers(",".join(all_codes)))
+        with st.spinner(f"{len(all_tickers)}銘柄の日足を一括取得中…"):
+            data = batch_stock_data_light(all_tickers, months=15)
+        st.session_state["v177_data"] = data
+        # データ取得成功数が小さすぎる場合も偽TOP50を作らない。
+        mother_data = {t:d for t,d in data.items() if code(t) in set(universe_codes)}
+        if len(mother_data) < 150:
+            st.session_state["v177_value_top50"] = pd.DataFrame()
+            st.session_state["v177_run_error"] = f"日足取得成功が{len(mother_data)}銘柄のみのため、BUY判定を安全停止しました。"
         else:
-            st.warning("企業価値AI TOP50を生成できませんでした。ZIPには空の比較ファイルと状態ファイルを保存します。")
+            with st.spinner("企業価値AIで一次選抜 → 本物TOP50を作成中…"):
+                value_top50_df = build_value_ai_top50(
+                    mother_data, max_rows=50, fundamental_pool_size=int(fundamental_pool_size)
+                )
+            st.session_state["v177_value_top50"] = value_top50_df
+            st.session_state["v177_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
+            st.session_state["v177_run_error"] = ""
 
-# 比較検証ONなら企業価値AI TOP50だけを新規BUY監視に使う。保有銘柄はSELL用に必ず残す。
-if data and use_value_top50 and isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
-    selected_codes = set(value_top50_df["コード"].astype(str).head(50).tolist()) | set(map(str, held_codes))
-    data_for_signal = {t:d for t,d in data.items() if code(t) in selected_codes}
-else:
-    data_for_signal = data
+universe_df = st.session_state.get("v177_universe_df", pd.DataFrame())
+data = st.session_state.get("v177_data", {})
+value_top50_df = st.session_state.get("v177_value_top50", pd.DataFrame())
+run_error = st.session_state.get("v177_run_error", "")
 
 # ------------------------------------------------------------
-# ②-B 比較専用：企業価値AI TOP50を採用した場合のストキャスBUY
-# 実売買設定がOFFでも毎回計算し、従来BUYとの比較材料として表示・ZIP保存する。
+# TOP50だけを新規BUY対象にする。SELLは保有全銘柄を監視。
 # ------------------------------------------------------------
-value_ai_buy_view = pd.DataFrame()
-value_ai_buy_signal_rows = []
-if data and isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
-    value_rank_codes = set(value_top50_df["コード"].astype(str).head(50).tolist())
-    held_code_set_compare = set(map(str, held_codes))
+buy_view = pd.DataFrame()
+sell_view = pd.DataFrame()
+buy_signal_rows, sell_signal_rows = [], []
+true_top50_codes = set()
+if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
+    true_top50_codes = set(value_top50_df["コード"].astype(str).head(50).tolist())
+held_code_set = set(map(str, held_codes))
+
+if data and true_top50_codes:
     for t, df0 in data.items():
         c = code(t)
-        if c not in value_rank_codes or c in held_code_set_compare:
+        # 新規BUYは本物TOP50のみ、SELLは保有のみ。それ以外は計算不要。
+        if c not in true_top50_codes and c not in held_code_set:
             continue
-        sx = stoch_prepare_light(df0, 14, 3, 3)
-        if sx.empty:
-            continue
-        rr = sx.iloc[-1]
-        sk = safe_float(rr.get("STOCH_K"))
-        sd = safe_float(rr.get("STOCH_D"))
-        px = safe_float(rr.get("Close"))
-        if (np.isfinite(px) and px > 0 and bool(rr.get("STOCH_GC", False))
-                and np.isfinite(sk) and sk <= 20):
-            value_ai_buy_signal_rows.append({
-                "コード": c, "銘柄名": name(t), "総合AIスコア": 100.0 - float(sk),
-                "現在株価": float(px), "%K": float(sk), "%D": float(sd), "条件": "%K≤20 GC",
-            })
-
-    if value_ai_buy_signal_rows:
-        _value_buy_df = pd.DataFrame(value_ai_buy_signal_rows).sort_values(["%K","コード"]).reset_index(drop=True)
-        _value_plan = build_purchase_plan(
-            _value_buy_df, buying_power, current_assets, held_codes,
-            max(int(maxpos), len(held_code_set_compare) + 3), maxbuy, sl,
-            reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
-            allow_addon=False, market_block=False,
-        )
-        value_ai_buy_view = _value_plan.merge(_value_buy_df[["コード","%K","%D","条件"]], on="コード", how="left")
-        value_ai_buy_view = value_ai_buy_view.rename(columns={"購入株数":"参考S株数","予定購入額":"概算購入額"})
-        _rank_cols = [c for c in ["コード","順位","AI_TOP50スコア","割安判定","AI参考価値","参考価値上昇余地%"] if c in value_top50_df.columns]
-        if _rank_cols:
-            _rank_meta = value_top50_df[_rank_cols].copy()
-            _rank_meta["コード"] = _rank_meta["コード"].astype(str)
-            value_ai_buy_view["コード"] = value_ai_buy_view["コード"].astype(str)
-            value_ai_buy_view = value_ai_buy_view.merge(_rank_meta, on="コード", how="left")
-        _value_cols = ["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額",
-                       "購入後推定余力","買付余力使用率","%K","%D","AI_TOP50スコア","割安判定",
-                       "AI参考価値","参考価値上昇余地%","買付可否","見送り理由"]
-        value_ai_buy_view = value_ai_buy_view[[c for c in _value_cols if c in value_ai_buy_view.columns]].head(3).copy()
-        for c in ["現在株価","概算購入額","購入後推定余力","AI参考価値"]:
-            if c in value_ai_buy_view:
-                value_ai_buy_view[c] = pd.to_numeric(value_ai_buy_view[c], errors="coerce").round(0)
-        for c in ["買付余力使用率","%K","%D","AI_TOP50スコア","参考価値上昇余地%"]:
-            if c in value_ai_buy_view:
-                value_ai_buy_view[c] = pd.to_numeric(value_ai_buy_view[c], errors="coerce").round(2)
-
-if not data:
-    st.info("上の『ストキャス判定を更新』を押すと、買い・売り候補を表示します。")
-else:
-    buy_signal_rows, sell_signal_rows = [], []
-    held_code_set = set(map(str, held_codes))
-
-    for t, df0 in data_for_signal.items():
         sx = stoch_prepare_light(df0, 14, 3, 3)
         if sx.empty:
             continue
         r = sx.iloc[-1]
-        sk = safe_float(r.get("STOCH_K"))
-        sd = safe_float(r.get("STOCH_D"))
-        px = safe_float(r.get("Close"))
-        c = code(t)
+        sk, sd, px = safe_float(r.get("STOCH_K")), safe_float(r.get("STOCH_D")), safe_float(r.get("Close"))
         if not (np.isfinite(px) and px > 0):
             continue
-
-        # BUY：Ver.16で採用した %K<=20 のGC。
-        # Ver.17では保有中銘柄の買い増しは行わず、新規BUY候補から完全除外。
-        if c not in held_code_set and bool(r.get("STOCH_GC", False)) and np.isfinite(sk) and sk <= 20:
+        if c in true_top50_codes and c not in held_code_set and bool(r.get("STOCH_GC", False)) and np.isfinite(sk) and sk <= 20:
             buy_signal_rows.append({
-                "コード": c,
-                "銘柄名": name(t),
-                "総合AIスコア": 100.0 - float(sk),
-                "現在株価": float(px),
-                "%K": float(sk),
-                "%D": float(sd),
-                "条件": "%K≤20 GC",
+                "コード": c, "銘柄名": name(t), "総合AIスコア": 100.0-float(sk),
+                "現在株価": float(px), "%K": float(sk), "%D": float(sd), "条件": "%K≤20 GC",
             })
-
-        # SELL：現在保有中のみ。DCを主条件、基本損切りを安全センサーとして併用。
         if c in held_code_set:
             h = confirmed.get(c, {})
             shares = int(safe_float(h.get("shares", 0)) or 0)
@@ -2501,186 +2516,133 @@ else:
             dc_hit = bool(r.get("STOCH_DC", False)) and np.isfinite(sk)
             stop_hit = np.isfinite(pnl_pct) and pnl_pct <= -float(sl)
             if dc_hit or stop_hit:
-                reasons = []
-                if stop_hit:
-                    reasons.append(f"損切りセンサー -{float(sl):.1f}%到達")
-                if dc_hit:
-                    reasons.append("ストキャスDC")
+                reasons=[]
+                if stop_hit: reasons.append(f"損切り -{float(sl):.1f}%")
+                if dc_hit: reasons.append("ストキャスDC")
                 sell_signal_rows.append({
-                    "コード": c,
-                    "銘柄名": name(t),
-                    "保有株数": shares,
-                    "取得単価": avg,
-                    "現在株価": float(px),
-                    "損益率%": pnl_pct,
-                    "%K": float(sk) if np.isfinite(sk) else np.nan,
-                    "%D": float(sd) if np.isfinite(sd) else np.nan,
-                    "売り理由": "＋".join(reasons),
+                    "コード":c,"銘柄名":name(t),"保有株数":shares,"取得単価":avg,"現在株価":float(px),
+                    "損益率%":pnl_pct,"%K":float(sk) if np.isfinite(sk) else np.nan,
+                    "%D":float(sd) if np.isfinite(sd) else np.nan,"売り理由":"＋".join(reasons),
                 })
 
-    # Ver.17.5: BUY/SELL表示・ZIP出力の変数混線を防ぐため、毎回必ず空DataFrameから初期化する。
-    # Streamlitの再実行時に古い表示用DataFrameが残っても、ZIPへ誤って流用しない。
-    sell_view = pd.DataFrame()
-    buy_view = pd.DataFrame()
-
-    # SELLを先に表示：実トレードで既存ポジションの安全確認を優先
-    st.subheader("🔻 売り候補 — 現在保有中のみ")
-    if sell_signal_rows:
-        sell_view = pd.DataFrame(sell_signal_rows).copy()
-        sell_view["優先"] = sell_view["売り理由"].str.contains("損切りセンサー", na=False).map({True:"🚨 最優先",False:"🔻 SELL"})
-        sell_view = sell_view[["優先","コード","銘柄名","保有株数","取得単価","現在株価","損益率%","%K","%D","売り理由"]]
-        for c in ["取得単価","現在株価","損益率%","%K","%D"]:
-            sell_view[c] = pd.to_numeric(sell_view[c], errors="coerce").round(2)
-        st.dataframe(sell_view, use_container_width=True, hide_index=True)
-    else:
-        st.success("現在保有中にSELL条件はありません。")
-
-    st.subheader("🟢 買い候補 — 参考S株数まで表示")
-    if buy_signal_rows:
-        buy_signal_df = pd.DataFrame(buy_signal_rows).sort_values(["%K","コード"]).reset_index(drop=True)
-        plan = build_purchase_plan(
-            buy_signal_df, buying_power, current_assets, held_codes,
-            max(int(maxpos), len(held_code_set) + 3), maxbuy, sl,
-            reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
-            allow_addon=False, market_block=False,
-        )
-        buy_view = plan.merge(buy_signal_df[["コード","%K","%D","条件"]], on="コード", how="left")
-        buy_view = buy_view.rename(columns={"購入株数":"参考S株数","予定購入額":"概算購入額"})
-        cols = ["購入優先度","コード","銘柄名","現在株価","参考S株数","概算購入額","購入後推定余力","買付余力使用率","%K","%D","買付可否","見送り理由"]
-        buy_view = buy_view[[c for c in cols if c in buy_view.columns]].head(3).copy()
-        for c in ["現在株価","概算購入額","購入後推定余力"]:
-            if c in buy_view:
-                buy_view[c] = pd.to_numeric(buy_view[c], errors="coerce").round(0)
-        for c in ["買付余力使用率","%K","%D"]:
-            if c in buy_view:
-                buy_view[c] = pd.to_numeric(buy_view[c], errors="coerce").round(2)
-        st.dataframe(buy_view, use_container_width=True, hide_index=True)
-        st.caption(f"参考S株数は買付余力 ¥{int(buying_power):,} と資金管理設定から算出。候補は最大3銘柄です。")
-    else:
-        st.info("現在、%K≤20のゴールデンクロスに一致する買い候補はありません。")
-
-    st.subheader("🧪 比較 — 企業価値AI TOP50を採用した場合のBUY候補")
-    st.caption("ここは比較専用です。上の『企業価値AI TOP50をストキャス対象に使う』がOFFなら、実売買候補には反映しません。")
-    if isinstance(value_ai_buy_view, pd.DataFrame) and not value_ai_buy_view.empty:
-        st.dataframe(value_ai_buy_view, use_container_width=True, hide_index=True)
-    else:
-        st.info("企業価値AI TOP50内には、現在 %K≤20のゴールデンクロスに一致する新規BUY候補はありません。")
-
-    st.caption(f"取得成功：{len(data)}/{len(analysis_tickers)}銘柄。シグナル監視：{len(data_for_signal)}銘柄。企業価値AI TOP50は比較記録用に自動生成し、実売買への採用は設定ON時のみです。")
-
-# ------------------------------------------------------------
-# ③ 全処理結果ZIP — 朝の実トレード記録用
-# ------------------------------------------------------------
-st.header("③ 全処理結果ZIP")
-try:
-    zip_buf = io.BytesIO()
-    with ZipFile(zip_buf, "w") as zf:
-        settings_df = pd.DataFrame([{
-            "Version": VERSION,
-            "Build": BUILD,
-            "買付余力": int(buying_power),
-            "現在資産": int(current_assets),
-            "損切りセンサー%": float(sl),
-            "最大保有銘柄数": int(maxpos),
-            "現金温存率%": int(reserve_pct),
-            "1日使用上限%": int(daily_deploy_pct),
-            "1銘柄許容損失_資産比%": float(risk_per_trade_pct),
-            "価格上振れバッファ%": float(price_buffer_pct),
-            "保有銘柄買い増し": False,
-            "BUY条件": "Slow Stoch 14,3,3 / %K<=20 GC",
-            "SELL条件": f"Slow Stoch DC または 損切り -{float(sl):.1f}%",
-            "企業価値AI_TOP50使用": bool(use_value_top50),
-        }])
-        zf.writestr("ver17_settings.csv", settings_df.to_csv(index=False, encoding="utf-8-sig"))
-        if not sbi_trades_df.empty:
-            zf.writestr("sbi_execution_history.csv", sbi_trades_df.to_csv(index=False, encoding="utf-8-sig"))
-        if confirmed:
-            hold_export = pd.DataFrame([
-                {"コード":c,"銘柄名":STOCK_NAMES.get(c,c),"株数":v["shares"],"取得単価":v["avg_price"]}
-                for c,v in confirmed.items()
-            ])
-            zf.writestr("current_holdings.csv", hold_export.to_csv(index=False, encoding="utf-8-sig"))
-        if not sbi_warning_df.empty:
-            zf.writestr("sbi_history_warnings.csv", sbi_warning_df.to_csv(index=False, encoding="utf-8-sig"))
-        # Ver.17.2: 比較用企業価値AI TOP50は設定OFFでも必ずZIPへ保存する。
-        if isinstance(value_top50_df, pd.DataFrame):
-            zf.writestr("value_ai_top50.csv", value_top50_df.to_csv(index=False, encoding="utf-8-sig"))
-        else:
-            zf.writestr("value_ai_top50.csv", pd.DataFrame().to_csv(index=False, encoding="utf-8-sig"))
-        value_status_df = pd.DataFrame([{
-            "自動生成": True,
-            "ストキャス対象に使用": bool(use_value_top50),
-            "TOP50件数": int(len(value_top50_df)) if isinstance(value_top50_df, pd.DataFrame) else 0,
-            "株式分割補正警告件数": int(value_top50_df["株式分割補正"].astype(str).str.contains("⚠️").sum()) if isinstance(value_top50_df, pd.DataFrame) and "株式分割補正" in value_top50_df.columns else 0,
-            "適正株価異常値ガード件数": int(value_top50_df["適正株価異常値ガード"].astype(str).str.contains("⚠️").sum()) if isinstance(value_top50_df, pd.DataFrame) and "適正株価異常値ガード" in value_top50_df.columns else 0,
-            "生成日時": st.session_state.get("v17_value_ai_generated_at", ""),
-            "株価データ署名": st.session_state.get("v17_value_ai_signature", ""),
-            "用途": "比較検証用。設定OFF時は実売買シグナルへ不使用。Ver17.6は株式分割補正＋適正株価異常値クロスチェック＋BUY/SELL ZIP分離ガード＋企業価値AI TOP50採用時BUY比較",
-        }])
-        zf.writestr("value_ai_status.csv", value_status_df.to_csv(index=False, encoding="utf-8-sig"))
-        if data:
-            # Ver.17.5: ZIPは表示変数の存在判定に頼らず、当回に初期化・生成したDataFrameだけを書き出す。
-            buy_cols_default = ["購入優先度","コード","銘柄名","現在株価","参考S株数","概算購入額","購入後推定余力","買付余力使用率","%K","%D","買付可否","見送り理由"]
-            sell_cols_default = ["優先","コード","銘柄名","保有株数","取得単価","現在株価","損益率%","%K","%D","売り理由"]
-            value_buy_cols_default = ["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","購入後推定余力","買付余力使用率","%K","%D","AI_TOP50スコア","割安判定","AI参考価値","参考価値上昇余地%","買付可否","見送り理由"]
-            buy_export_df = buy_view.copy() if isinstance(buy_view, pd.DataFrame) and not buy_view.empty else pd.DataFrame(columns=buy_cols_default)
-            sell_export_df = sell_view.copy() if isinstance(sell_view, pd.DataFrame) and not sell_view.empty else pd.DataFrame(columns=sell_cols_default)
-            value_buy_export_df = value_ai_buy_view.copy() if isinstance(value_ai_buy_view, pd.DataFrame) and not value_ai_buy_view.empty else pd.DataFrame(columns=value_buy_cols_default)
-
-            # SELL候補は「現在保有中のみ」という仕様をZIP側でも二重保証する。
-            held_code_str_set = {str(x) for x in held_codes}
-            if not sell_export_df.empty and "コード" in sell_export_df.columns:
-                sell_export_df["コード"] = sell_export_df["コード"].astype(str)
-                sell_export_df = sell_export_df[sell_export_df["コード"].isin(held_code_str_set)].copy()
-
-            # BUY用の列がSELL CSVへ混入していたら安全側で破棄する。
-            forbidden_sell_cols = {"参考S株数", "概算購入額", "購入後推定余力", "買付余力使用率", "買付可否", "見送り理由"}
-            if any(c in sell_export_df.columns for c in forbidden_sell_cols):
-                sell_export_df = pd.DataFrame(columns=sell_cols_default)
-
-            zf.writestr("stoch_buy_candidates.csv", buy_export_df.to_csv(index=False, encoding="utf-8-sig"))
-            zf.writestr("stoch_sell_candidates.csv", sell_export_df.to_csv(index=False, encoding="utf-8-sig"))
-            zf.writestr("value_ai_stoch_buy_candidates.csv", value_buy_export_df.to_csv(index=False, encoding="utf-8-sig"))
-
-            signal_export_status = pd.DataFrame([{
-                "BUY候補件数": int(len(buy_export_df)),
-                "SELL候補件数": int(len(sell_export_df)),
-                "企業価値AI_TOP50採用時BUY候補件数": int(len(value_buy_export_df)),
-                "SELLは保有銘柄のみ": True,
-                "BUY_SELL変数分離": True,
-                "空SELL_CSVヘッダー保持": True,
-                "Version": VERSION,
-            }])
-            zf.writestr("stoch_signal_export_status.csv", signal_export_status.to_csv(index=False, encoding="utf-8-sig"))
-
-            latest_rows = []
-            for t, df0 in data.items():
-                sx = stoch_prepare_light(df0, 14, 3, 3)
-                if sx.empty:
-                    continue
-                rr = sx.iloc[-1]
-                latest_rows.append({
-                    "コード": code(t), "銘柄名": name(t),
-                    "現在株価": safe_float(rr.get("Close")),
-                    "%K": safe_float(rr.get("STOCH_K")),
-                    "%D": safe_float(rr.get("STOCH_D")),
-                    "GC": bool(rr.get("STOCH_GC", False)),
-                    "DC": bool(rr.get("STOCH_DC", False)),
-                    "保有中": code(t) in set(map(str, held_codes)),
-                })
-            if latest_rows:
-                zf.writestr("stoch_latest_all.csv", pd.DataFrame(latest_rows).to_csv(index=False, encoding="utf-8-sig"))
-    zip_buf.seek(0)
-    st.download_button(
-        "📦 Ver.17 全処理結果ZIPをダウンロード",
-        data=zip_buf.getvalue(),
-        file_name="ver17_all_analysis.zip",
-        mime="application/zip",
-        use_container_width=True,
-        key="ver17_zip_download",
+if buy_signal_rows:
+    buy_signal_df = pd.DataFrame(buy_signal_rows).sort_values(["%K","コード"]).reset_index(drop=True)
+    plan = build_purchase_plan(
+        buy_signal_df, buying_power, current_assets, held_codes,
+        max(int(maxpos), len(held_code_set)+3), maxbuy, sl,
+        reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
+        allow_addon=False, market_block=False,
     )
+    buy_view = plan.merge(buy_signal_df[["コード","%K","%D","条件"]], on="コード", how="left")
+    buy_view = buy_view.rename(columns={"購入株数":"参考S株数","予定購入額":"概算購入額"})
+    meta_cols=[c for c in ["コード","順位","AI_TOP50スコア","割安判定"] if c in value_top50_df.columns]
+    if meta_cols:
+        m=value_top50_df[meta_cols].copy(); m["コード"]=m["コード"].astype(str); buy_view["コード"]=buy_view["コード"].astype(str)
+        buy_view=buy_view.merge(m,on="コード",how="left")
+    cols=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","%K","%D","AI_TOP50スコア","割安判定","買付可否"]
+    buy_view=buy_view[[c for c in cols if c in buy_view.columns]].head(3).copy()
+    for c in ["現在株価","概算購入額"]:
+        if c in buy_view: buy_view[c]=pd.to_numeric(buy_view[c],errors="coerce").round(0)
+    for c in ["%K","%D","AI_TOP50スコア"]:
+        if c in buy_view: buy_view[c]=pd.to_numeric(buy_view[c],errors="coerce").round(2)
+
+sell_cols=["優先","コード","銘柄名","保有株数","取得単価","現在株価","損益率%","%K","%D","売り理由"]
+if sell_signal_rows:
+    sell_view=pd.DataFrame(sell_signal_rows)
+    sell_view["優先"]=sell_view["売り理由"].str.contains("損切り",na=False).map({True:"🚨 最優先",False:"🔻 SELL"})
+    sell_view=sell_view[sell_cols].copy()
+    for c in ["取得単価","現在株価","損益率%","%K","%D"]:
+        sell_view[c]=pd.to_numeric(sell_view[c],errors="coerce").round(2)
+else:
+    sell_view=pd.DataFrame(columns=sell_cols)
+
+# ------------------------------------------------------------
+# シンプル画面 + 目立たない管理者タブ
+# ------------------------------------------------------------
+main_tab, admin_tab = st.tabs(["今日の売買", "管理者"])
+with main_tab:
+    if run_error:
+        st.error(run_error)
+    elif not data or not true_top50_codes:
+        st.info("「今日の判定を更新」を押してください。")
+    else:
+        st.subheader("🔻 売り")
+        if sell_view.empty:
+            st.success("売り候補はありません。")
+        else:
+            st.dataframe(sell_view, use_container_width=True, hide_index=True)
+
+        st.subheader("🟢 買い")
+        if buy_view.empty:
+            st.info("本物の企業価値AI TOP50内に、現在BUY条件を満たす銘柄はありません。")
+        else:
+            simple_buy_cols=[c for c in ["順位","コード","銘柄名","現在株価","参考S株数","%K","%D","買付可否"] if c in buy_view.columns]
+            st.dataframe(buy_view[simple_buy_cols], use_container_width=True, hide_index=True)
+        st.caption(f"新規BUY監視：企業価値AI TOP50のみ / SELL監視：現在保有 {len(held_codes)}銘柄")
+
+with admin_tab:
+    st.caption("比較・検証用。通常の朝はここを見る必要はありません。")
+    ucnt = len(universe_df) if isinstance(universe_df, pd.DataFrame) else 0
+    dcnt = len([1 for t in data if code(t) not in held_code_set]) if data else 0
+    tcnt = len(value_top50_df) if isinstance(value_top50_df, pd.DataFrame) else 0
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("取得母集団", f"{ucnt}銘柄")
+    c2.metric("日足取得", f"{dcnt}銘柄")
+    c3.metric("企業価値AI TOP", f"{tcnt}銘柄")
+    c4.metric("生成時刻", st.session_state.get("v177_generated_at", "—"))
+    if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
+        show_cols=["順位","コード","銘柄名","一次選抜順位","現在株価_価格","AI参考価値","参考価値上昇余地%","割安判定",
+                   "企業価値スコア","成長性スコア","流動性スコア","AI_TOP50スコア","適正株価異常値ガード","株式分割補正"]
+        admin_show=value_top50_df[[c for c in show_cols if c in value_top50_df.columns]].copy()
+        st.dataframe(admin_show, use_container_width=True, hide_index=True)
+    with st.expander("現在保有", expanded=False):
+        if confirmed:
+            st.dataframe(pd.DataFrame([{"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]} for c,v in confirmed.items()]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("保有情報なし")
+
+# ------------------------------------------------------------
+# ZIP — メイン画面の最下部に1ボタンだけ
+# ------------------------------------------------------------
+st.divider()
+try:
+    zip_buf=io.BytesIO()
+    with ZipFile(zip_buf,"w") as zf:
+        settings_df=pd.DataFrame([{
+            "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
+            "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
+            "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
+            "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC",
+            "SELL条件":f"保有銘柄のみ / Slow Stoch DC または 損切り -{float(sl):.1f}%",
+            "旧49銘柄固定ユニバース使用":False,
+        }])
+        zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
+        if isinstance(universe_df,pd.DataFrame):
+            zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
+        if isinstance(value_top50_df,pd.DataFrame):
+            zf.writestr("value_ai_top50.csv",value_top50_df.to_csv(index=False,encoding="utf-8-sig"))
+        if not sbi_trades_df.empty:
+            zf.writestr("sbi_execution_history.csv",sbi_trades_df.to_csv(index=False,encoding="utf-8-sig"))
+        if confirmed:
+            zf.writestr("current_holdings.csv",pd.DataFrame([{"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]} for c,v in confirmed.items()]).to_csv(index=False,encoding="utf-8-sig"))
+        if not sbi_warning_df.empty:
+            zf.writestr("sbi_history_warnings.csv",sbi_warning_df.to_csv(index=False,encoding="utf-8-sig"))
+        buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","%K","%D","AI_TOP50スコア","割安判定","買付可否"]
+        buy_export=buy_view.copy() if isinstance(buy_view,pd.DataFrame) and not buy_view.empty else pd.DataFrame(columns=buy_cols_default)
+        zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
+        status_df=pd.DataFrame([{
+            "本物TOP50モード":True,"母集団最低200銘柄ガード":True,
+            "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
+            "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
+            "TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
+            "BUY候補件数":len(buy_export),"SELL候補件数":len(sell_view),"エラー":run_error,
+            "生成日時":st.session_state.get("v177_generated_at","")
+        }])
+        zf.writestr("value_ai_status.csv",status_df.to_csv(index=False,encoding="utf-8-sig"))
+    zip_buf.seek(0)
+    st.download_button("📦 全処理結果ZIP",data=zip_buf.getvalue(),file_name="ver17_all_analysis.zip",mime="application/zip",use_container_width=True,key="v177_zip")
 except Exception as e:
     st.warning(f"ZIP作成エラー: {e}")
 
-st.divider()
-st.caption("Ver.17.2は売買判断補助です。自動発注は行いません。企業価値AI TOP50は比較用に自動生成・ZIP保存しますが、設定OFF時はストキャス実売買へ使用しません。未来情報混入を避けるため過去バックテストには直接混ぜていません。")
+st.caption("売買判断補助です。自動発注は行いません。")

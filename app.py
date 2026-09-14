@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.6.0
-# BUILD: VER6.0-RC6.12-FAST-2STAGE-1OKU-20260908
+# 日本株 AI投資アシスタント Ver.17.12
+# BUILD: VER17-12-JUDGEMENTS-FIRST-20260914
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.11",
+    page_title="日本株 AI投資アシスタント Ver.17.12",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.11 TOP50 + SURGE RADAR"
-BUILD = "VER17-11-TOP50-SURGE-RADAR-20260913"
+VERSION = "17.12 JUDGEMENTS FIRST"
+BUILD = "VER17-12-JUDGEMENTS-FIRST-20260914"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2613,6 +2613,48 @@ def build_top50_surge_radar(data, value_top50_df):
     out.insert(0, "急騰順位", np.arange(1, len(out) + 1))
     return out[[c for c in columns if c in out.columns]]
 
+
+def add_research_judgements_first(df, surge_df, value_df):
+    """表示用の全銘柄表へ研究判定を付け、必ず左端へ並べる。
+
+    急騰予兆と割安判定は観察情報であり、正式なBUY/SELL条件には使わない。
+    TOP50外など算定値がない銘柄も、空欄にせず対象外/未算定と明示する。
+    """
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    out = df.copy()
+    if "コード" not in out.columns:
+        return out
+
+    out["コード"] = out["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
+
+    surge_map = {}
+    if isinstance(surge_df, pd.DataFrame) and not surge_df.empty and "コード" in surge_df.columns:
+        sm = surge_df.copy()
+        sm["コード"] = sm["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
+        if "急騰予兆判定" in sm.columns:
+            surge_map = sm.drop_duplicates("コード").set_index("コード")["急騰予兆判定"].to_dict()
+
+    value_map = {}
+    if isinstance(value_df, pd.DataFrame) and not value_df.empty and "コード" in value_df.columns:
+        vm = value_df.copy()
+        vm["コード"] = vm["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
+        if "割安判定" in vm.columns:
+            value_map = vm.drop_duplicates("コード").set_index("コード")["割安判定"].to_dict()
+
+    # 既存列があっても共通マスターを優先し、欠損時だけ既存表示を残す。
+    old_surge = out["急騰予兆判定"].copy() if "急騰予兆判定" in out.columns else pd.Series("", index=out.index)
+    old_value = out["割安判定"].copy() if "割安判定" in out.columns else pd.Series("", index=out.index)
+    mapped_surge = out["コード"].map(surge_map)
+    mapped_value = out["コード"].map(value_map)
+    out["急騰予兆判定"] = mapped_surge.where(mapped_surge.notna(), old_surge)
+    out["割安判定"] = mapped_value.where(mapped_value.notna(), old_value)
+    out["急騰予兆判定"] = out["急騰予兆判定"].replace("", np.nan).fillna("⚪ 判定対象外")
+    out["割安判定"] = out["割安判定"].replace("", np.nan).fillna("— 未算定")
+
+    first = ["急騰予兆判定", "割安判定"]
+    return out[first + [c for c in out.columns if c not in first]]
+
 def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     """Slow Stochastic 14,3,3。Ver.16で採用したBUY/SELL判定専用。"""
     if df is None or df.empty:
@@ -2846,6 +2888,12 @@ surge_top50_df = build_top50_surge_radar(data, value_top50_df) if data and true_
 if not isinstance(surge_top50_df, pd.DataFrame):
     surge_top50_df = pd.DataFrame()
 
+# 画面に出るすべての銘柄表で、研究判定を左端に統一表示する。
+# 表示専用の付加情報であり、正式な売買ロジックには接続しない。
+buy_view = add_research_judgements_first(buy_view, surge_top50_df, value_top50_df)
+sell_view = add_research_judgements_first(sell_view, surge_top50_df, value_top50_df)
+indicator_compare_df = add_research_judgements_first(indicator_compare_df, surge_top50_df, value_top50_df)
+
 # ------------------------------------------------------------
 # シンプル画面 + 目立たない管理者タブ
 # ------------------------------------------------------------
@@ -2866,7 +2914,7 @@ with main_tab:
         if buy_view.empty:
             st.info("本物の企業価値AI TOP50内に、現在BUY条件を満たす銘柄はありません。")
         else:
-            simple_buy_cols=[c for c in ["順位","コード","銘柄名","現在株価","参考S株数","%K","%D","買付可否"] if c in buy_view.columns]
+            simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","参考S株数","%K","%D","買付可否"] if c in buy_view.columns]
             st.dataframe(buy_view[simple_buy_cols], use_container_width=True, hide_index=True)
         st.caption(f"新規BUY監視：企業価値AI TOP50のみ / SELL監視：現在保有 {len(held_codes)}銘柄")
 
@@ -2881,9 +2929,10 @@ with admin_tab:
     c3.metric("企業価値AI TOP", f"{tcnt}銘柄")
     c4.metric("生成時刻", st.session_state.get("v177_generated_at", "—"))
     if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
-        show_cols=["順位","コード","銘柄名","一次選抜順位","現在株価_価格","AI参考価値","参考価値上昇余地%","割安判定",
+        value_show = add_research_judgements_first(value_top50_df, surge_top50_df, value_top50_df)
+        show_cols=["急騰予兆判定","割安判定","順位","コード","銘柄名","一次選抜順位","現在株価_価格","AI参考価値","参考価値上昇余地%",
                    "企業価値スコア","成長性スコア","流動性スコア","AI_TOP50スコア","適正株価異常値ガード","株式分割補正"]
-        admin_show=value_top50_df[[c for c in show_cols if c in value_top50_df.columns]].copy()
+        admin_show=value_show[[c for c in show_cols if c in value_show.columns]].copy()
         st.dataframe(admin_show, use_container_width=True, hide_index=True)
     with st.expander("🚀 TOP50・急騰予兆センサー", expanded=False):
         st.caption("旧Ver.5.5系の急騰予兆を企業価値AI TOP50だけに適用。観察専用で、正式なBUY/SELLには影響しません。")
@@ -2909,8 +2958,8 @@ with admin_tab:
                 if c in surge_show.columns:
                     surge_show[c] = pd.to_numeric(surge_show[c], errors="coerce").round(2)
             display_cols = [
-                "急騰順位","TOP50順位","コード","銘柄名","現在株価","急騰予兆スコア","急騰予兆判定",
-                "AI_TOP50スコア","割安判定","RSI","5日騰落率","25日騰落率","出来高倍率",
+                "急騰予兆判定","割安判定","急騰順位","TOP50順位","コード","銘柄名","現在株価","急騰予兆スコア",
+                "AI_TOP50スコア","RSI","5日騰落率","25日騰落率","出来高倍率",
                 "MA25乖離率","20日高値更新","Stoch_BUY","%K","%D"
             ]
             st.dataframe(surge_show[[c for c in display_cols if c in surge_show.columns]], use_container_width=True, hide_index=True)
@@ -2941,7 +2990,9 @@ with admin_tab:
         st.write("5年通算参考：60万円 → 約105.6万円 / +76.01% / PF 2.09 / 最大DD -10.04% / 339決済")
     with st.expander("現在保有", expanded=False):
         if confirmed:
-            st.dataframe(pd.DataFrame([{"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]} for c,v in confirmed.items()]), use_container_width=True, hide_index=True)
+            held_show = pd.DataFrame([{"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]} for c,v in confirmed.items()])
+            held_show = add_research_judgements_first(held_show, surge_top50_df, value_top50_df)
+            st.dataframe(held_show, use_container_width=True, hide_index=True)
         else:
             st.caption("保有情報なし")
 
@@ -3025,30 +3076,3 @@ try:
         zf.writestr("surge_prediction_summary.csv", surge_summary.to_csv(index=False,encoding="utf-8-sig"))
         compare_summary = pd.DataFrame([{
             "生成日時": st.session_state.get("v177_generated_at",""),
-            "実売買方式": "Stoch 14,3,3 / %K<=20 GC",
-            "研究_RSI5": "RSI(5) 15以下から15上抜け",
-            "研究_BB20": "BB20 -2σ外から内側復帰",
-            "Stoch_BUY件数": int(compare_export["Stoch_BUY"].sum()) if not compare_export.empty and "Stoch_BUY" in compare_export else 0,
-            "RSI5_BUY件数": int(compare_export["RSI5_BUY"].sum()) if not compare_export.empty and "RSI5_BUY" in compare_export else 0,
-            "BB20_BUY件数": int(compare_export["BB20_BUY"].sum()) if not compare_export.empty and "BB20_BUY" in compare_export else 0,
-            "2方式以上一致件数": int((pd.to_numeric(compare_export["一致数"], errors="coerce") >= 2).sum()) if not compare_export.empty and "一致数" in compare_export else 0,
-            "実売買へ影響": False,
-        }])
-        zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
-        status_df=pd.DataFrame([{
-            "本物TOP50モード":True,"母集団最低200銘柄ガード":True,
-            "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
-            "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
-            "TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "一次選抜_流動性重み":0.45,"一次選抜_トレンド重み":0.30,"一次選抜_安定性重み":0.25,
-            "OOS検証済み":True,"OOS_PF参考":1.89,"5年通算PF参考":2.09,
-            "BUY候補件数":len(buy_export),"SELL候補件数":len(sell_view),"エラー":run_error,
-            "生成日時":st.session_state.get("v177_generated_at","")
-        }])
-        zf.writestr("value_ai_status.csv",status_df.to_csv(index=False,encoding="utf-8-sig"))
-    zip_buf.seek(0)
-    st.download_button("📦 全処理結果ZIP",data=zip_buf.getvalue(),file_name="ver17_all_analysis.zip",mime="application/zip",use_container_width=True,key="v177_zip")
-except Exception as e:
-    st.warning(f"ZIP作成エラー: {e}")
-
-st.caption("売買判断補助です。自動発注は行いません。")

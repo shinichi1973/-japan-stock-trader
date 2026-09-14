@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.12
-# BUILD: VER17-12-JUDGEMENTS-FIRST-20260914
+# 日本株 AI投資アシスタント Ver.17.13
+# BUILD: VER17-13-MOBILE-TWO-LINE-CARDS-20260915
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -23,7 +23,7 @@ import re
 import plistlib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from html import unescape as html_unescape
+from html import escape as html_escape, unescape as html_unescape
 from html.parser import HTMLParser
 from zipfile import ZipFile
 
@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.12",
+    page_title="日本株 AI投資アシスタント Ver.17.13",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.12 JUDGEMENTS FIRST"
-BUILD = "VER17-12-JUDGEMENTS-FIRST-20260914"
+VERSION = "17.13 MOBILE TWO-LINE CARDS"
+BUILD = "VER17-13-MOBILE-TWO-LINE-CARDS-20260915"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2670,7 +2670,186 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     x["STOCH_DC"] = (x["STOCH_K"] < x["STOCH_D"]) & (x["STOCH_K"].shift(1) >= x["STOCH_D"].shift(1))
     return x
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.9")
+
+def _mobile_text(value, fallback="—"):
+    """カード表示用に欠損値を安全な短い文字列へ変換する。"""
+    if value is None:
+        return fallback
+    try:
+        if pd.isna(value):
+            return fallback
+    except Exception:
+        pass
+    text = str(value).strip()
+    return html_escape(text if text else fallback)
+
+
+def _mobile_number(value, decimals=0, suffix=""):
+    """スマホカード用の数値表記。"""
+    number = safe_float(value)
+    if not np.isfinite(number):
+        return "—"
+    if decimals == 0:
+        return f"{number:,.0f}{suffix}"
+    return f"{number:,.{int(decimals)}f}{suffix}"
+
+
+def _short_surge_label(value):
+    text = str(value or "")
+    if "強い急騰" in text:
+        return "🚨 強い予兆"
+    if "急騰予兆" in text:
+        return "🟠 急騰予兆"
+    if "変化検知" in text:
+        return "🟡 変化"
+    if "対象外" in text:
+        return "⚪ 対象外"
+    return "⚪ 通常"
+
+
+def _short_value_label(value):
+    text = str(value or "")
+    if "分割補正" in text:
+        return "⚠️ 分割確認"
+    if "異常値" in text:
+        return "⚠️ 算定確認"
+    if "やや割安" in text:
+        return "🟡 やや割安"
+    if "割安" in text:
+        return "🟢 割安"
+    if "割高" in text:
+        return "🔴 割高"
+    if "適正" in text:
+        return "⚪ 適正"
+    return "— 未算定"
+
+
+def render_mobile_trade_cards(df, side):
+    """メイン画面専用の2行カード。元DataFrameとZIP出力は変更しない。"""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+
+    for _, row in df.iterrows():
+        code_text = _mobile_text(row.get("コード"))
+        name_text = _mobile_text(row.get("銘柄名"))
+        price_text = _mobile_number(row.get("現在株価"), 0, "円")
+        surge_text = html_escape(_short_surge_label(row.get("急騰予兆判定")))
+        value_text = html_escape(_short_value_label(row.get("割安判定")))
+        k_text = _mobile_number(row.get("%K"), 1)
+        d_text = _mobile_number(row.get("%D"), 1)
+
+        if side == "sell":
+            shares_text = _mobile_number(row.get("保有株数"), 0, "株")
+            pnl_text = _mobile_number(row.get("損益率%"), 1, "%")
+            reason_text = _mobile_text(row.get("売り理由"))
+            action_text = "🚨 売り" if "損切り" in str(row.get("売り理由", "")) else "🔴 売り"
+            card_class = "sell-card"
+            quantity_text = f"保有 {shares_text}"
+            detail_text = (
+                f"<span>{surge_text}</span><span>{value_text}</span>"
+                f"<span>現在 {price_text}</span><span>損益 {pnl_text}</span>"
+                f"<span>{reason_text}</span>"
+            )
+        else:
+            shares = int(max(safe_float(row.get("参考S株数"), 0), 0))
+            can_buy = "BUY" in str(row.get("買付可否", "")) and shares > 0
+            action_text = "🟢 買い" if can_buy else "⛔ 見送り"
+            card_class = "buy-card" if can_buy else "skip-card"
+            quantity_text = f"参考 {shares:,}株" if can_buy else _mobile_text(row.get("買付可否"), "購入不可")
+            detail_text = (
+                f"<span>{surge_text}</span><span>{value_text}</span>"
+                f"<span>現在 {price_text}</span><span>K {k_text} / D {d_text}</span>"
+            )
+
+        st.markdown(
+            f"""
+            <div class="trade-card {card_class}">
+              <div class="trade-card-main">
+                <span class="trade-action">{action_text}</span>
+                <span class="trade-name">{code_text} {name_text}</span>
+                <span class="trade-quantity">{quantity_text}</span>
+              </div>
+              <div class="trade-card-detail">{detail_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
+    .trade-card {
+        border: 1px solid rgba(128,128,128,.25);
+        border-left: 6px solid #808080;
+        border-radius: 12px;
+        padding: 10px 11px 9px 11px;
+        margin: 0 0 9px 0;
+        background: rgba(128,128,128,.055);
+        box-shadow: 0 1px 3px rgba(0,0,0,.06);
+    }
+    .trade-card.buy-card {border-left-color: #18a058; background: rgba(24,160,88,.075);}
+    .trade-card.sell-card {border-left-color: #e5484d; background: rgba(229,72,77,.075);}
+    .trade-card.skip-card {border-left-color: #d49b16; background: rgba(212,155,22,.07);}
+    .trade-card-main {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+        line-height: 1.25;
+    }
+    .trade-action {font-size: 1.02rem; font-weight: 800; white-space: nowrap;}
+    .trade-name {
+        min-width: 0;
+        flex: 1;
+        font-size: 1rem;
+        font-weight: 750;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .trade-quantity {
+        font-size: .96rem;
+        font-weight: 800;
+        white-space: nowrap;
+        padding: 2px 7px;
+        border-radius: 7px;
+        background: rgba(128,128,128,.12);
+    }
+    .trade-card-detail {
+        display: flex;
+        flex-wrap: wrap;
+        column-gap: 9px;
+        row-gap: 2px;
+        margin-top: 7px;
+        padding-top: 6px;
+        border-top: 1px solid rgba(128,128,128,.18);
+        font-size: .76rem;
+        line-height: 1.25;
+        opacity: .90;
+    }
+    .trade-card-detail span {white-space: nowrap;}
+    @media (max-width: 640px) {
+        .block-container {padding-left: .75rem; padding-right: .75rem; padding-top: .8rem;}
+        h1 {font-size: 1.55rem !important;}
+        h2 {font-size: 1.28rem !important;}
+        h3 {font-size: 1.12rem !important;}
+        .trade-card {padding: 9px 9px 8px 9px; border-radius: 10px; margin-bottom: 7px;}
+        .trade-card-main {gap: 6px;}
+        .trade-action {font-size: .94rem;}
+        .trade-name {font-size: .91rem;}
+        .trade-quantity {font-size: .86rem; padding: 2px 5px;}
+        .trade-card-detail {font-size: .69rem; column-gap: 7px; margin-top: 6px; padding-top: 5px;}
+        div[data-testid="stDataFrame"] {font-size: .72rem;}
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+st.title("📈 日本株 AI投資アシスタント Ver.17.13")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("本物の企業価値AI TOP50 → Slow Stochastic 14,3,3 → BUY候補だけをシンプル表示")
 st.caption("一次選抜は5年OOS検証済み：流動性45% / トレンド30% / 値動き安定性25%")
@@ -2908,14 +3087,18 @@ with main_tab:
         if sell_view.empty:
             st.success("売り候補はありません。")
         else:
-            st.dataframe(sell_view, use_container_width=True, hide_index=True)
+            render_mobile_trade_cards(sell_view, "sell")
+            with st.expander("売り候補の詳細表", expanded=False):
+                st.dataframe(sell_view, use_container_width=True, hide_index=True)
 
         st.subheader("🟢 買い")
         if buy_view.empty:
             st.info("本物の企業価値AI TOP50内に、現在BUY条件を満たす銘柄はありません。")
         else:
+            render_mobile_trade_cards(buy_view, "buy")
             simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","参考S株数","%K","%D","買付可否"] if c in buy_view.columns]
-            st.dataframe(buy_view[simple_buy_cols], use_container_width=True, hide_index=True)
+            with st.expander("買い候補の詳細表", expanded=False):
+                st.dataframe(buy_view[simple_buy_cols], use_container_width=True, hide_index=True)
         st.caption(f"新規BUY監視：企業価値AI TOP50のみ / SELL監視：現在保有 {len(held_codes)}銘柄")
 
 with admin_tab:

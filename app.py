@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.13
-# BUILD: VER17-13-MOBILE-TWO-LINE-CARDS-20260915
+# 日本株 AI投資アシスタント Ver.17.14
+# BUILD: VER17-14-ADMIN-COMPACT-TABLES-20260915
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.13",
+    page_title="日本株 AI投資アシスタント Ver.17.14",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.13 MOBILE TWO-LINE CARDS"
-BUILD = "VER17-13-MOBILE-TWO-LINE-CARDS-20260915"
+VERSION = "17.14 ADMIN COMPACT TABLES"
+BUILD = "VER17-14-ADMIN-COMPACT-TABLES-20260915"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2776,6 +2776,46 @@ def render_mobile_trade_cards(df, side):
         )
 
 
+def prepare_admin_display(df, rename_columns=None):
+    """管理者表だけを短い判定・統一桁数に整える。元データは変更しない。"""
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    out = df.copy()
+    if "急騰予兆判定" in out.columns:
+        out["急騰予兆判定"] = out["急騰予兆判定"].map(_short_surge_label)
+    if "割安判定" in out.columns:
+        out["割安判定"] = out["割安判定"].map(_short_value_label)
+
+    zero_decimal = ["現在株価", "現在株価_価格", "AI参考価値", "取得単価", "株数", "保有株数"]
+    one_decimal = [
+        "参考価値上昇余地%", "企業価値スコア", "成長性スコア", "流動性スコア",
+        "AI_TOP50スコア", "急騰予兆スコア", "RSI", "5日騰落率", "25日騰落率",
+        "MA25乖離率", "MA25傾き", "%K", "%D", "RSI5", "BB下限", "損益率%",
+    ]
+    two_decimal = ["出来高倍率"]
+    for col in zero_decimal:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(0)
+    for col in one_decimal:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(1)
+    for col in two_decimal:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+    for col in ["Stoch_BUY", "RSI5_BUY", "BB20_BUY"]:
+        if col in out.columns:
+            out[col] = out[col].fillna(False).astype(bool).map({True: "🟢", False: "—"})
+    if rename_columns:
+        out = out.rename(columns=rename_columns)
+    return out
+
+
+def admin_table_height(df, maximum=520):
+    """件数が少ない表は余白を減らし、多い表は表内スクロールにする。"""
+    rows = len(df) if isinstance(df, pd.DataFrame) else 0
+    return min(maximum, max(150, 36 * (rows + 1) + 8))
+
+
 st.markdown(
     """
     <style>
@@ -2830,6 +2870,8 @@ st.markdown(
         opacity: .90;
     }
     .trade-card-detail span {white-space: nowrap;}
+    div[data-testid="stTabs"] button p {font-size: .88rem; font-weight: 700;}
+    div[data-testid="stDataFrame"] {border-radius: 9px; overflow: hidden;}
     @media (max-width: 640px) {
         .block-container {padding-left: .75rem; padding-right: .75rem; padding-top: .8rem;}
         h1 {font-size: 1.55rem !important;}
@@ -2841,7 +2883,11 @@ st.markdown(
         .trade-name {font-size: .91rem;}
         .trade-quantity {font-size: .86rem; padding: 2px 5px;}
         .trade-card-detail {font-size: .69rem; column-gap: 7px; margin-top: 6px; padding-top: 5px;}
-        div[data-testid="stDataFrame"] {font-size: .72rem;}
+        div[data-testid="stTabs"] button {padding-left: .48rem; padding-right: .48rem;}
+        div[data-testid="stTabs"] button p {font-size: .72rem; white-space: nowrap;}
+        div[data-testid="stDataFrame"] {font-size: .70rem;}
+        div[data-testid="stMetric"] {padding: .2rem;}
+        div[data-testid="stMetricValue"] {font-size: 1.1rem;}
     }
     </style>
     """,
@@ -2849,7 +2895,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.13")
+st.title("📈 日本株 AI投資アシスタント Ver.17.14")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("本物の企業価値AI TOP50 → Slow Stochastic 14,3,3 → BUY候補だけをシンプル表示")
 st.caption("一次選抜は5年OOS検証済み：流動性45% / トレンド30% / 値動き安定性25%")
@@ -3107,109 +3153,186 @@ with admin_tab:
     dcnt = len([1 for t in data if code(t) not in held_code_set]) if data else 0
     tcnt = len(value_top50_df) if isinstance(value_top50_df, pd.DataFrame) else 0
     c1,c2,c3,c4=st.columns(4)
-    c1.metric("取得母集団", f"{ucnt}銘柄")
+    c1.metric("母集団", f"{ucnt}銘柄")
     c2.metric("日足取得", f"{dcnt}銘柄")
-    c3.metric("企業価値AI TOP", f"{tcnt}銘柄")
-    c4.metric("生成時刻", st.session_state.get("v177_generated_at", "—"))
-    if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
-        value_show = add_research_judgements_first(value_top50_df, surge_top50_df, value_top50_df)
-        show_cols=["急騰予兆判定","割安判定","順位","コード","銘柄名","一次選抜順位","現在株価_価格","AI参考価値","参考価値上昇余地%",
-                   "企業価値スコア","成長性スコア","流動性スコア","AI_TOP50スコア","適正株価異常値ガード","株式分割補正"]
-        admin_show=value_show[[c for c in show_cols if c in value_show.columns]].copy()
-        st.dataframe(admin_show, use_container_width=True, hide_index=True)
-    with st.expander("🚀 TOP50・急騰予兆センサー", expanded=False):
-        st.caption("旧Ver.5.5系の急騰予兆を企業価値AI TOP50だけに適用。観察専用で、正式なBUY/SELLには影響しません。")
-        st.write("判定：70点以上＝強い急騰予兆、55点以上＝急騰予兆、40点以上＝変化検知。株価2,000円以上も除外しません。")
+    c3.metric("AI TOP", f"{tcnt}銘柄")
+    c4.metric("保有", f"{len(held_codes)}銘柄")
+
+    value_tab, surge_tab, compare_tab, holdings_tab = st.tabs([
+        "企業価値", "急騰予兆", "3指標比較", "保有銘柄"
+    ])
+
+    with value_tab:
+        st.caption("企業価値AI TOP50：重要列だけを先に表示します。")
+        if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
+            st.info("先に『今日の判定を更新』で企業価値AI TOP50を作成してください。")
+        else:
+            value_show = add_research_judgements_first(value_top50_df, surge_top50_df, value_top50_df)
+            show_cols=[
+                "急騰予兆判定","割安判定","順位","コード","銘柄名","一次選抜順位",
+                "現在株価_価格","AI参考価値","参考価値上昇余地%","企業価値スコア",
+                "成長性スコア","流動性スコア","AI_TOP50スコア",
+                "適正株価異常値ガード","株式分割補正"
+            ]
+            value_full = prepare_admin_display(value_show[[c for c in show_cols if c in value_show.columns]])
+            value_compact_cols = [
+                "急騰予兆判定","割安判定","順位","コード","銘柄名",
+                "現在株価_価格","AI_TOP50スコア"
+            ]
+            value_compact = value_full[[c for c in value_compact_cols if c in value_full.columns]].rename(columns={
+                "急騰予兆判定":"急騰", "割安判定":"割安", "現在株価_価格":"株価",
+                "AI_TOP50スコア":"AI点"
+            })
+            st.dataframe(
+                value_compact, use_container_width=True, hide_index=True,
+                height=admin_table_height(value_compact, 520)
+            )
+            with st.expander("企業価値TOP50の詳細列", expanded=False):
+                st.dataframe(
+                    value_full, use_container_width=True, hide_index=True,
+                    height=admin_table_height(value_full, 560)
+                )
+
+        with st.expander("🧪 5年OOS検証メモ", expanded=False):
+            st.caption("過去時点のOHLCVだけで作るTOP50フィルターを70%学習 / 30%未学習で検証。企業価値ファンダメンタル自体の過去再現ではありません。")
+            st.write("採用値：流動性45% / トレンド30% / 値動き安定性25%")
+            st.write("学習期間：+54.27% / PF 2.10 / 最大DD -10.04% / 257決済")
+            st.write("OOS期間：+16.10% / PF 1.89 / 最大DD -5.25% / 81決済")
+            st.write("5年通算参考：60万円 → 約105.6万円 / +76.01% / PF 2.09 / 最大DD -10.04% / 339決済")
+
+        with st.expander("🧪 バックテスト用5年日足データ", expanded=False):
+            st.caption("この出力は検証専用です。売買判定には使いません。現在の大規模母集団の5年OHLCVを取得します。")
+            st.warning("企業価値AIを過去時点で完全再現するには、当時のファンダメンタル/目標株価データが別途必要です。このデータだけでできるのは347銘柄ストキャス検証と、現TOP50を固定した参考検証です。")
+            if isinstance(universe_df, pd.DataFrame) and not universe_df.empty:
+                bt_tickers = tuple(universe_df["ticker"].astype(str).tolist()) if "ticker" in universe_df.columns else tuple(tickers(",".join(universe_df["コード"].astype(str).tolist())))
+                if st.button("5年日足バックテストデータを作成", key="v178_make_btdata"):
+                    with st.spinner(f"{len(bt_tickers)}銘柄の5年日足を取得中… 数分かかる場合があります。"):
+                        bt_hist, bt_failed = export_backtest_history_5y(bt_tickers)
+                    bbuf = io.BytesIO()
+                    with ZipFile(bbuf, "w") as bzf:
+                        bzf.writestr("backtest_history_5y.csv", bt_hist.to_csv(index=False, encoding="utf-8-sig"))
+                        bzf.writestr("backtest_universe.csv", universe_df.to_csv(index=False, encoding="utf-8-sig"))
+                        if isinstance(value_top50_df, pd.DataFrame):
+                            bzf.writestr("current_value_ai_top50.csv", value_top50_df.to_csv(index=False, encoding="utf-8-sig"))
+                        bzf.writestr("backtest_history_failures.csv", bt_failed.to_csv(index=False, encoding="utf-8-sig"))
+                        manifest = pd.DataFrame([{
+                            "Version": VERSION, "Build": BUILD,
+                            "母集団件数": len(universe_df),
+                            "5年日足取得成功銘柄数": int(bt_hist["コード"].nunique()) if not bt_hist.empty and "コード" in bt_hist.columns else 0,
+                            "総日足行数": len(bt_hist), "取得失敗件数": len(bt_failed),
+                            "用途": "この場での347銘柄ストキャス5年バックテスト用",
+                            "注意": "過去時点の企業価値AI TOP50完全再現にはpoint-in-timeファンダメンタルが必要",
+                        }])
+                        bzf.writestr("backtest_manifest.csv", manifest.to_csv(index=False, encoding="utf-8-sig"))
+                    bbuf.seek(0)
+                    st.success(f"5年日足：{bt_hist['コード'].nunique() if not bt_hist.empty and 'コード' in bt_hist.columns else 0}銘柄 / {len(bt_hist):,}行")
+                    st.download_button("📦 バックテスト用5年日足ZIP", data=bbuf.getvalue(), file_name="ver17_backtest_history_5y.zip", mime="application/zip", use_container_width=True, key="v178_btzip")
+            else:
+                st.info("先に『今日の判定を更新』で大規模母集団を作成してください。")
+
+    with surge_tab:
+        st.caption("旧Ver.5.5系の観察センサーです。正式なBUY/SELLには影響しません。")
+        st.write("70点以上＝強い予兆、55点以上＝急騰予兆、40点以上＝変化検知")
         if surge_top50_df.empty:
             st.info("先に『今日の判定を更新』で企業価値AI TOP50を作成してください。")
         else:
-            strong_n = int((pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce") >= 70).sum())
-            alert_n = int((pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce") >= 55).sum())
-            change_n = int((pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce") >= 40).sum())
-            stoch_match_n = int((
-                (pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce") >= 55) &
-                surge_top50_df["Stoch_BUY"].fillna(False).astype(bool)
-            ).sum())
+            surge_score = pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce")
+            strong_n = int((surge_score >= 70).sum())
+            alert_n = int((surge_score >= 55).sum())
+            change_n = int((surge_score >= 40).sum())
+            stoch_match_n = int(((surge_score >= 55) & surge_top50_df["Stoch_BUY"].fillna(False).astype(bool)).sum())
             s1,s2,s3,s4 = st.columns(4)
-            s1.metric("強い急騰予兆", strong_n)
-            s2.metric("急騰予兆以上", alert_n)
-            s3.metric("変化検知以上", change_n)
-            s4.metric("予兆＋Stoch BUY", stoch_match_n)
+            s1.metric("強予兆", strong_n)
+            s2.metric("予兆以上", alert_n)
+            s3.metric("変化以上", change_n)
+            s4.metric("予兆＋Stoch", stoch_match_n)
 
-            surge_show = surge_top50_df.copy()
-            for c in ["現在株価","急騰予兆スコア","AI_TOP50スコア","RSI","5日騰落率","25日騰落率","出来高倍率","MA25乖離率","MA25傾き","%K","%D"]:
-                if c in surge_show.columns:
-                    surge_show[c] = pd.to_numeric(surge_show[c], errors="coerce").round(2)
-            display_cols = [
-                "急騰予兆判定","割安判定","急騰順位","TOP50順位","コード","銘柄名","現在株価","急騰予兆スコア",
-                "AI_TOP50スコア","RSI","5日騰落率","25日騰落率","出来高倍率",
-                "MA25乖離率","20日高値更新","Stoch_BUY","%K","%D"
+            surge_display_cols = [
+                "急騰予兆判定","割安判定","急騰順位","TOP50順位","コード","銘柄名",
+                "現在株価","急騰予兆スコア","AI_TOP50スコア","RSI","5日騰落率",
+                "25日騰落率","出来高倍率","MA25乖離率","20日高値更新",
+                "Stoch_BUY","%K","%D"
             ]
-            st.dataframe(surge_show[[c for c in display_cols if c in surge_show.columns]], use_container_width=True, hide_index=True)
-            st.caption("TOP50全銘柄をスコア順に表示します。詳細な配点は全処理ZIPへ保存します。")
-    with st.expander("🧪 インジケーター研究：Stoch vs RSI5 vs BB20", expanded=False):
-        st.caption("比較専用です。実売買は従来どおりStoch 14,3,3 / %K≤20 GCのみを使用します。")
-        st.write("研究条件：RSI(5)は15以下から15上抜け、BB20は-2σ下抜け後のバンド内復帰。")
+            surge_full = prepare_admin_display(surge_top50_df[[c for c in surge_display_cols if c in surge_top50_df.columns]])
+            surge_compact_cols = [
+                "急騰予兆判定","割安判定","急騰順位","コード","銘柄名",
+                "現在株価","急騰予兆スコア","出来高倍率","Stoch_BUY"
+            ]
+            surge_compact = surge_full[[c for c in surge_compact_cols if c in surge_full.columns]].rename(columns={
+                "急騰予兆判定":"急騰", "割安判定":"割安", "急騰順位":"順位",
+                "現在株価":"株価", "急騰予兆スコア":"予兆点", "出来高倍率":"出来高倍",
+                "Stoch_BUY":"Stoch"
+            })
+            st.dataframe(
+                surge_compact, use_container_width=True, hide_index=True,
+                height=admin_table_height(surge_compact, 520)
+            )
+            with st.expander("急騰予兆の詳細列", expanded=False):
+                st.dataframe(
+                    surge_full, use_container_width=True, hide_index=True,
+                    height=admin_table_height(surge_full, 560)
+                )
+                st.caption("詳細な配点は全処理ZIPにも保存します。株価2,000円以上も除外しません。")
+
+    with compare_tab:
+        st.caption("研究専用。実売買はStoch 14,3,3 / %K≤20 GCのみです。")
+        st.write("RSI5＝15以下から15上抜け / BB20＝-2σ外から内側復帰")
         if indicator_compare_df.empty:
             st.info("現在、TOP50内で3方式のいずれかがBUY点灯している銘柄はありません。")
         else:
-            comp_show = indicator_compare_df.copy()
-            for c in ["現在株価","%K","%D","RSI5","BB下限"]:
-                if c in comp_show.columns:
-                    comp_show[c] = pd.to_numeric(comp_show[c], errors="coerce").round(2)
-            st.dataframe(comp_show, use_container_width=True, hide_index=True)
+            raw_compare = indicator_compare_df.copy()
             c1,c2,c3,c4 = st.columns(4)
-            c1.metric("Stoch BUY", int(comp_show["Stoch_BUY"].sum()) if "Stoch_BUY" in comp_show else 0)
-            c2.metric("RSI5 BUY", int(comp_show["RSI5_BUY"].sum()) if "RSI5_BUY" in comp_show else 0)
-            c3.metric("BB20 BUY", int(comp_show["BB20_BUY"].sum()) if "BB20_BUY" in comp_show else 0)
-            c4.metric("2方式以上一致", int((pd.to_numeric(comp_show.get("一致数", 0), errors="coerce") >= 2).sum()))
-        st.caption("日々の比較結果は全処理ZIP内の indicator_compare_candidates.csv に保存します。")
+            c1.metric("Stoch", int(raw_compare["Stoch_BUY"].fillna(False).astype(bool).sum()) if "Stoch_BUY" in raw_compare else 0)
+            c2.metric("RSI5", int(raw_compare["RSI5_BUY"].fillna(False).astype(bool).sum()) if "RSI5_BUY" in raw_compare else 0)
+            c3.metric("BB20", int(raw_compare["BB20_BUY"].fillna(False).astype(bool).sum()) if "BB20_BUY" in raw_compare else 0)
+            c4.metric("2方式以上", int((pd.to_numeric(raw_compare.get("一致数", 0), errors="coerce") >= 2).sum()))
 
-    with st.expander("🧪 5年OOS検証メモ", expanded=False):
-        st.caption("過去時点のOHLCVだけで作るTOP50フィルターを70%学習 / 30%未学習で検証。企業価値ファンダメンタル自体の過去再現ではありません。")
-        st.write("採用値：流動性45% / トレンド30% / 値動き安定性25%")
-        st.write("学習期間：+54.27% / PF 2.10 / 最大DD -10.04% / 257決済")
-        st.write("OOS期間：+16.10% / PF 1.89 / 最大DD -5.25% / 81決済")
-        st.write("5年通算参考：60万円 → 約105.6万円 / +76.01% / PF 2.09 / 最大DD -10.04% / 339決済")
-    with st.expander("現在保有", expanded=False):
+            comp_full = prepare_admin_display(raw_compare)
+            comp_cols = [
+                "急騰予兆判定","割安判定","コード","銘柄名","現在株価",
+                "一致数","発火方式","Stoch_BUY","RSI5_BUY","BB20_BUY"
+            ]
+            comp_compact = comp_full[[c for c in comp_cols if c in comp_full.columns]].rename(columns={
+                "急騰予兆判定":"急騰", "割安判定":"割安", "現在株価":"株価",
+                "Stoch_BUY":"Stoch", "RSI5_BUY":"RSI5", "BB20_BUY":"BB20"
+            })
+            if "一致数" in comp_compact.columns:
+                comp_compact = comp_compact.sort_values(["一致数", "コード"], ascending=[False, True])
+            st.dataframe(
+                comp_compact, use_container_width=True, hide_index=True,
+                height=admin_table_height(comp_compact, 480)
+            )
+            with st.expander("3指標比較の詳細列", expanded=False):
+                st.dataframe(
+                    comp_full, use_container_width=True, hide_index=True,
+                    height=admin_table_height(comp_full, 520)
+                )
+        st.caption("比較結果は全処理ZIP内の indicator_compare_candidates.csv に保存します。")
+
+    with holdings_tab:
+        st.caption("SBI約定履歴CSVから復元できた現在保有銘柄だけを表示します。")
         if confirmed:
-            held_show = pd.DataFrame([{"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]} for c,v in confirmed.items()])
+            held_show = pd.DataFrame([
+                {"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]}
+                for c,v in confirmed.items()
+            ])
             held_show = add_research_judgements_first(held_show, surge_top50_df, value_top50_df)
-            st.dataframe(held_show, use_container_width=True, hide_index=True)
+            held_full = prepare_admin_display(held_show)
+            held_compact_cols = ["急騰予兆判定","割安判定","コード","銘柄名","株数","取得単価"]
+            held_compact = held_full[[c for c in held_compact_cols if c in held_full.columns]].rename(columns={
+                "急騰予兆判定":"急騰", "割安判定":"割安"
+            })
+            st.dataframe(
+                held_compact, use_container_width=True, hide_index=True,
+                height=admin_table_height(held_compact, 460)
+            )
+            with st.expander("保有銘柄の詳細列", expanded=False):
+                st.dataframe(
+                    held_full, use_container_width=True, hide_index=True,
+                    height=admin_table_height(held_full, 500)
+                )
         else:
-            st.caption("保有情報なし")
-
-
-    with st.expander("🧪 バックテスト用5年日足データ（管理者）", expanded=False):
-        st.caption("この出力は検証専用です。売買判定には使いません。現在の大規模母集団の5年OHLCVを取得します。")
-        st.warning("企業価値AIを過去時点で完全再現するには、当時のファンダメンタル/目標株価データが別途必要です。このデータだけでできるのは347銘柄ストキャス検証と、現TOP50を固定した参考検証です。")
-        if isinstance(universe_df, pd.DataFrame) and not universe_df.empty:
-            bt_tickers = tuple(universe_df["ticker"].astype(str).tolist()) if "ticker" in universe_df.columns else tuple(tickers(",".join(universe_df["コード"].astype(str).tolist())))
-            if st.button("5年日足バックテストデータを作成", key="v178_make_btdata"):
-                with st.spinner(f"{len(bt_tickers)}銘柄の5年日足を取得中… 数分かかる場合があります。"):
-                    bt_hist, bt_failed = export_backtest_history_5y(bt_tickers)
-                bbuf = io.BytesIO()
-                with ZipFile(bbuf, "w") as bzf:
-                    bzf.writestr("backtest_history_5y.csv", bt_hist.to_csv(index=False, encoding="utf-8-sig"))
-                    bzf.writestr("backtest_universe.csv", universe_df.to_csv(index=False, encoding="utf-8-sig"))
-                    if isinstance(value_top50_df, pd.DataFrame):
-                        bzf.writestr("current_value_ai_top50.csv", value_top50_df.to_csv(index=False, encoding="utf-8-sig"))
-                    bzf.writestr("backtest_history_failures.csv", bt_failed.to_csv(index=False, encoding="utf-8-sig"))
-                    manifest = pd.DataFrame([{
-                        "Version": VERSION, "Build": BUILD,
-                        "母集団件数": len(universe_df),
-                        "5年日足取得成功銘柄数": int(bt_hist["コード"].nunique()) if not bt_hist.empty and "コード" in bt_hist.columns else 0,
-                        "総日足行数": len(bt_hist),
-                        "取得失敗件数": len(bt_failed),
-                        "用途": "この場での347銘柄ストキャス5年バックテスト用",
-                        "注意": "過去時点の企業価値AI TOP50完全再現にはpoint-in-timeファンダメンタルが必要",
-                    }])
-                    bzf.writestr("backtest_manifest.csv", manifest.to_csv(index=False, encoding="utf-8-sig"))
-                bbuf.seek(0)
-                st.success(f"5年日足：{bt_hist['コード'].nunique() if not bt_hist.empty and 'コード' in bt_hist.columns else 0}銘柄 / {len(bt_hist):,}行")
-                st.download_button("📦 バックテスト用5年日足ZIP", data=bbuf.getvalue(), file_name="ver17_backtest_history_5y.zip", mime="application/zip", use_container_width=True, key="v178_btzip")
-        else:
-            st.info("先に『今日の判定を更新』で大規模母集団を作成してください。")
+            st.info("保有情報はありません。SBI約定履歴CSVを読み込んでください。")
 
 # ------------------------------------------------------------
 # ZIP — メイン画面の最下部に1ボタンだけ

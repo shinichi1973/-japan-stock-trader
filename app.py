@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.14
-# BUILD: VER17-14-ADMIN-COMPACT-TABLES-20260915
+# 日本株 AI投資アシスタント Ver.17.15
+# BUILD: VER17-15-SAME-DAY-DAILY-BAR-20260917
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.14",
+    page_title="日本株 AI投資アシスタント Ver.17.15",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.14 ADMIN COMPACT TABLES"
-BUILD = "VER17-14-ADMIN-COMPACT-TABLES-20260915"
+VERSION = "17.15 SAME-DAY DAILY BAR"
+BUILD = "VER17-15-SAME-DAY-DAILY-BAR-20260917"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -699,7 +699,77 @@ def _stooq_stock_day(symbol, target_date):
     return values, "Stooq日本株日足CSV（無料）"
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=300, show_spinner=False)
+def latest_tse_session_status(reference_symbol="7203.T"):
+    """東証の直近取引日をYahooの取引時刻から確認する。
+
+    カレンダーを推測せず、実際の regularMarketTime を使うことで、土日祝日や
+    臨時休場日に当日行を誤追加しない。15:30の大引け後もデータ配信側の集計を
+    待ち、16:00以降だけ当日OHLCVを確定扱いする。
+    """
+    encoded = requests.utils.quote(str(reference_symbol), safe="")
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; JPStockAssistant/17.15)"}
+    last_error = None
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            response = requests.get(
+                f"https://{host}/v8/finance/chart/{encoded}",
+                params={"range":"5d", "interval":"1d", "includePrePost":"false"},
+                headers=headers, timeout=12,
+            )
+            response.raise_for_status()
+            result = (response.json().get("chart", {}).get("result") or [])[0]
+            meta = result.get("meta") or {}
+            market_ts = meta.get("regularMarketTime")
+            if not market_ts:
+                raise ValueError("regularMarketTimeなし")
+            market_time = pd.Timestamp(int(market_ts), unit="s", tz="UTC").tz_convert(JST)
+            session_date = market_time.tz_localize(None).normalize()
+            now_jst = tokyo_now()
+            today = pd.Timestamp(now_jst.date())
+            # 前営業日以前なら確定済み。当日分は16時以降だけ採用する。
+            confirmed = bool(session_date < today or (session_date == today and now_jst.hour >= 16))
+            return {
+                "session_date": session_date,
+                "confirmed": confirmed,
+                "market_time": market_time.strftime("%Y-%m-%d %H:%M:%S JST"),
+                "market_state": str(meta.get("marketState") or ""),
+                "source": f"Yahoo取引時刻 ({host})",
+                "error": "",
+            }
+        except Exception as exc:
+            last_error = exc
+    return {
+        "session_date": pd.NaT, "confirmed": False, "market_time": "",
+        "market_state": "", "source": "取得失敗", "error": str(last_error or "不明"),
+    }
+
+
+def _merge_same_day_quote(history, quote, session_date):
+    """一括取得した確定OHLCVを、指標計算前の日足履歴へ安全に結合する。"""
+    base = _normalize_ohlcv(history)
+    if base.empty or not quote or pd.isna(session_date):
+        return history, False
+    session_date = pd.Timestamp(session_date).normalize()
+    latest = pd.Timestamp(base.index.max()).normalize()
+    if latest >= session_date:
+        return base, False
+    values = {k: safe_float(quote.get(k), np.nan) for k in ["Open","High","Low","Close","Volume"]}
+    valid = (
+        all(np.isfinite(values[k]) and values[k] > 0 for k in ["Open","High","Low","Close"])
+        and values["Low"] <= min(values["Open"], values["Close"])
+        and values["High"] >= max(values["Open"], values["Close"])
+    )
+    if not valid:
+        return base, False
+    volume = values["Volume"] if np.isfinite(values["Volume"]) and values["Volume"] >= 0 else 0.0
+    base.loc[session_date, ["Open","High","Low","Close","Volume"]] = [
+        values["Open"], values["High"], values["Low"], values["Close"], volume
+    ]
+    return base.sort_index(), True
+
+
+@st.cache_data(ttl=300)
 def tradingview_batch_quotes(tickers_tuple):
     """TradingView公開スキャナーから東証銘柄を1回でまとめて取得する。"""
     requested = [str(t) for t in tickers_tuple if str(t).endswith(".T")]
@@ -2356,13 +2426,23 @@ def export_backtest_history_5y(tickers_tuple):
         hist = hist.sort_values(["コード","日付"]).reset_index(drop=True)
     return hist, pd.DataFrame(failed)
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def batch_stock_data_light(tickers_tuple, months=15):
-    """数百銘柄の日足をyfinanceで分割一括取得。1銘柄ずつ取得するより大幅に軽量。"""
+    """数百銘柄の日足を取得し、16時以降は直近東証日を一括補完する。
+
+    過去履歴はyfinanceを使い、遅れやすい最終1日だけTradingViewの東証
+    一括OHLCVで補う。補完不能時は従来履歴へ安全にフォールバックする。
+    """
     ts = list(dict.fromkeys([str(t) for t in tickers_tuple if str(t).endswith(".T")]))
     out = {}
     if not ts:
         return out
+    session = latest_tse_session_status("7203.T")
+    session_date = session.get("session_date", pd.NaT)
+    same_day_quotes = {}
+    quote_diagnostics = []
+    if bool(session.get("confirmed")) and pd.notna(session_date):
+        same_day_quotes, quote_diagnostics = tradingview_batch_quotes(tuple(ts))
     # 大きすぎる一括DLは不安定なので60銘柄ずつ。
     for i in range(0, len(ts), 60):
         chunk = ts[i:i+60]
@@ -2389,12 +2469,53 @@ def batch_stock_data_light(tickers_tuple, months=15):
                     if len(chunk) != 1:
                         continue
                     one = raw.copy()
+                one, same_day_added = _merge_same_day_quote(
+                    one, same_day_quotes.get(t), session_date
+                )
                 fx = _prepare_light_history_frame(one)
                 if not fx.empty:
+                    latest = pd.Timestamp(fx.index.max()).normalize()
+                    is_current = bool(pd.notna(session_date) and latest >= pd.Timestamp(session_date).normalize())
+                    fx.attrs.update({
+                        "source": (
+                            "yfinance履歴 + TradingView東証一括OHLCV（当日補完）"
+                            if same_day_added else "yfinance一括日足"
+                        ),
+                        "same_day_added": bool(same_day_added),
+                        "session_date": session_date,
+                        "latest_date": latest,
+                        "daily_bar_status": (
+                            "🟢 当日確定" if is_current and bool(session.get("confirmed"))
+                            else "🟡 取引中・未確定" if pd.notna(session_date) and not bool(session.get("confirmed"))
+                            else "🔴 更新待ち"
+                        ),
+                        "session_source": session.get("source", ""),
+                        "quote_diagnostics": quote_diagnostics,
+                    })
                     out[t] = fx
             except Exception:
                 continue
     return out
+
+
+def build_daily_bar_status(data):
+    """画面表示とZIP保存用に、銘柄別の日足鮮度を一覧化する。"""
+    rows = []
+    for t, frame in (data or {}).items():
+        if frame is None or frame.empty:
+            continue
+        latest = pd.Timestamp(frame.index.max()).normalize()
+        session_date = frame.attrs.get("session_date", pd.NaT)
+        session_date = pd.Timestamp(session_date).normalize() if pd.notna(session_date) else pd.NaT
+        rows.append({
+            "コード": code(t), "銘柄名": name(t),
+            "日足最終日": latest.strftime("%Y-%m-%d"),
+            "直近東証取引日": session_date.strftime("%Y-%m-%d") if pd.notna(session_date) else "確認不可",
+            "状態": frame.attrs.get("daily_bar_status", "不明"),
+            "当日補完": bool(frame.attrs.get("same_day_added", False)),
+            "データ元": frame.attrs.get("source", "不明"),
+        })
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -2895,7 +3016,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.14")
+st.title("📈 日本株 AI投資アシスタント Ver.17.15")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("本物の企業価値AI TOP50 → Slow Stochastic 14,3,3 → BUY候補だけをシンプル表示")
 st.caption("一次選抜は5年OOS検証済み：流動性45% / トレンド30% / 値動き安定性25%")
@@ -2997,6 +3118,7 @@ if run_clicked:
     # 「本物TOP50」の最低条件。失敗時に旧49銘柄へ戻さない。
     if not isinstance(universe_df, pd.DataFrame) or len(universe_df) < 200:
         st.session_state["v177_data"] = {}
+        st.session_state["v177_daily_bar_status"] = pd.DataFrame()
         st.session_state["v177_value_top50"] = pd.DataFrame()
         st.session_state["v177_run_error"] = "大規模母集団を200銘柄以上取得できなかったため、BUY判定を安全停止しました。旧49銘柄へは戻していません。"
     else:
@@ -3007,6 +3129,7 @@ if run_clicked:
         with st.spinner(f"{len(all_tickers)}銘柄の日足を一括取得中…"):
             data = batch_stock_data_light(all_tickers, months=15)
         st.session_state["v177_data"] = data
+        st.session_state["v177_daily_bar_status"] = build_daily_bar_status(data)
         # データ取得成功数が小さすぎる場合も偽TOP50を作らない。
         mother_data = {t:d for t,d in data.items() if code(t) in set(universe_codes)}
         if len(mother_data) < 150:
@@ -3025,6 +3148,7 @@ universe_df = st.session_state.get("v177_universe_df", pd.DataFrame())
 data = st.session_state.get("v177_data", {})
 value_top50_df = st.session_state.get("v177_value_top50", pd.DataFrame())
 run_error = st.session_state.get("v177_run_error", "")
+daily_bar_status_df = st.session_state.get("v177_daily_bar_status", pd.DataFrame())
 
 # ------------------------------------------------------------
 # TOP50だけを新規BUY対象にする。SELLは保有全銘柄を監視。
@@ -3124,6 +3248,19 @@ indicator_compare_df = add_research_judgements_first(indicator_compare_df, surge
 # ------------------------------------------------------------
 main_tab, admin_tab = st.tabs(["今日の売買", "管理者"])
 with main_tab:
+    if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
+        current_count = int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum())
+        total_count = len(daily_bar_status_df)
+        target_dates = daily_bar_status_df.loc[
+            daily_bar_status_df["直近東証取引日"].ne("確認不可"), "直近東証取引日"
+        ]
+        target_label = target_dates.mode().iloc[0] if not target_dates.empty else "確認不可"
+        if current_count == total_count:
+            st.success(f"日足データ：{target_label} 確定（{current_count}/{total_count}銘柄）")
+        elif current_count > 0:
+            st.warning(f"日足データ：{target_label} 確定 {current_count}/{total_count}銘柄。更新待ち銘柄は判定に注意してください。")
+        else:
+            st.warning("最新日足は取引中または更新待ちです。確定後にもう一度『今日の判定を更新』を押してください。")
     if run_error:
         st.error(run_error)
     elif not data or not true_top50_codes:
@@ -3157,6 +3294,14 @@ with admin_tab:
     c2.metric("日足取得", f"{dcnt}銘柄")
     c3.metric("AI TOP", f"{tcnt}銘柄")
     c4.metric("保有", f"{len(held_codes)}銘柄")
+
+    with st.expander("🕒 日足データの鮮度", expanded=False):
+        if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
+            st.dataframe(daily_bar_status_df, use_container_width=True, hide_index=True,
+                         height=admin_table_height(daily_bar_status_df, 520))
+            st.caption("16:00以降は直近東証取引日のOHLCVを確認し、履歴が遅れている銘柄だけ当日分を補完します。")
+        else:
+            st.info("『今日の判定を更新』後に日足最終日と取得元を表示します。")
 
     value_tab, surge_tab, compare_tab, holdings_tab = st.tabs([
         "企業価値", "急騰予兆", "3指標比較", "保有銘柄"
@@ -3354,6 +3499,8 @@ try:
             zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(value_top50_df,pd.DataFrame):
             zf.writestr("value_ai_top50.csv",value_top50_df.to_csv(index=False,encoding="utf-8-sig"))
+        if isinstance(daily_bar_status_df,pd.DataFrame):
+            zf.writestr("daily_bar_freshness.csv",daily_bar_status_df.to_csv(index=False,encoding="utf-8-sig"))
         if not sbi_trades_df.empty:
             zf.writestr("sbi_execution_history.csv",sbi_trades_df.to_csv(index=False,encoding="utf-8-sig"))
         if confirmed:
@@ -3397,6 +3544,7 @@ try:
             "本物TOP50モード":True,"母集団最低200銘柄ガード":True,
             "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
+            "当日確定日足件数":int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum()) if isinstance(daily_bar_status_df,pd.DataFrame) and not daily_bar_status_df.empty else 0,
             "TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "一次選抜_流動性重み":0.45,"一次選抜_トレンド重み":0.30,"一次選抜_安定性重み":0.25,
             "OOS検証済み":True,"OOS_PF参考":1.89,"5年通算PF参考":2.09,

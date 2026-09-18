@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.15
-# BUILD: VER17-15-SAME-DAY-DAILY-BAR-20260917
+# 日本株 AI投資アシスタント Ver.17.16
+# BUILD: VER17-16-STOCH-CHURN-GUARD-20260919
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.15",
+    page_title="日本株 AI投資アシスタント Ver.17.16",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.15 SAME-DAY DAILY BAR"
-BUILD = "VER17-15-SAME-DAY-DAILY-BAR-20260917"
+VERSION = "17.16 STOCH CHURN GUARD"
+BUILD = "VER17-16-STOCH-CHURN-GUARD-20260919"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2151,7 +2151,37 @@ def _percentile_score(series, higher_better=True):
     return r.fillna(50.0).clip(0, 100)
 
 
-def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90):
+def stoch_churn_diagnostic(df):
+    """判定日までの日足のみを用いた、新規買い対象の短期反転検査。"""
+    empty = {"直近20日クロス回数": 0, "直近30日早期反転回数": 0,
+             "25日騰落率_反転検査%": np.nan, "新規買い除外理由": ""}
+    if df is None or len(df) < 60:
+        return {**empty, "新規買い除外理由": "日足不足"}
+    x = stoch_prepare_light(df, 14, 3, 3).tail(65)
+    k, d = x["STOCH_K"], x["STOCH_D"]
+    if k.tail(30).isna().any() or d.tail(30).isna().any():
+        return {**empty, "新規買い除外理由": "ストキャス算定不能"}
+    gc, dc = x["STOCH_GC"].fillna(False), x["STOCH_DC"].fillna(False)
+    flips = int((gc | dc).tail(20).sum())
+    close = pd.to_numeric(x["Close"], errors="coerce")
+    ret25 = (float(close.iloc[-1] / close.iloc[-26] - 1) * 100.0
+             if len(close) >= 26 and close.iloc[-26] > 0 else np.nan)
+    # 買い圏のGCのあと5営業日以内にDCとなるケースを重複なく数える。
+    buy_gc = (gc & (k <= 20)).to_numpy(dtype=bool)
+    sell_dc = dc.to_numpy(dtype=bool)
+    early = sum(bool(sell_dc[i+1:min(i+6, len(x))].any())
+                for i in range(max(0, len(x)-30), len(x)) if buy_gc[i])
+    reasons = []
+    if flips >= 5 and np.isfinite(ret25) and abs(ret25) <= 5.0:
+        reasons.append("20営業日で5回以上クロス＋25日騰落率±5%以内")
+    if early >= 2:
+        reasons.append("30営業日で買いGCから5日以内のDCが2回以上")
+    return {"直近20日クロス回数": flips, "直近30日早期反転回数": int(early),
+            "25日騰落率_反転検査%": round(ret25, 2) if np.isfinite(ret25) else np.nan,
+            "新規買い除外理由": "／".join(reasons)}
+
+
+def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filter=True):
     """数百銘柄の母集団から一次選抜→企業価値AIで最終TOP50。
 
     重いファンダ取得を全銘柄へ直列実行するとStreamlit Cloudでタイムアウトしやすいため、
@@ -2179,13 +2209,17 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90):
         if np.isfinite(ma75) and close > ma75: trend_raw += 1.0
         if np.isfinite(ma25) and np.isfinite(ma75) and ma25 > ma75: trend_raw += 1.0
         trend_raw += np.clip(ret25 / 10.0, -1.0, 1.0)
+        diagnostic = stoch_churn_diagnostic(x) if churn_filter else {
+            "直近20日クロス回数": 0, "直近30日早期反転回数": 0,
+            "25日騰落率_反転検査%": np.nan, "新規買い除外理由": ""}
         tech_rows.append({
             "ticker": t, "コード": code(t), "銘柄名": name(t), "現在株価_価格": close,
             "20日平均売買代金": turnover20, "20日平均出来高": volume20,
             "25日騰落率%": ret25, "ATR%": atr_pct, "トレンド原点": trend_raw,
+            **diagnostic,
         })
     if not tech_rows:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     base = pd.DataFrame(tech_rows)
     mother_count = len(base)
@@ -2209,6 +2243,14 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90):
         base["トレンドスコア"] * .30 +
         base["値動き安定スコア"] * .25
     ).clip(0, 100)
+    # 除外は一次選抜の前。欠員には次順位の候補を充当する。
+    audit = base[["コード", "銘柄名", "直近20日クロス回数", "直近30日早期反転回数",
+                  "25日騰落率_反転検査%", "新規買い除外理由"]].copy()
+    audit.insert(2, "判定", np.where(audit["新規買い除外理由"].ne(""), "新規買い除外", "通過"))
+    if churn_filter:
+        base = base[base["新規買い除外理由"].eq("")].copy()
+    if len(base) < int(max_rows):
+        return pd.DataFrame(), audit
     base = base.sort_values(["一次選抜スコア", "流動性スコア"], ascending=[False, False]).reset_index(drop=True)
     base["一次選抜順位"] = np.arange(1, len(base) + 1)
 
@@ -2270,7 +2312,7 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90):
     out["詳細企業価値評価件数"] = int(pool_n)
     out = out.sort_values(["AI_TOP50スコア", "流動性スコア"], ascending=[False, False]).reset_index(drop=True)
     out.insert(0, "順位", np.arange(1, len(out) + 1))
-    return out.head(int(max_rows)).copy()
+    return out.head(int(max_rows)).copy(), audit
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -3016,7 +3058,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.15")
+st.title("📈 日本株 AI投資アシスタント Ver.17.16")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("本物の企業価値AI TOP50 → Slow Stochastic 14,3,3 → BUY候補だけをシンプル表示")
 st.caption("一次選抜は5年OOS検証済み：流動性45% / トレンド30% / 値動き安定性25%")
@@ -3103,6 +3145,8 @@ with st.expander("⚙ 管理者設定", expanded=False):
     universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n")
     fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool")
     st.caption("標準：350銘柄 → 5年OOS検証済み一次選抜（45/30/25）で90銘柄 → 企業価値AIでTOP50。BUYはそのTOP50だけ。")
+    churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=True, key="v1716_churn_filter")
+    st.caption("試験設定：20日で5回以上のクロス＋25日騰落率±5%以内、または30日で買いGC後5日以内のDCが2回以上。損切り・保有銘柄の売り判定には適用しません。")
 
 run_clicked = st.button("▶ 今日の判定を更新", type="primary", use_container_width=True, key="v177_run")
 
@@ -3120,6 +3164,7 @@ if run_clicked:
         st.session_state["v177_data"] = {}
         st.session_state["v177_daily_bar_status"] = pd.DataFrame()
         st.session_state["v177_value_top50"] = pd.DataFrame()
+        st.session_state["v1716_churn_audit"] = pd.DataFrame()
         st.session_state["v177_run_error"] = "大規模母集団を200銘柄以上取得できなかったため、BUY判定を安全停止しました。旧49銘柄へは戻していません。"
     else:
         universe_codes = universe_df["コード"].astype(str).tolist()
@@ -3134,19 +3179,24 @@ if run_clicked:
         mother_data = {t:d for t,d in data.items() if code(t) in set(universe_codes)}
         if len(mother_data) < 150:
             st.session_state["v177_value_top50"] = pd.DataFrame()
+            st.session_state["v1716_churn_audit"] = pd.DataFrame()
             st.session_state["v177_run_error"] = f"日足取得成功が{len(mother_data)}銘柄のみのため、BUY判定を安全停止しました。"
         else:
             with st.spinner("企業価値AIで一次選抜 → 本物TOP50を作成中…"):
-                value_top50_df = build_value_ai_top50(
-                    mother_data, max_rows=50, fundamental_pool_size=int(fundamental_pool_size)
+                value_top50_df, churn_audit_df = build_value_ai_top50(
+                    mother_data, max_rows=50, fundamental_pool_size=int(fundamental_pool_size),
+                    churn_filter=bool(churn_filter),
                 )
             st.session_state["v177_value_top50"] = value_top50_df
+            st.session_state["v1716_churn_audit"] = churn_audit_df
             st.session_state["v177_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
-            st.session_state["v177_run_error"] = ""
+            st.session_state["v177_run_error"] = ("反転検査後の候補が50銘柄未満のため新規買い判定を停止しました。"
+                                                  if value_top50_df.empty else "")
 
 universe_df = st.session_state.get("v177_universe_df", pd.DataFrame())
 data = st.session_state.get("v177_data", {})
 value_top50_df = st.session_state.get("v177_value_top50", pd.DataFrame())
+churn_audit_df = st.session_state.get("v1716_churn_audit", pd.DataFrame())
 run_error = st.session_state.get("v177_run_error", "")
 daily_bar_status_df = st.session_state.get("v177_daily_bar_status", pd.DataFrame())
 
@@ -3294,6 +3344,15 @@ with admin_tab:
     c2.metric("日足取得", f"{dcnt}銘柄")
     c3.metric("AI TOP", f"{tcnt}銘柄")
     c4.metric("保有", f"{len(held_codes)}銘柄")
+
+    with st.expander("🔎 TOP50選定前の短期反転チェック", expanded=False):
+        if isinstance(churn_audit_df, pd.DataFrame) and not churn_audit_df.empty:
+            excluded = churn_audit_df[churn_audit_df["判定"].eq("新規買い除外")]
+            st.caption(f"新規買い除外：{len(excluded)} / 検査対象：{len(churn_audit_df)}。閾値は試験設定で、成績改善は未検証です。")
+            st.dataframe(excluded, use_container_width=True, hide_index=True,
+                         height=admin_table_height(excluded, 480))
+        else:
+            st.info("『今日の判定を更新』後に除外理由を表示します。")
 
     with st.expander("🕒 日足データの鮮度", expanded=False):
         if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
@@ -3493,12 +3552,15 @@ try:
             "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
             "SELL条件":f"保有銘柄のみ / Slow Stoch DC または 損切り -{float(sl):.1f}%",
             "旧49銘柄固定ユニバース使用":False,
+            "短期反転フィルター":bool(churn_filter),
         }])
         zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(universe_df,pd.DataFrame):
             zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(value_top50_df,pd.DataFrame):
             zf.writestr("value_ai_top50.csv",value_top50_df.to_csv(index=False,encoding="utf-8-sig"))
+        if isinstance(churn_audit_df,pd.DataFrame):
+            zf.writestr("stoch_churn_audit.csv",churn_audit_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(daily_bar_status_df,pd.DataFrame):
             zf.writestr("daily_bar_freshness.csv",daily_bar_status_df.to_csv(index=False,encoding="utf-8-sig"))
         if not sbi_trades_df.empty:

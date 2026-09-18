@@ -34,13 +34,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.16",
+    page_title="日本株 AI投資アシスタント Ver.17.17",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.16 STOCH CHURN GUARD"
-BUILD = "VER17-16-STOCH-CHURN-GUARD-20260919"
+VERSION = "17.17 STOCH TREND LAB"
+BUILD = "VER17-17-STOCH-TREND-LAB-20260919"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2212,11 +2212,12 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
         diagnostic = stoch_churn_diagnostic(x) if churn_filter else {
             "直近20日クロス回数": 0, "直近30日早期反転回数": 0,
             "25日騰落率_反転検査%": np.nan, "新規買い除外理由": ""}
+        signal_quality = stoch_signal_quality(x)
         tech_rows.append({
             "ticker": t, "コード": code(t), "銘柄名": name(t), "現在株価_価格": close,
             "20日平均売買代金": turnover20, "20日平均出来高": volume20,
             "25日騰落率%": ret25, "ATR%": atr_pct, "トレンド原点": trend_raw,
-            **diagnostic,
+            **diagnostic, **signal_quality,
         })
     if not tech_rows:
         return pd.DataFrame(), pd.DataFrame()
@@ -2243,8 +2244,14 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
         base["トレンドスコア"] * .30 +
         base["値動き安定スコア"] * .25
     ).clip(0, 100)
+    # 少数のクロスから銘柄を即除外しない。十分な件数で悪い場合だけ小幅減点。
+    if "検証GC件数" in base:
+        base["シグナル品質減点"] = np.where(
+            (base["検証GC件数"] >= 4) & (base["検証GC平均5日騰落%"] < 0), 5.0, 0.0)
+        base["一次選抜スコア"] = (base["一次選抜スコア"] - base["シグナル品質減点"]).clip(0, 100)
     # 除外は一次選抜の前。欠員には次順位の候補を充当する。
-    audit = base[["コード", "銘柄名", "直近20日クロス回数", "直近30日早期反転回数",
+    audit = base[["コード", "銘柄名", "検証GC件数", "検証GC平均5日騰落%", "シグナル品質減点",
+                  "直近20日クロス回数", "直近30日早期反転回数",
                   "25日騰落率_反転検査%", "新規買い除外理由"]].copy()
     audit.insert(2, "判定", np.where(audit["新規買い除外理由"].ne(""), "新規買い除外", "通過"))
     if churn_filter:
@@ -2834,6 +2841,103 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     return x
 
 
+def stoch_quality_frame(df, stop_pct=7.0, band_window=20):
+    """前日までの帯と当日までの価格だけでクロスを評価。欠損時はシグナルを出さない。"""
+    x = stoch_prepare_light(df)
+    if x.empty:
+        return x
+    close = pd.to_numeric(x["Close"], errors="coerce")
+    k = x["STOCH_K"]
+    d = x["STOCH_D"]
+    # 前日までの20日間で帯を固定。狭すぎる帯の上限/下限には床を設ける。
+    low = k.shift(1).rolling(band_window, min_periods=band_window).quantile(.25)
+    high = k.shift(1).rolling(band_window, min_periods=band_window).quantile(.75)
+    x["帯下限"] = np.minimum(low, 35.0)
+    x["帯上限"] = np.maximum(high, 65.0)
+    ma25 = close.rolling(25, min_periods=25).mean()
+    ma75 = close.rolling(75, min_periods=75).mean()
+    x["上昇トレンド"] = (close > ma25) & (ma25 > ma25.shift(5)) & (ma25 > ma75)
+    x["下降確認"] = (close < ma25) & (ma25 < ma25.shift(5))
+    x["小幅クロス"] = (k - d).abs() < 1.0
+    x["BUY_現行"] = x["STOCH_GC"].fillna(False) & k.le(20)
+    x["SELL_現行"] = x["STOCH_DC"].fillna(False)
+    x["BUY_改善"] = (x["BUY_現行"] & k.le(x["帯下限"]) &
+                    x["上昇トレンド"] & ~x["小幅クロス"] &
+                    close.gt(close.shift(1)))
+    # 帯の下側でのデッドクロス、または価格も下向きのデッドクロス。
+    x["SELL_改善"] = (x["SELL_現行"] & ~x["小幅クロス"] &
+                     (k.ge(x["帯上限"]) | x["下降確認"]) &
+                     close.lt(close.shift(1)))
+    return x
+
+
+def stoch_signal_quality(df):
+    """直近の買いクロスの事後成績。未成熟な直近5日は数えない。"""
+    x = stoch_quality_frame(df)
+    if len(x) < 85:
+        return {"検証GC件数": 0, "検証GC平均5日騰落%": np.nan}
+    hit = x["BUY_現行"].iloc[max(0, len(x)-100):-5]
+    future = x["Close"].shift(-5).div(x["Close"]).sub(1).mul(100)
+    values = future.loc[hit.index[hit]].dropna()
+    return {"検証GC件数": int(len(values)),
+            "検証GC平均5日騰落%": round(float(values.mean()), 2) if len(values) else np.nan}
+
+
+def compare_stoch_backtest(history, stop_pct=7.0, top_codes=None):
+    """銘柄別独立1ポジション。終値判定→翌日始値約定、未決済は評価損益を分離。"""
+    required = {"コード", "日付", "Open", "High", "Low", "Close"}
+    if not required.issubset(history.columns):
+        raise ValueError("日足CSVには コード・日付・Open・High・Low・Close が必要です")
+    rows, trades = [], []
+    hist = history.copy()
+    hist["コード"] = hist["コード"].astype(str).str.replace(r"\.T$", "", regex=True)
+    hist["日付"] = pd.to_datetime(hist["日付"], errors="coerce")
+    for col in ("Open", "High", "Low", "Close"):
+        hist[col] = pd.to_numeric(hist[col], errors="coerce")
+    hist = hist.dropna(subset=["日付", "Open", "High", "Low", "Close"])
+    hist = hist[(hist["Open"] > 0) & (hist["High"] > 0) & (hist["Low"] > 0) & (hist["Close"] > 0)]
+    if top_codes is not None:
+        hist = hist[hist["コード"].isin(set(map(str, top_codes)))]
+    for c, df in hist.groupby("コード", sort=False):
+        df = df.sort_values("日付").drop_duplicates("日付", keep="last").set_index("日付")
+        if len(df) < 90:
+            continue
+        x = stoch_quality_frame(df, stop_pct)
+        for mode in ("現行", "改善"):
+            entry = None
+            for i in range(75, len(x)-1):
+                today, tomorrow = x.iloc[i], x.iloc[i+1]
+                op = float(tomorrow["Open"])
+                if entry is None:
+                    if bool(today[f"BUY_{mode}"]):
+                        entry = (op, x.index[i+1])
+                    continue
+                entry_px, entry_date = entry
+                stop = float(today["Close"]) / entry_px - 1 <= -stop_pct / 100
+                if stop or bool(today[f"SELL_{mode}"]):
+                    trades.append({"方式": mode, "コード": c, "買い日": entry_date,
+                                   "売り日": x.index[i+1], "買い始値": entry_px,
+                                   "売り始値": op, "騰落率%": (op / entry_px - 1) * 100,
+                                   "売り理由": "損切り" if stop else "ストキャスDC"})
+                    entry = None
+            if entry is not None:
+                rows.append({"方式": mode, "コード": c, "買い日": entry[1],
+                             "最終日": x.index[-1], "評価損益率%":
+                             (float(x["Close"].iloc[-1]) / entry[0] - 1) * 100})
+    tdf = pd.DataFrame(trades)
+    udf = pd.DataFrame(rows)
+    summary = []
+    for mode in ("現行", "改善"):
+        a = tdf[tdf["方式"].eq(mode)] if not tdf.empty else pd.DataFrame()
+        p = a["騰落率%"] if not a.empty else pd.Series(dtype=float)
+        gains, losses = p[p > 0].sum(), -p[p < 0].sum()
+        summary.append({"方式": mode, "決済件数": len(a), "勝率%": round(float((p > 0).mean()*100), 2) if len(p) else np.nan,
+                        "平均取引騰落率%": round(float(p.mean()), 2) if len(p) else np.nan,
+                        "PF_単純合算": round(float(gains/losses), 2) if losses > 0 else np.nan,
+                        "未決済件数": int(udf["方式"].eq(mode).sum()) if not udf.empty else 0})
+    return pd.DataFrame(summary), tdf, udf
+
+
 def _mobile_text(value, fallback="—"):
     """カード表示用に欠損値を安全な短い文字列へ変換する。"""
     if value is None:
@@ -3058,7 +3162,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.16")
+st.title("📈 日本株 AI投資アシスタント Ver.17.17")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("本物の企業価値AI TOP50 → Slow Stochastic 14,3,3 → BUY候補だけをシンプル表示")
 st.caption("一次選抜は5年OOS検証済み：流動性45% / トレンド30% / 値動き安定性25%")
@@ -3147,6 +3251,9 @@ with st.expander("⚙ 管理者設定", expanded=False):
     st.caption("標準：350銘柄 → 5年OOS検証済み一次選抜（45/30/25）で90銘柄 → 企業価値AIでTOP50。BUYはそのTOP50だけ。")
     churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=True, key="v1716_churn_filter")
     st.caption("試験設定：20日で5回以上のクロス＋25日騰落率±5%以内、または30日で買いGC後5日以内のDCが2回以上。損切り・保有銘柄の売り判定には適用しません。")
+    quality_mode = st.checkbox("トレンド＋振れ幅フィルターを実売買判定に使用（検証後に切替）",
+                               value=False, key="v1717_quality_mode")
+    st.caption("オフは従来判定。TOP50一次選抜には直近のGC後5日成績を最大5点の小幅減点として加えます。")
 
 run_clicked = st.button("▶ 今日の判定を更新", type="primary", use_container_width=True, key="v177_run")
 
@@ -3206,6 +3313,7 @@ daily_bar_status_df = st.session_state.get("v177_daily_bar_status", pd.DataFrame
 buy_view = pd.DataFrame()
 sell_view = pd.DataFrame()
 buy_signal_rows, sell_signal_rows = [], []
+signal_audit_rows = []
 true_top50_codes = set()
 if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
     true_top50_codes = set(value_top50_df["コード"].astype(str).head(50).tolist())
@@ -3217,14 +3325,27 @@ if data and true_top50_codes:
         # 新規BUYは本物TOP50のみ、SELLは保有のみ。それ以外は計算不要。
         if c not in true_top50_codes and c not in held_code_set:
             continue
-        sx = stoch_prepare_light(df0, 14, 3, 3)
+        sx = stoch_quality_frame(df0, sl)
         if sx.empty:
             continue
         r = sx.iloc[-1]
         sk, sd, px = safe_float(r.get("STOCH_K")), safe_float(r.get("STOCH_D")), safe_float(r.get("Close"))
         if not (np.isfinite(px) and px > 0):
             continue
-        if c in true_top50_codes and c not in held_code_set and bool(r.get("STOCH_GC", False)) and np.isfinite(sk) and sk <= 20:
+        buy_old = bool(r.get("BUY_現行", False))
+        buy_new = bool(r.get("BUY_改善", False))
+        sell_old = bool(r.get("SELL_現行", False))
+        sell_new = bool(r.get("SELL_改善", False))
+        if c in true_top50_codes or c in held_code_set:
+            signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else "TOP50",
+                                      "現行買い": buy_old, "改善買い": buy_new,
+                                      "現行売り": sell_old if c in held_code_set else False,
+                                      "改善売り": sell_new if c in held_code_set else False,
+                                      "上昇トレンド": bool(r.get("上昇トレンド", False)),
+                                      "下降確認": bool(r.get("下降確認", False)),
+                                      "帯下限": safe_float(r.get("帯下限")), "帯上限": safe_float(r.get("帯上限")),
+                                      "%K": sk, "%D": sd})
+        if c in true_top50_codes and c not in held_code_set and (buy_new if quality_mode else buy_old):
             buy_signal_rows.append({
                 "コード": c, "銘柄名": name(t), "総合AIスコア": 100.0-float(sk),
                 "現在株価": float(px), "%K": float(sk), "%D": float(sd), "条件": "%K≤20 GC",
@@ -3234,12 +3355,12 @@ if data and true_top50_codes:
             shares = int(safe_float(h.get("shares", 0)) or 0)
             avg = safe_float(h.get("avg_price", np.nan))
             pnl_pct = ((px / avg - 1.0) * 100.0) if np.isfinite(avg) and avg > 0 else np.nan
-            dc_hit = bool(r.get("STOCH_DC", False)) and np.isfinite(sk)
+            dc_hit = (sell_new if quality_mode else sell_old) and np.isfinite(sk)
             stop_hit = np.isfinite(pnl_pct) and pnl_pct <= -float(sl)
             if dc_hit or stop_hit:
                 reasons=[]
                 if stop_hit: reasons.append(f"損切り -{float(sl):.1f}%")
-                if dc_hit: reasons.append("ストキャスDC")
+                if dc_hit: reasons.append("トレンド確認DC" if quality_mode else "ストキャスDC")
                 sell_signal_rows.append({
                     "コード":c,"銘柄名":name(t),"保有株数":shares,"取得単価":avg,"現在株価":float(px),
                     "損益率%":pnl_pct,"%K":float(sk) if np.isfinite(sk) else np.nan,
@@ -3434,6 +3555,43 @@ with admin_tab:
             else:
                 st.info("先に『今日の判定を更新』で大規模母集団を作成してください。")
 
+        with st.expander("🧪 ストキャス振り回され対策の比較バックテスト", expanded=False):
+            st.caption("上で作成した5年日足ZIP、または backtest_history_5y.csv をアップロード。現行GC/DCとトレンド＋振れ幅判定を同じ日足で比較します。")
+            st.warning("銘柄別に独立した1ポジションの検証です。TOP50を現在の銘柄で固定する選択は過去の選定を再現しません。企業価値、買付余力、実際の約定・手数料・税金は再現していません。")
+            bt_input = st.file_uploader("5年日足ZIPまたはCSV", type=["zip", "csv"], key="v1717_bt_input")
+            bt_fixed_top = st.checkbox("現在のTOP50だけに限定（参考検証）", value=False, key="v1717_bt_top")
+            if st.button("現行版と改善版を比較", key="v1717_bt_run", disabled=bt_input is None):
+                try:
+                    raw = bt_input.getvalue()
+                    if len(raw) > 80_000_000:
+                        raise ValueError("ファイルは80MB以内にしてください")
+                    if bt_input.name.lower().endswith(".zip"):
+                        with ZipFile(io.BytesIO(raw)) as z:
+                            names = [n for n in z.namelist() if n.endswith("backtest_history_5y.csv")]
+                            if not names:
+                                raise ValueError("ZIPに backtest_history_5y.csv がありません")
+                            if z.getinfo(names[0]).file_size > 150_000_000:
+                                raise ValueError("展開後の日足CSVが大きすぎます")
+                            raw = z.read(names[0])
+                    hist = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", low_memory=False)
+                    if len(hist) > 750_000:
+                        raise ValueError("75万行以内のデータを使用してください")
+                    codes = true_top50_codes if bt_fixed_top else None
+                    if bt_fixed_top and not codes:
+                        raise ValueError("先に『今日の判定を更新』でTOP50を作成してください")
+                    summary, trades, unrealized = compare_stoch_backtest(hist, sl, codes)
+                    st.session_state["v1717_bt_result"] = (summary, trades, unrealized)
+                except Exception as e:
+                    st.error(f"比較バックテストを実行できません: {e}")
+            if "v1717_bt_result" in st.session_state:
+                summary, trades, unrealized = st.session_state["v1717_bt_result"]
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+                st.caption("終値で判定し、翌営業日の始値で約定。最終日の未決済は集計から分離。PFは取引騰落率の単純合算比で、ポートフォリオの資産推移・最大DDを示すものではありません。")
+                for label, frame, filename in [("決済明細CSV", trades, "stoch_backtest_trades.csv"),
+                                               ("未決済明細CSV", unrealized, "stoch_backtest_open.csv")]:
+                    st.download_button(label, data=frame.to_csv(index=False).encode("utf-8-sig"),
+                                       file_name=filename, mime="text/csv", key="v1717_" + filename)
+
     with surge_tab:
         st.caption("旧Ver.5.5系の観察センサーです。正式なBUY/SELLには影響しません。")
         st.write("70点以上＝強い予兆、55点以上＝急騰予兆、40点以上＝変化検知")
@@ -3549,10 +3707,11 @@ try:
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
-            "SELL条件":f"保有銘柄のみ / Slow Stoch DC または 損切り -{float(sl):.1f}%",
+            "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"トレンド＋振れ幅＋GC" if quality_mode else "Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
+            "SELL条件":f"保有銘柄のみ / {'トレンド確認DC' if quality_mode else 'Slow Stoch DC'} または 損切り -{float(sl):.1f}%",
             "旧49銘柄固定ユニバース使用":False,
             "短期反転フィルター":bool(churn_filter),
+            "トレンド振れ幅フィルター実売買":bool(quality_mode),
         }])
         zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(universe_df,pd.DataFrame):
@@ -3561,6 +3720,7 @@ try:
             zf.writestr("value_ai_top50.csv",value_top50_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(churn_audit_df,pd.DataFrame):
             zf.writestr("stoch_churn_audit.csv",churn_audit_df.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("stoch_signal_quality_audit.csv", pd.DataFrame(signal_audit_rows).to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(daily_bar_status_df,pd.DataFrame):
             zf.writestr("daily_bar_freshness.csv",daily_bar_status_df.to_csv(index=False,encoding="utf-8-sig"))
         if not sbi_trades_df.empty:

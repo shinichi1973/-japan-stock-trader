@@ -3104,8 +3104,49 @@ def admin_table_height(df, maximum=520):
     return min(maximum, max(150, 36 * (rows + 1) + 8))
 
 
+def current_holdings_rows(holdings, sell_candidates, signal_audit):
+    """保有復元と同じ売り候補判定から、表示専用の一覧を作る。"""
+    sell_codes = (set(sell_candidates["コード"].astype(str))
+                  if isinstance(sell_candidates, pd.DataFrame) and "コード" in sell_candidates else set())
+    checked_codes = {str(row["コード"]) for row in signal_audit if "コード" in row}
+    rows = []
+    for ticker, holding in holdings.items():
+        ticker = str(ticker)
+        verdict = "売り" if ticker in sell_codes else "保有継続" if ticker in checked_codes else ""
+        rows.append({"銘柄コード": ticker, "銘柄名": holding.get("name") or name(ticker),
+                     "保有株数": int(holding["shares"]), "判定": verdict})
+    return sorted(rows, key=lambda row: (row["判定"] != "売り", row["銘柄コード"]))
+
+
+def render_current_holdings(rows):
+    """既存の売買カードと同じHTML描画で、4列と行の色を表示する。"""
+    st.subheader("現在保有中の銘柄")
+    if not rows:
+        st.dataframe(pd.DataFrame([{
+            "銘柄コード": "", "銘柄名": "NO DATA", "保有株数": "", "判定": "",
+        }]), use_container_width=True, hide_index=True, height=120)
+        return
+    st.markdown(
+        '<div class="holding-grid holding-head"><span>銘柄コード</span><span>銘柄名</span>'
+        '<span>保有株数</span><span>判定</span></div>', unsafe_allow_html=True,
+    )
+    for row in rows:
+        verdict = row["判定"]
+        tone = "sell" if verdict == "売り" else "keep" if verdict == "保有継続" else "pending"
+        st.markdown(
+            f'<div class="holding-grid holding-row {tone}">'
+            f'<span>{html_escape(str(row["銘柄コード"]))}</span>'
+            f'<span class="holding-name">{html_escape(str(row["銘柄名"]))}</span>'
+            f'<span class="holding-shares">{int(row["保有株数"]):,}</span>'
+            f'<span class="holding-verdict">{html_escape(verdict or "—")}</span></div>',
+            unsafe_allow_html=True,
+        )
+    if any(not row["判定"] for row in rows):
+        st.caption("「—」は日足を取得できていない、または判定をまだ更新していない銘柄です。")
+
+
 def admin_judgement_table(df, key, maximum=520):
-    """表ごとに判定名を巡回し、選択した判定の行を先頭に表示する。"""
+    """管理者表の判定をグループ化し、判定名で絞り込む。元データは変更しない。"""
     if not isinstance(df, pd.DataFrame):
         return
     choices = {
@@ -3116,24 +3157,49 @@ def admin_judgement_table(df, key, maximum=520):
     for kind, labels in choices.items():
         col = kind if kind in df.columns else kind + ("予兆判定" if kind == "急騰" else "判定")
         if col in df.columns:
-            present = set(df[col].fillna("").astype(str))
-            available[kind] = (col, [label for label in labels if label in present])
+            available[kind] = col
     if available:
-        buttons = st.columns(len(available))
-        for button, (kind, (col, labels)) in zip(buttons, available.items()):
-            if button.button(kind + "で並び替え", key=key + "_sort_" + kind,
-                             use_container_width=True, disabled=not labels):
-                previous = st.session_state.get(key + "_sort")
-                index = (previous[1] + 1) % len(labels) if previous and previous[0] == kind else 0
-                st.session_state[key + "_sort"] = (kind, index)
-        selected = st.session_state.get(key + "_sort")
-        if selected and selected[0] in available:
-            kind, index = selected
-            col, labels = available[kind]
-            if labels:
-                label = labels[index % len(labels)]
-                st.caption(f"{kind}：{label} を先頭に表示（再タップで次の判定）")
-                df = df.loc[df[col].fillna("").astype(str).eq(label).sort_values(ascending=False, kind="stable").index]
+        options = ["急騰 → 割安", "割安 → 急騰", "急騰のみ", "割安のみ", "元の順番"]
+        if len(available) == 1:
+            only = next(iter(available))
+            options = [only + "順", "元の順番"]
+        order = st.session_state.get(key + "_saved_order", options[0])
+        filters = {kind: st.session_state.get(key + "_saved_filter_" + kind, []) for kind in available}
+        if st.checkbox("🔽 判定で並び替え・絞り込み", key=key + "_show_controls"):
+            order = st.selectbox("並び順", options,
+                                 index=options.index(order) if order in options else 0,
+                                 key=key + "_order")
+            st.session_state[key + "_saved_order"] = order
+            for kind, col in available.items():
+                present = set(df[col].fillna("").astype(str))
+                labels = [label for label in choices[kind] if label in present]
+                labels += sorted(present.difference(choices[kind]).difference({""}))
+                filters[kind] = st.multiselect(
+                    kind + "の判定を抽出（未選択＝すべて）", labels,
+                    default=[label for label in filters[kind] if label in labels],
+                    key=key + "_filter_" + kind,
+                )
+                st.session_state[key + "_saved_filter_" + kind] = filters[kind]
+        for kind, selected in filters.items():
+            if selected:
+                df = df.loc[df[available[kind]].fillna("").astype(str).isin(selected)]
+        if order != "元の順番":
+            priority = (["割安", "急騰"] if order.startswith("割安") else ["急騰", "割安"])
+            if "のみ" in order or "順" in order:
+                priority = priority[:1]
+            priority = [kind for kind in priority if kind in available]
+            sort_keys = []
+            for kind in priority:
+                # カテゴリーの順番を明示し、同じ判定名の行を連続させる。
+                ranks = {label: i for i, label in enumerate(choices[kind])}
+                sort_keys.append(df[available[kind]].fillna("").astype(str).map(ranks).fillna(len(ranks)).astype(int))
+            if sort_keys:
+                sort_frame = pd.concat(sort_keys, axis=1)
+                sort_frame.columns = range(len(sort_keys))
+                df = df.iloc[sort_frame.reset_index(drop=True).sort_values(
+                    list(sort_frame.columns), kind="stable"
+                ).index.to_numpy()]
+        st.caption(f"{order}・{len(df)}件表示")
     st.dataframe(df, use_container_width=True, hide_index=True,
                  height=admin_table_height(df, maximum))
 
@@ -3154,6 +3220,18 @@ st.markdown(
     .trade-card.buy-card {border-left-color: #18a058; background: rgba(24,160,88,.075);}
     .trade-card.sell-card {border-left-color: #e5484d; background: rgba(229,72,77,.075);}
     .trade-card.skip-card {border-left-color: #d49b16; background: rgba(212,155,22,.07);}
+    .holding-grid {display: grid; grid-template-columns: minmax(3.6rem, .8fr) minmax(5rem, 2fr)
+        minmax(3.2rem, .8fr) minmax(4.4rem, 1fr); align-items: center; gap: 5px;
+        padding: 8px 7px; font-size: .78rem; line-height: 1.3;}
+    .holding-head {font-size: .68rem; font-weight: 700; padding-bottom: 3px;}
+    .holding-head span {white-space: nowrap;}
+    .holding-row {border-radius: 7px; margin-bottom: 4px; border-left: 4px solid #888;}
+    .holding-row.sell {background: rgba(229,72,77,.20); border-left-color: #e5484d;}
+    .holding-row.keep {background: rgba(24,160,88,.17); border-left-color: #18a058;}
+    .holding-row.pending {background: rgba(128,128,128,.12);}
+    .holding-name {overflow-wrap: anywhere;}
+    .holding-shares {text-align: right; white-space: nowrap;}
+    .holding-verdict {font-weight: 700; white-space: nowrap;}
     .trade-card-main {
         display: flex;
         align-items: center;
@@ -3272,6 +3350,7 @@ if trade_files:
             confirmed = {
                 str(r["code"]): {
                     "shares": int(r["shares"]), "avg_price": float(r["avg_price"]),
+                    "name": str(r.get("name", "")),
                     "source": str(r["source"]), "account_types": str(r.get("account_types", "")),
                 }
                 for _, r in holdings_auto_df.iterrows()
@@ -3280,9 +3359,6 @@ if trade_files:
             st.warning("一部CSVを読めませんでした：\n- " + "\n- ".join(parse_errors))
 held_codes = list(confirmed.keys())
 
-m1, m2 = st.columns(2)
-m1.metric("現在保有", f"{len(held_codes)}銘柄")
-m2.metric("買付余力", f"¥{int(buying_power):,}")
 if int(buying_power) <= 0:
     st.warning("買付余力を入力すると参考S株数を計算できます。")
 if not sbi_warning_df.empty:
@@ -3479,6 +3555,10 @@ indicator_compare_df = add_research_judgements_first(indicator_compare_df, surge
 # ------------------------------------------------------------
 main_tab, admin_tab = st.tabs(["今日の売買", "管理者"])
 with main_tab:
+    m1, m2 = st.columns(2)
+    m1.metric("現在保有", f"{len(held_codes)}銘柄")
+    m2.metric("買付余力", f"¥{int(buying_power):,}")
+    render_current_holdings(current_holdings_rows(confirmed, sell_view, signal_audit_rows))
     if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
         current_count = int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum())
         total_count = len(daily_bar_status_df)

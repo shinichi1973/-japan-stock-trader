@@ -40,7 +40,7 @@ st.set_page_config(
 )
 
 VERSION = "17.17 STOCH TREND LAB"
-BUILD = "VER17-17-STOCH-TREND-LAB-20260919"
+BUILD = "VER17-17-STOCH-TREND-LAB-HOLDINGS-SUMMARY-20260919"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3126,6 +3126,13 @@ def render_current_holdings(rows):
             "銘柄コード": "", "銘柄名": "NO DATA", "保有株数": "", "判定": "",
         }]), use_container_width=True, hide_index=True, height=120)
         return
+    sell_count = sum(row["判定"] == "売り" for row in rows)
+    keep_count = sum(row["判定"] == "保有継続" for row in rows)
+    pending_count = len(rows) - sell_count - keep_count
+    summary = f"🔴 **売り {sell_count}件**　🟢 **保有継続 {keep_count}件**"
+    if pending_count:
+        summary += f"　⚪ **判定待ち {pending_count}件**"
+    st.markdown(summary)
     st.markdown(
         '<div class="holding-grid holding-head"><span>銘柄コード</span><span>銘柄名</span>'
         '<span>保有株数</span><span>判定</span></div>', unsafe_allow_html=True,
@@ -3558,7 +3565,6 @@ with main_tab:
     m1, m2 = st.columns(2)
     m1.metric("現在保有", f"{len(held_codes)}銘柄")
     m2.metric("買付余力", f"¥{int(buying_power):,}")
-    render_current_holdings(current_holdings_rows(confirmed, sell_view, signal_audit_rows))
     if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
         current_count = int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum())
         total_count = len(daily_bar_status_df)
@@ -3572,6 +3578,7 @@ with main_tab:
             st.warning(f"日足データ：{target_label} 確定 {current_count}/{total_count}銘柄。更新待ち銘柄は判定に注意してください。")
         else:
             st.warning("最新日足は取引中または更新待ちです。確定後にもう一度『今日の判定を更新』を押してください。")
+    render_current_holdings(current_holdings_rows(confirmed, sell_view, signal_audit_rows))
     if run_error:
         st.error(run_error)
     elif not data or not true_top50_codes:

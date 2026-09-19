@@ -20,7 +20,6 @@ import json
 import math
 import os
 import re
-import plistlib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from html import escape as html_escape, unescape as html_unescape
@@ -40,7 +39,7 @@ st.set_page_config(
 )
 
 VERSION = "17.17 STOCH TREND LAB"
-BUILD = "VER17-17-STOCH-TREND-LAB-HOLDINGS-SUMMARY-20260919"
+BUILD = "VER17-17-STOCH-TREND-LAB-MANUAL-BP-20260919"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1965,67 +1964,8 @@ def rebuild_holdings_from_trades(trades):
     return holdings, lots, pd.DataFrame(audit), warning_df
 
 # ------------------------------------------------------------
-# SBI買付余力ファイル読取 / 購入株数プラン
+# 手入力した買付余力から購入株数を計算
 # ------------------------------------------------------------
-def _decode_text_bytes(raw):
-    """CSV/TXT/HTMLなどを文字列化。Apple WebArchiveにも対応。"""
-    if raw is None:
-        return ""
-    if not isinstance(raw, (bytes, bytearray)):
-        raw = bytes(raw)
-
-    # Safari等で保存した .webarchive はbinary plistの場合がある。
-    try:
-        obj = plistlib.loads(raw)
-        main = obj.get("WebMainResource", {}) if isinstance(obj, dict) else {}
-        data = main.get("WebResourceData")
-        if isinstance(data, (bytes, bytearray)):
-            raw = bytes(data)
-    except Exception:
-        pass
-
-    for enc in ("utf-8-sig", "cp932", "shift_jis", "utf-8", "euc_jp"):
-        try:
-            return raw.decode(enc)
-        except Exception:
-            continue
-    return raw.decode("utf-8", errors="ignore")
-
-
-def extract_buying_power_from_file(uploaded_file):
-    """SBI口座サマリー等の保存ファイルから買付余力を抽出する。
-
-    優先順:
-      1) 買付余力（2営業日後）
-      2) 現物買付余力
-      3) 買付余力
-    スクリーンショット/OCRは使用しない。
-    """
-    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-    text = _decode_text_bytes(raw)
-    # HTMLタグ・連続空白を簡易正規化
-    plain = re.sub(r"<script.*?</script>|<style.*?</style>", " ", text, flags=re.I | re.S)
-    plain = re.sub(r"<[^>]+>", " ", plain)
-    plain = plain.replace("&nbsp;", " ").replace("&#44;", ",")
-    plain = re.sub(r"[\u00a0\s]+", " ", plain)
-
-    labels = [
-        r"買付余力\s*[（(]?\s*2営業日後\s*[）)]?",
-        r"現物買付余力",
-        r"買付余力",
-    ]
-    for label in labels:
-        m = re.search(label + r"[^0-9]{0,80}([0-9][0-9,]{0,20})\s*円?", plain, flags=re.I)
-        if m:
-            try:
-                val = int(m.group(1).replace(",", ""))
-                if 0 <= val <= 10_000_000_000:
-                    return val, plain[:5000]
-            except Exception:
-                pass
-    raise ValueError("買付余力の金額を自動検出できませんでした。手入力欄を使用してください。")
-
-
 def build_purchase_plan(candidates, buying_power, current_assets, held_codes, max_positions,
                         max_per_stock, stop_loss_pct, reserve_pct, daily_deploy_pct,
                         risk_per_trade_pct, price_buffer_pct, allow_addon=False,
@@ -3320,17 +3260,8 @@ with input_left:
         "SBI 約定履歴CSV", type=["csv"], accept_multiple_files=True, key="sbi_execution_csvs_v177"
     )
 with input_right:
-    bp_file = st.file_uploader(
-        "買付余力ファイル（任意）", type=["csv", "txt", "html", "htm", "webarchive"], key="sbi_buying_power_file_v177"
-    )
     if "sbi_buying_power_yen_v177" not in st.session_state:
         st.session_state["sbi_buying_power_yen_v177"] = 0
-    if bp_file is not None:
-        try:
-            detected_buying_power, _ = extract_buying_power_from_file(bp_file)
-            st.session_state["sbi_buying_power_yen_v177"] = int(detected_buying_power)
-        except Exception as e:
-            st.warning(f"余力自動読取不可：{e}")
     buying_power = st.number_input(
         "現物買付余力（円）", min_value=0, max_value=1_000_000_000, step=1000,
         key="sbi_buying_power_yen_v177"

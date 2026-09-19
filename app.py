@@ -2999,10 +2999,10 @@ def _trade_trend_text(code_value, trend_by_code, side, is_stop=False):
     if not trend:
         return "⚪ トレンド未判定"
     if trend.get("上昇トレンド", False):
-        return "↗ 上昇・買いと一致" if side == "buy" else "↗ 上昇・売りは慎重"
+        return "↗ 上昇トレンド・買いと一致" if side == "buy" else "↗ 上昇トレンド・売りは慎重"
     if trend.get("下降確認", False):
-        return "↘ 下降・買いは慎重" if side == "buy" else "↘ 下降・売りと一致"
-    return "→ 方向感なし・振り回され注意"
+        return "↘ 下降トレンド・買いは慎重" if side == "buy" else "↘ 下降トレンド・売りと一致"
+    return "→ 横ばいトレンド・振り回され注意"
 
 
 def render_mobile_trade_cards(df, side, trend_by_code=None):

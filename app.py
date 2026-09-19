@@ -3104,6 +3104,40 @@ def admin_table_height(df, maximum=520):
     return min(maximum, max(150, 36 * (rows + 1) + 8))
 
 
+def admin_judgement_table(df, key, maximum=520):
+    """表ごとに判定名を巡回し、選択した判定の行を先頭に表示する。"""
+    if not isinstance(df, pd.DataFrame):
+        return
+    choices = {
+        "急騰": ["🚨 強い予兆", "🟠 急騰予兆", "🟡 変化", "⚪ 通常", "⚪ 対象外"],
+        "割安": ["🟢 割安", "🟡 やや割安", "⚪ 適正", "🔴 割高", "⚠️ 分割確認", "⚠️ 算定確認", "— 未算定"],
+    }
+    available = {}
+    for kind, labels in choices.items():
+        col = kind if kind in df.columns else kind + ("予兆判定" if kind == "急騰" else "判定")
+        if col in df.columns:
+            present = set(df[col].fillna("").astype(str))
+            available[kind] = (col, [label for label in labels if label in present])
+    if available:
+        buttons = st.columns(len(available))
+        for button, (kind, (col, labels)) in zip(buttons, available.items()):
+            if button.button(kind + "で並び替え", key=key + "_sort_" + kind,
+                             use_container_width=True, disabled=not labels):
+                previous = st.session_state.get(key + "_sort")
+                index = (previous[1] + 1) % len(labels) if previous and previous[0] == kind else 0
+                st.session_state[key + "_sort"] = (kind, index)
+        selected = st.session_state.get(key + "_sort")
+        if selected and selected[0] in available:
+            kind, index = selected
+            col, labels = available[kind]
+            if labels:
+                label = labels[index % len(labels)]
+                st.caption(f"{kind}：{label} を先頭に表示（再タップで次の判定）")
+                df = df.loc[df[col].fillna("").astype(str).eq(label).sort_values(ascending=False, kind="stable").index]
+    st.dataframe(df, use_container_width=True, hide_index=True,
+                 height=admin_table_height(df, maximum))
+
+
 st.markdown(
     """
     <style>
@@ -3534,15 +3568,9 @@ with admin_tab:
                 "急騰予兆判定":"急騰", "割安判定":"割安", "現在株価_価格":"株価",
                 "AI_TOP50スコア":"AI点"
             })
-            st.dataframe(
-                value_compact, use_container_width=True, hide_index=True,
-                height=admin_table_height(value_compact, 520)
-            )
+            admin_judgement_table(value_compact, "v7_value_compact", 520)
             with st.expander("企業価値TOP50の詳細列", expanded=False):
-                st.dataframe(
-                    value_full, use_container_width=True, hide_index=True,
-                    height=admin_table_height(value_full, 560)
-                )
+                admin_judgement_table(value_full, "v7_value_full", 560)
 
         with st.expander("🧪 5年OOS検証メモ", expanded=False):
             st.caption("過去時点のOHLCVだけで作るTOP50フィルターを70%学習 / 30%未学習で検証。企業価値ファンダメンタル自体の過去再現ではありません。")
@@ -3651,15 +3679,9 @@ with admin_tab:
                 "現在株価":"株価", "急騰予兆スコア":"予兆点", "出来高倍率":"出来高倍",
                 "Stoch_BUY":"Stoch"
             })
-            st.dataframe(
-                surge_compact, use_container_width=True, hide_index=True,
-                height=admin_table_height(surge_compact, 520)
-            )
+            admin_judgement_table(surge_compact, "v7_surge_compact", 520)
             with st.expander("急騰予兆の詳細列", expanded=False):
-                st.dataframe(
-                    surge_full, use_container_width=True, hide_index=True,
-                    height=admin_table_height(surge_full, 560)
-                )
+                admin_judgement_table(surge_full, "v7_surge_full", 560)
                 st.caption("詳細な配点は全処理ZIPにも保存します。株価2,000円以上も除外しません。")
 
     with compare_tab:
@@ -3686,15 +3708,9 @@ with admin_tab:
             })
             if "一致数" in comp_compact.columns:
                 comp_compact = comp_compact.sort_values(["一致数", "コード"], ascending=[False, True])
-            st.dataframe(
-                comp_compact, use_container_width=True, hide_index=True,
-                height=admin_table_height(comp_compact, 480)
-            )
+            admin_judgement_table(comp_compact, "v7_comp_compact", 480)
             with st.expander("3指標比較の詳細列", expanded=False):
-                st.dataframe(
-                    comp_full, use_container_width=True, hide_index=True,
-                    height=admin_table_height(comp_full, 520)
-                )
+                admin_judgement_table(comp_full, "v7_comp_full", 520)
         st.caption("比較結果は全処理ZIP内の indicator_compare_candidates.csv に保存します。")
 
     with holdings_tab:
@@ -3710,15 +3726,9 @@ with admin_tab:
             held_compact = held_full[[c for c in held_compact_cols if c in held_full.columns]].rename(columns={
                 "急騰予兆判定":"急騰", "割安判定":"割安"
             })
-            st.dataframe(
-                held_compact, use_container_width=True, hide_index=True,
-                height=admin_table_height(held_compact, 460)
-            )
+            admin_judgement_table(held_compact, "v7_held_compact", 460)
             with st.expander("保有銘柄の詳細列", expanded=False):
-                st.dataframe(
-                    held_full, use_container_width=True, hide_index=True,
-                    height=admin_table_height(held_full, 500)
-                )
+                admin_judgement_table(held_full, "v7_held_full", 500)
         else:
             st.info("保有情報はありません。SBI約定履歴CSVを読み込んでください。")
 

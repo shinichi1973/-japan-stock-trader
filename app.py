@@ -2991,10 +2991,25 @@ def _short_value_label(value):
     return "— 未算定"
 
 
-def render_mobile_trade_cards(df, side):
+def _trade_trend_text(code_value, trend_by_code, side, is_stop=False):
+    """研究用トレンド判定を候補カードに表示するだけ。売買条件には使わない。"""
+    if is_stop:
+        return "🚨 損切り優先"
+    trend = trend_by_code.get(str(code_value), {})
+    if not trend:
+        return "⚪ トレンド未判定"
+    if trend.get("上昇トレンド", False):
+        return "↗ 上昇・買いと一致" if side == "buy" else "↗ 上昇・売りは慎重"
+    if trend.get("下降確認", False):
+        return "↘ 下降・買いは慎重" if side == "buy" else "↘ 下降・売りと一致"
+    return "→ 方向感なし・振り回され注意"
+
+
+def render_mobile_trade_cards(df, side, trend_by_code=None):
     """メイン画面専用の2行カード。元DataFrameとZIP出力は変更しない。"""
     if not isinstance(df, pd.DataFrame) or df.empty:
         return
+    trend_by_code = trend_by_code or {}
 
     for _, row in df.iterrows():
         code_text = _mobile_text(row.get("コード"))
@@ -3004,18 +3019,22 @@ def render_mobile_trade_cards(df, side):
         value_text = html_escape(_short_value_label(row.get("割安判定")))
         k_text = _mobile_number(row.get("%K"), 1)
         d_text = _mobile_number(row.get("%D"), 1)
+        stop_hit = side == "sell" and "損切り" in str(row.get("売り理由", ""))
+        trend_text = html_escape(_trade_trend_text(row.get("コード"), trend_by_code, side, stop_hit))
 
         if side == "sell":
             shares_text = _mobile_number(row.get("保有株数"), 0, "株")
             pnl_text = _mobile_number(row.get("損益率%"), 1, "%")
             reason_text = _mobile_text(row.get("売り理由"))
+            signal_text = "損切り" if stop_hit else "DC"
             action_text = "🚨 売り" if "損切り" in str(row.get("売り理由", "")) else "🔴 売り"
             card_class = "sell-card"
             quantity_text = f"保有 {shares_text}"
             detail_text = (
-                f"<span>{surge_text}</span><span>{value_text}</span>"
-                f"<span>現在 {price_text}</span><span>損益 {pnl_text}</span>"
-                f"<span>{reason_text}</span>"
+                f"<span class=\"trade-trend\">{trend_text}</span>"
+                f"<span>{signal_text}・損益 {pnl_text}</span><span class=\"trade-card-secondary\">現在 {price_text}</span>"
+                f"<span class=\"trade-card-secondary\">{reason_text}</span>"
+                f"<span class=\"trade-card-secondary\">{surge_text}・{value_text}</span>"
             )
         else:
             shares = int(max(safe_float(row.get("参考S株数"), 0), 0))
@@ -3024,8 +3043,10 @@ def render_mobile_trade_cards(df, side):
             card_class = "buy-card" if can_buy else "skip-card"
             quantity_text = f"参考 {shares:,}株" if can_buy else _mobile_text(row.get("買付可否"), "購入不可")
             detail_text = (
-                f"<span>{surge_text}</span><span>{value_text}</span>"
-                f"<span>現在 {price_text}</span><span>K {k_text} / D {d_text}</span>"
+                f"<span class=\"trade-trend\">{trend_text}</span>"
+                f"<span>K {k_text} / D {d_text}</span>"
+                f"<span class=\"trade-card-secondary\">現在 {price_text}</span>"
+                f"<span class=\"trade-card-secondary\">{surge_text}・{value_text}</span>"
             )
 
         st.markdown(
@@ -3137,6 +3158,7 @@ st.markdown(
         opacity: .90;
     }
     .trade-card-detail span {white-space: nowrap;}
+    .trade-trend {font-weight: 750;}
     div[data-testid="stTabs"] button p {font-size: .88rem; font-weight: 700;}
     div[data-testid="stDataFrame"] {border-radius: 9px; overflow: hidden;}
     @media (max-width: 640px) {
@@ -3149,7 +3171,8 @@ st.markdown(
         .trade-action {font-size: .94rem;}
         .trade-name {font-size: .91rem;}
         .trade-quantity {font-size: .86rem; padding: 2px 5px;}
-        .trade-card-detail {font-size: .69rem; column-gap: 7px; margin-top: 6px; padding-top: 5px;}
+        .trade-card-detail {font-size: .69rem; column-gap: 7px; margin-top: 6px; padding-top: 5px; flex-wrap: nowrap; overflow-x: auto;}
+        .trade-card-secondary {display: none;}
         div[data-testid="stTabs"] button {padding-left: .48rem; padding-right: .48rem;}
         div[data-testid="stTabs"] button p {font-size: .72rem; white-space: nowrap;}
         div[data-testid="stDataFrame"] {font-size: .70rem;}
@@ -3367,6 +3390,9 @@ if data and true_top50_codes:
                     "%D":float(sd) if np.isfinite(sd) else np.nan,"売り理由":"＋".join(reasons),
                 })
 
+# カード表示だけに使う。買い・売りの採用判定やZIPの列には接続しない。
+trend_by_code = {str(r["コード"]): r for r in signal_audit_rows}
+
 if buy_signal_rows:
     buy_signal_df = pd.DataFrame(buy_signal_rows).sort_values(["%K","コード"]).reset_index(drop=True)
     plan = build_purchase_plan(
@@ -3441,7 +3467,7 @@ with main_tab:
         if sell_view.empty:
             st.success("売り候補はありません。")
         else:
-            render_mobile_trade_cards(sell_view, "sell")
+            render_mobile_trade_cards(sell_view, "sell", trend_by_code)
             with st.expander("売り候補の詳細表", expanded=False):
                 st.dataframe(sell_view, use_container_width=True, hide_index=True)
 
@@ -3449,7 +3475,7 @@ with main_tab:
         if buy_view.empty:
             st.info("本物の企業価値AI TOP50内に、現在BUY条件を満たす銘柄はありません。")
         else:
-            render_mobile_trade_cards(buy_view, "buy")
+            render_mobile_trade_cards(buy_view, "buy", trend_by_code)
             simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","参考S株数","%K","%D","買付可否"] if c in buy_view.columns]
             with st.expander("買い候補の詳細表", expanded=False):
                 st.dataframe(buy_view[simple_buy_cols], use_container_width=True, hide_index=True)

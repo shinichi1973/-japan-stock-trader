@@ -2878,6 +2878,130 @@ def compare_stoch_backtest(history, stop_pct=7.0, top_codes=None):
     return pd.DataFrame(summary), tdf, udf
 
 
+def compare_value_addon_backtest(history, stop_pct=7.0, top_codes=None,
+                                valuation_history=None, max_value_age_days=120,
+                                addon_fraction=0.5):
+    """終値シグナル→翌日始値、銘柄別の独立検証。過去の評価だけを参照する。"""
+    required = {"コード", "日付", "Open", "High", "Low", "Close"}
+    if not required.issubset(history.columns):
+        raise ValueError("日足CSVには コード・日付・Open・High・Low・Close が必要です")
+    hist = history.copy()
+    hist["コード"] = hist["コード"].astype(str).str.replace(r"\.T$", "", regex=True)
+    hist["日付"] = pd.to_datetime(hist["日付"], errors="coerce").dt.normalize()
+    for col in ("Open", "High", "Low", "Close"):
+        hist[col] = pd.to_numeric(hist[col], errors="coerce")
+    hist = hist.dropna(subset=list(required))
+    hist = hist[(hist[["Open", "High", "Low", "Close"]] > 0).all(axis=1)]
+    if top_codes is not None:
+        hist = hist[hist["コード"].isin(set(map(str, top_codes)))]
+    values = {}
+    if valuation_history is not None:
+        need = {"コード", "評価日", "AI参考価値"}
+        if not need.issubset(valuation_history.columns):
+            raise ValueError("過去評価CSVには コード・評価日・AI参考価値 が必要です")
+        val = valuation_history.copy()
+        val["コード"] = val["コード"].astype(str).str.replace(r"\.T$", "", regex=True)
+        val["評価日"] = pd.to_datetime(val["評価日"], errors="coerce").dt.normalize()
+        val["AI参考価値"] = pd.to_numeric(val["AI参考価値"], errors="coerce")
+        val = val.dropna(subset=["コード", "評価日", "AI参考価値"])
+        val = val[val["AI参考価値"] > 0]
+        for c, part in val.groupby("コード"):
+            part = part.sort_values("評価日").drop_duplicates("評価日", keep="last")
+            values[c] = (part["評価日"].to_numpy(dtype="datetime64[ns]"),
+                         part["AI参考価値"].to_numpy(dtype=float))
+
+    def valuation_at(c, date, close):
+        dates, fair = values.get(c, (None, None))
+        if dates is None:
+            return "評価なし", np.nan, pd.NaT
+        pos = dates.searchsorted(np.datetime64(date), side="right") - 1
+        if pos < 0:
+            return "評価なし", np.nan, pd.NaT
+        age = (pd.Timestamp(date) - pd.Timestamp(dates[pos])).days
+        if age > max_value_age_days:
+            return "期限切れ", np.nan, pd.Timestamp(dates[pos])
+        upside = (float(fair[pos]) / close - 1.0) * 100.0
+        return ("割高" if upside <= -10.0 else "通過"), upside, pd.Timestamp(dates[pos])
+
+    modes = ["現行"] + (["割高除外"] if valuation_history is not None else [])
+    trades, open_positions, audits = [], [], []
+    for c, df in hist.groupby("コード", sort=False):
+        df = df.sort_values("日付").drop_duplicates("日付", keep="last").set_index("日付")
+        if len(df) < 90:
+            continue
+        x = stoch_quality_frame(df, stop_pct)
+        for mode in modes:
+            for addon_enabled in (False, True):
+                variant = f"{mode}・{'買い増しあり' if addon_enabled else '買い増しなし'}"
+                lots = []  # (株数, 翌日始値, 買い日)。初回は1株相当、追加はその一定割合。
+                for i in range(75, len(x) - 1):
+                    today, tomorrow = x.iloc[i], x.iloc[i + 1]
+                    date, next_date = x.index[i], x.index[i + 1]
+                    close, op = float(today["Close"]), float(tomorrow["Open"])
+                    avg = (sum(q * p for q, p, _ in lots) / sum(q for q, _, _ in lots)) if lots else np.nan
+                    stop = bool(lots and close / avg - 1 <= -stop_pct / 100)
+                    sell = bool(today["SELL_現行"])
+                    # 売り・損切りを優先。売った当日に買い直すこともしない。
+                    if lots and (stop or sell):
+                        paid = sum(q * p for q, p, _ in lots)
+                        proceeds = op * sum(q for q, _, _ in lots)
+                        trades.append({"方式": variant, "コード": c, "買い日": lots[0][2],
+                                       "売り日": next_date, "買い増し回数": len(lots) - 1,
+                                       "買い増し日": lots[1][2] if len(lots) > 1 else pd.NaT,
+                                       "投下額_1株換算": paid, "回収額_1株換算": proceeds,
+                                       "騰落率%": (proceeds / paid - 1) * 100,
+                                       "売り理由": "損切り" if stop else "ストキャスDC"})
+                        lots = []
+                        continue
+                    # DCで売却する戦略では、保有中に次のGCを待つと必ず先に売却される。
+                    # 買い増しは、初回GCの後に上向きが継続した場合だけ別途判定する。
+                    fresh_buy = bool(today["BUY_現行"])
+                    addon_buy = bool(
+                        lots and addon_enabled and len(lots) == 1 and
+                        i - x.index.get_loc(lots[0][2]) >= 2 and
+                        np.isfinite(safe_float(today["STOCH_K"])) and
+                        np.isfinite(safe_float(today["STOCH_D"])) and
+                        float(today["STOCH_K"]) <= 50 and
+                        float(today["STOCH_K"]) > float(today["STOCH_D"]) and
+                        float(today["STOCH_K"]) > float(x.iloc[i-1]["STOCH_K"]) and
+                        close > avg
+                    )
+                    if (not lots and fresh_buy) or addon_buy:
+                        state, upside, valuation_date = valuation_at(c, date, close)
+                        action = "買い増し" if lots else "新規"
+                        permitted = mode == "現行" or state == "通過"
+                        audits.append({"方式": variant, "コード": c, "判定日": date,
+                                       "判定": action, "評価日": valuation_date,
+                                       "参考価値上昇余地%": upside, "割高判定": state,
+                                       "結果": "採用" if permitted else "見送り"})
+                        if permitted:
+                            lots.append((float(addon_fraction) if lots else 1.0, op, next_date))
+                if lots:
+                    paid = sum(q * p for q, p, _ in lots)
+                    market_value = float(x["Close"].iloc[-1]) * sum(q for q, _, _ in lots)
+                    open_positions.append({"方式": variant, "コード": c, "買い日": lots[0][2],
+                                           "買い増し回数": len(lots) - 1, "最終日": x.index[-1],
+                                           "評価損益率%": (market_value / paid - 1) * 100})
+    tdf, udf, adf = pd.DataFrame(trades), pd.DataFrame(open_positions), pd.DataFrame(audits)
+    summary = []
+    for mode in modes:
+        for addon_enabled in (False, True):
+            variant = f"{mode}・{'買い増しあり' if addon_enabled else '買い増しなし'}"
+            t = tdf[tdf["方式"].eq(variant)] if not tdf.empty else pd.DataFrame()
+            a = adf[adf["方式"].eq(variant)] if not adf.empty else pd.DataFrame()
+            p = t["騰落率%"] if not t.empty else pd.Series(dtype=float)
+            gain, loss = p[p > 0].sum(), -p[p < 0].sum()
+            summary.append({"方式": variant, "決済件数": len(t),
+                            "勝率%": round(float((p > 0).mean() * 100), 2) if len(p) else np.nan,
+                            "平均取引騰落率%": round(float(p.mean()), 2) if len(p) else np.nan,
+                            "PF_単純合算": round(float(gain / loss), 2) if loss > 0 else np.nan,
+                            "買い増し実行回数": int(t["買い増し回数"].sum()) if not t.empty else 0,
+                            "評価なし・期限切れ見送り": int((a["結果"].eq("見送り") & a["割高判定"].isin(["評価なし", "期限切れ"])).sum()) if not a.empty else 0,
+                            "割高見送り": int((a["結果"].eq("見送り") & a["割高判定"].eq("割高")).sum()) if not a.empty else 0,
+                            "未決済件数": int(udf["方式"].eq(variant).sum()) if not udf.empty else 0})
+    return pd.DataFrame(summary), tdf, udf, adf
+
+
 def _mobile_text(value, fallback="—"):
     """カード表示用に欠損値を安全な短い文字列へ変換する。"""
     if value is None:
@@ -3664,6 +3788,66 @@ with admin_tab:
                     st.download_button(label, data=frame.to_csv(index=False).encode("utf-8-sig"),
                                        file_name=filename, mime="text/csv", key="v1717_" + filename)
 
+        with st.expander("🧪 割高除外・保有買い増しの比較バックテスト", expanded=False):
+            st.caption("5年日足で現行売買と買い増しを比較。判定日の終値で判断し、翌営業日の始値で約定します。")
+            st.warning("割高除外の過去検証には、各評価日当時に公表・取得できたAI参考価値が必要です。現在のTOP50や現在の参考価値を過去へ流用しません。過去評価CSVがない場合は買い増しだけを比較します。")
+            new_history_file = st.file_uploader("5年日足ZIPまたはCSV", type=["zip", "csv"], key="v1718_history")
+            new_value_file = st.file_uploader("過去時点の企業価値CSV（任意）", type=["csv"], key="v1718_values")
+            st.download_button("過去評価CSVの書式をダウンロード",
+                               data="コード,評価日,AI参考価値\n".encode("utf-8-sig"),
+                               file_name="historical_value_template.csv", mime="text/csv",
+                               key="v1718_template")
+            st.caption("過去評価CSV：コード,評価日,AI参考価値。評価日は、その参考価値を実際に利用できた日。既定では120日を超えた評価は期限切れ。現在の評価を過去の日付に書き換えないでください。")
+            new_fixed_top = st.checkbox("現在のTOP50に限定（過去の選定再現ではない）",
+                                        value=False, key="v1718_fixed_top")
+            addon_fraction = st.slider("買い増し量（初回買付を1とした比率）",
+                                       min_value=0.25, max_value=1.0, value=0.5,
+                                       step=0.25, key="v1718_addon_fraction")
+            if st.button("割高除外・買い増しを比較", key="v1718_run", disabled=new_history_file is None):
+                try:
+                    raw = new_history_file.getvalue()
+                    if len(raw) > 80_000_000:
+                        raise ValueError("日足ファイルは80MB以内にしてください")
+                    if new_history_file.name.lower().endswith(".zip"):
+                        with ZipFile(io.BytesIO(raw)) as z:
+                            names = [n for n in z.namelist() if n.endswith("backtest_history_5y.csv")]
+                            if not names:
+                                raise ValueError("ZIPに backtest_history_5y.csv がありません")
+                            if z.getinfo(names[0]).file_size > 150_000_000:
+                                raise ValueError("展開後の日足CSVが大きすぎます")
+                            raw = z.read(names[0])
+                    hist = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", low_memory=False)
+                    if len(hist) > 750_000:
+                        raise ValueError("日足は75万行以内にしてください")
+                    old_values = None
+                    if new_value_file is not None:
+                        raw_value = new_value_file.getvalue()
+                        if len(raw_value) > 20_000_000:
+                            raise ValueError("過去評価CSVは20MB以内にしてください")
+                        old_values = pd.read_csv(io.BytesIO(raw_value), encoding="utf-8-sig",
+                                                 dtype={"コード": str})
+                    codes = true_top50_codes if new_fixed_top else None
+                    if new_fixed_top and not codes:
+                        raise ValueError("先に『今日の判定を更新』でTOP50を作成してください")
+                    result = compare_value_addon_backtest(
+                        hist, sl, codes, old_values, addon_fraction=addon_fraction)
+                    st.session_state["v1718_result"] = result
+                except Exception as e:
+                    st.session_state.pop("v1718_result", None)
+                    st.error(f"比較バックテストを実行できません: {e}")
+            if "v1718_result" in st.session_state:
+                summary, trades, unrealized, audit = st.session_state["v1718_result"]
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+                st.caption("買い増しは初回の約定から2営業日以上経過し、売り・損切りがなく、%Kが%Dより上で上昇中・%K≤50・終値が平均取得額を上回る場合に1回だけ。追加量は初回の指定比率。損切りは追加後の平均取得額で判定します。")
+                st.caption("銘柄別の独立検証です。過去のTOP50、実際の買付余力、ポートフォリオ収益・最大DD、手数料、税金は再現しません。PFは決済した取引騰落率の単純合算比です。未決済は別表に分離します。")
+                for label, frame, filename in [
+                    ("決済明細CSV", trades, "value_addon_trades.csv"),
+                    ("未決済明細CSV", unrealized, "value_addon_open.csv"),
+                    ("判定・見送り理由CSV", audit, "value_addon_audit.csv"),
+                ]:
+                    st.download_button(label, data=frame.to_csv(index=False).encode("utf-8-sig"),
+                                       file_name=filename, mime="text/csv", key="v1718_" + filename)
+
     with surge_tab:
         st.caption("旧Ver.5.5系の観察センサーです。正式なBUY/SELLには影響しません。")
         st.write("70点以上＝強い予兆、55点以上＝急騰予兆、40点以上＝変化検知")
@@ -3788,49 +3972,4 @@ try:
         zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
         zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
         compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()
-        zf.writestr("indicator_compare_candidates.csv", compare_export.to_csv(index=False,encoding="utf-8-sig"))
-        surge_export = surge_top50_df.copy() if isinstance(surge_top50_df, pd.DataFrame) else pd.DataFrame()
-        zf.writestr("surge_prediction_top50.csv", surge_export.to_csv(index=False,encoding="utf-8-sig"))
-        surge_summary = pd.DataFrame([{
-            "生成日時": st.session_state.get("v177_generated_at",""),
-            "対象": "企業価値AI TOP50のみ",
-            "強い急騰予兆_70点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 70).sum()),
-            "急騰予兆_55点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55).sum()),
-            "変化検知_40点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 40).sum()),
-            "予兆55点以上かつStoch_BUY": int(((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55) & surge_export.get("Stoch_BUY", pd.Series(False, index=surge_export.index)).fillna(False).astype(bool)).sum()),
-            "株価2000円以上除外": False,
-            "ニュース加点": False,
-            "実売買へ影響": False,
-        }])
-        zf.writestr("surge_prediction_summary.csv", surge_summary.to_csv(index=False,encoding="utf-8-sig"))
-        compare_summary_row = {
-            "生成日時": st.session_state.get("v177_generated_at",""),
-            "実売買方式": "Stoch 14,3,3 / %K<=20 GC",
-            "研究_RSI5": "RSI(5) 15以下から15上抜け",
-            "研究_BB20": "BB20 -2σ外から内側復帰",
-            "Stoch_BUY件数": int(compare_export["Stoch_BUY"].sum()) if not compare_export.empty and "Stoch_BUY" in compare_export else 0,
-            "RSI5_BUY件数": int(compare_export["RSI5_BUY"].sum()) if not compare_export.empty and "RSI5_BUY" in compare_export else 0,
-            "BB20_BUY件数": int(compare_export["BB20_BUY"].sum()) if not compare_export.empty and "BB20_BUY" in compare_export else 0,
-            "2方式以上一致件数": int((pd.to_numeric(compare_export["一致数"], errors="coerce") >= 2).sum()) if not compare_export.empty and "一致数" in compare_export else 0,
-            "実売買へ影響": False,
-        }
-        compare_summary = pd.DataFrame([compare_summary_row])
-        zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
-        status_df=pd.DataFrame([{
-            "本物TOP50モード":True,"母集団最低200銘柄ガード":True,
-            "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
-            "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
-            "当日確定日足件数":int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum()) if isinstance(daily_bar_status_df,pd.DataFrame) and not daily_bar_status_df.empty else 0,
-            "TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "一次選抜_流動性重み":0.45,"一次選抜_トレンド重み":0.30,"一次選抜_安定性重み":0.25,
-            "OOS検証済み":True,"OOS_PF参考":1.89,"5年通算PF参考":2.09,
-            "BUY候補件数":len(buy_export),"SELL候補件数":len(sell_view),"エラー":run_error,
-            "生成日時":st.session_state.get("v177_generated_at","")
-        }])
-        zf.writestr("value_ai_status.csv",status_df.to_csv(index=False,encoding="utf-8-sig"))
-    zip_buf.seek(0)
-    st.download_button("📦 全処理結果ZIP",data=zip_buf.getvalue(),file_name="ver17_all_analysis.zip",mime="application/zip",use_container_width=True,key="v177_zip")
-except Exception as e:
-    st.warning(f"ZIP作成エラー: {e}")
-
-st.caption("売買判断補助です。自動発注は行いません。")
+        zf.writestr("indicator_com

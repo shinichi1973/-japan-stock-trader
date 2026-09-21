@@ -3174,26 +3174,59 @@ def admin_table_height(df, maximum=520):
     return min(maximum, max(150, 36 * (rows + 1) + 8))
 
 
-def current_holdings_rows(holdings, sell_candidates, signal_audit):
-    """保有復元と同じ売り候補判定から、表示専用の一覧を作る。"""
+def current_holdings_rows(holdings, sell_candidates, signal_audit, value_df, price_data):
+    """現在保有一覧へ売買判定と企業価値判定を付ける。"""
     sell_codes = (set(sell_candidates["コード"].astype(str))
                   if isinstance(sell_candidates, pd.DataFrame) and "コード" in sell_candidates else set())
     checked_codes = {str(row["コード"]) for row in signal_audit if "コード" in row}
+    value_map = {}
+    if isinstance(value_df, pd.DataFrame) and not value_df.empty and "コード" in value_df.columns:
+        vm = value_df.copy()
+        vm["コード"] = vm["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
+        if "割安判定" in vm.columns:
+            value_map = vm.drop_duplicates("コード").set_index("コード")["割安判定"].to_dict()
+
     rows = []
     for ticker, holding in holdings.items():
         ticker = str(ticker)
         verdict = "売り" if ticker in sell_codes else "保有継続" if ticker in checked_codes else ""
+        value_label = value_map.get(ticker, "")
+        # TOP50外の保有銘柄も、現在情報を取得できる場合は企業価値を個別算定する。
+        if not str(value_label).strip():
+            symbol = ticker if ticker.endswith(".T") else ticker + ".T"
+            history = price_data.get(symbol, pd.DataFrame()) if isinstance(price_data, dict) else pd.DataFrame()
+            price_hint = safe_float(history["Close"].iloc[-1]) if isinstance(history, pd.DataFrame) and not history.empty else np.nan
+            f = (fundamental_snapshot(symbol, market_price_hint=price_hint)
+                 if np.isfinite(price_hint) and price_hint > 0 else {})
+            upside = safe_float(f.get("参考価値上昇余地"))
+            split_status = str(f.get("株式分割補正", ""))
+            guard_status = str(f.get("適正株価異常値ガード", ""))
+            if "⚠️" in split_status:
+                value_label = "⚠️ 分割補正確認"
+            elif "⚠️" in guard_status and not np.isfinite(upside):
+                value_label = "⚠️ 異常値ガード・算定不能"
+            elif not np.isfinite(upside):
+                value_label = "算定不能"
+            elif upside >= 20:
+                value_label = "🟢 割安"
+            elif upside >= 5:
+                value_label = "🟡 やや割安"
+            elif upside > -10:
+                value_label = "⚪ 適正圏"
+            else:
+                value_label = "🔴 割高"
         rows.append({"銘柄コード": ticker, "銘柄名": holding.get("name") or name(ticker),
-                     "保有株数": int(holding["shares"]), "判定": verdict})
+                     "保有株数": int(holding["shares"]), "判定": verdict,
+                     "銘柄判定": _short_value_label(value_label)})
     return sorted(rows, key=lambda row: (row["判定"] != "売り", row["銘柄コード"]))
 
 
 def render_current_holdings(rows):
-    """既存の売買カードと同じHTML描画で、4列と行の色を表示する。"""
+    """現在保有銘柄の売買判定と割安・割高判定を表示する。"""
     st.subheader("現在保有中の銘柄")
     if not rows:
         st.dataframe(pd.DataFrame([{
-            "銘柄コード": "", "銘柄名": "NO DATA", "保有株数": "", "判定": "",
+            "銘柄コード": "", "銘柄名": "NO DATA", "保有株数": "", "判定": "", "銘柄判定": "",
         }]), use_container_width=True, hide_index=True, height=120)
         return
     sell_count = sum(row["判定"] == "売り" for row in rows)
@@ -3205,7 +3238,7 @@ def render_current_holdings(rows):
     st.markdown(summary)
     st.markdown(
         '<div class="holding-grid holding-head"><span>銘柄コード</span><span>銘柄名</span>'
-        '<span>保有株数</span><span>判定</span></div>', unsafe_allow_html=True,
+        '<span>保有株数</span><span>売買判定</span><span>銘柄判定</span></div>', unsafe_allow_html=True,
     )
     for row in rows:
         verdict = row["判定"]
@@ -3215,11 +3248,13 @@ def render_current_holdings(rows):
             f'<span>{html_escape(str(row["銘柄コード"]))}</span>'
             f'<span class="holding-name">{html_escape(str(row["銘柄名"]))}</span>'
             f'<span class="holding-shares">{int(row["保有株数"]):,}</span>'
-            f'<span class="holding-verdict">{html_escape(verdict or "—")}</span></div>',
+            f'<span class="holding-verdict">{html_escape(verdict or "—")}</span>'
+            f'<span class="holding-value">{html_escape(str(row.get("銘柄判定") or "—"))}</span></div>',
             unsafe_allow_html=True,
         )
     if any(not row["判定"] for row in rows):
         st.caption("「—」は日足を取得できていない、または判定をまだ更新していない銘柄です。")
+    st.caption("銘柄判定は企業価値の参考表示です。売買判定そのものは変更しません。")
 
 
 def admin_judgement_table(df, key, maximum=520):
@@ -3297,8 +3332,8 @@ st.markdown(
     .trade-card.buy-card {border-left-color: #18a058; background: rgba(24,160,88,.075);}
     .trade-card.sell-card {border-left-color: #e5484d; background: rgba(229,72,77,.075);}
     .trade-card.skip-card {border-left-color: #d49b16; background: rgba(212,155,22,.07);}
-    .holding-grid {display: grid; grid-template-columns: minmax(3.6rem, .8fr) minmax(5rem, 2fr)
-        minmax(3.2rem, .8fr) minmax(4.4rem, 1fr); align-items: center; gap: 5px;
+    .holding-grid {display: grid; grid-template-columns: minmax(3.4rem, .72fr) minmax(4.5rem, 1.55fr)
+        minmax(3rem, .65fr) minmax(4.1rem, .9fr) minmax(4.8rem, 1.1fr); align-items: center; gap: 5px;
         padding: 8px 7px; font-size: .78rem; line-height: 1.3;}
     .holding-head {font-size: .68rem; font-weight: 700; padding-bottom: 3px;}
     .holding-head span {white-space: nowrap;}
@@ -3309,6 +3344,7 @@ st.markdown(
     .holding-name {overflow-wrap: anywhere;}
     .holding-shares {text-align: right; white-space: nowrap;}
     .holding-verdict {font-weight: 700; white-space: nowrap;}
+    .holding-value {font-weight: 750; white-space: nowrap;}
     .trade-card-main {
         display: flex;
         align-items: center;
@@ -3642,7 +3678,9 @@ with main_tab:
             st.warning(f"日足データ：{target_label} 確定 {current_count}/{total_count}銘柄。更新待ち銘柄は判定に注意してください。")
         else:
             st.warning("最新日足は取引中または更新待ちです。確定後にもう一度『今日の判定を更新』を押してください。")
-    render_current_holdings(current_holdings_rows(confirmed, sell_view, signal_audit_rows))
+    render_current_holdings(current_holdings_rows(
+        confirmed, sell_view, signal_audit_rows, value_top50_df, data
+    ))
     if run_error:
         st.error(run_error)
     elif not data or not true_top50_codes:

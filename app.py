@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.16
-# BUILD: VER17-16-STOCH-CHURN-GUARD-20260919
+# 日本株 AI投資アシスタント Ver.17.18
+# BUILD: VER17-18-OVERVALUED-BUY-GUARD-20260921
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -33,13 +33,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.17",
+    page_title="日本株 AI投資アシスタント Ver.17.18",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.17 STOCH TREND LAB"
-BUILD = "VER17-17-STOCH-TREND-LAB-MANUAL-BP-20260919"
+VERSION = "17.18 STOCH OVERVALUED GUARD"
+BUILD = "VER17-18-OVERVALUED-BUY-GUARD-20260921"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2727,7 +2727,7 @@ def build_top50_surge_radar(data, value_top50_df):
 def add_research_judgements_first(df, surge_df, value_df):
     """表示用の全銘柄表へ研究判定を付け、必ず左端へ並べる。
 
-    急騰予兆と割安判定は観察情報であり、正式なBUY/SELL条件には使わない。
+    急騰予兆は観察情報。割安判定は表示にも使い、割高だけは別工程で新規BUYから除外する。
     TOP50外など算定値がない銘柄も、空欄にせず対象外/未算定と明示する。
     """
     if not isinstance(df, pd.DataFrame):
@@ -3555,8 +3555,15 @@ sell_view = pd.DataFrame()
 buy_signal_rows, sell_signal_rows = [], []
 signal_audit_rows = []
 true_top50_codes = set()
+value_judgement_by_code = {}
 if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
-    true_top50_codes = set(value_top50_df["コード"].astype(str).head(50).tolist())
+    value_meta = value_top50_df.head(50).copy()
+    value_meta["コード"] = value_meta["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
+    true_top50_codes = set(value_meta["コード"].tolist())
+    if "割安判定" in value_meta.columns:
+        value_judgement_by_code = (
+            value_meta.drop_duplicates("コード").set_index("コード")["割安判定"].astype(str).to_dict()
+        )
 held_code_set = set(map(str, held_codes))
 
 if data and true_top50_codes:
@@ -3576,19 +3583,31 @@ if data and true_top50_codes:
         buy_new = bool(r.get("BUY_改善", False))
         sell_old = bool(r.get("SELL_現行", False))
         sell_new = bool(r.get("SELL_改善", False))
+        buy_signal_hit = buy_new if quality_mode else buy_old
+        value_judgement = value_judgement_by_code.get(c, "— 未算定")
+        overvalued = "割高" in str(value_judgement)
+        new_buy_target = c in true_top50_codes and c not in held_code_set
+        final_buy_hit = bool(new_buy_target and buy_signal_hit and not overvalued)
+        buy_skip_reason = "割高判定のため新規買い除外" if new_buy_target and buy_signal_hit and overvalued else ""
         if c in true_top50_codes or c in held_code_set:
             signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else "TOP50",
                                       "現行買い": buy_old, "改善買い": buy_new,
+                                      "採用方式の買いシグナル": bool(buy_signal_hit),
+                                      "銘柄判定": value_judgement,
+                                      "割高除外": bool(overvalued and new_buy_target),
+                                      "最終買い": final_buy_hit,
+                                      "買い見送り理由": buy_skip_reason,
                                       "現行売り": sell_old if c in held_code_set else False,
                                       "改善売り": sell_new if c in held_code_set else False,
                                       "上昇トレンド": bool(r.get("上昇トレンド", False)),
                                       "下降確認": bool(r.get("下降確認", False)),
                                       "帯下限": safe_float(r.get("帯下限")), "帯上限": safe_float(r.get("帯上限")),
                                       "%K": sk, "%D": sd})
-        if c in true_top50_codes and c not in held_code_set and (buy_new if quality_mode else buy_old):
+        if final_buy_hit:
             buy_signal_rows.append({
                 "コード": c, "銘柄名": name(t), "総合AIスコア": 100.0-float(sk),
-                "現在株価": float(px), "%K": float(sk), "%D": float(sd), "条件": "%K≤20 GC",
+                "現在株価": float(px), "%K": float(sk), "%D": float(sd),
+                "条件": "買い条件成立＋割高除外通過",
             })
         if c in held_code_set:
             h = confirmed.get(c, {})
@@ -3606,6 +3625,16 @@ if data and true_top50_codes:
                     "損益率%":pnl_pct,"%K":float(sk) if np.isfinite(sk) else np.nan,
                     "%D":float(sd) if np.isfinite(sd) else np.nan,"売り理由":"＋".join(reasons),
                 })
+
+signal_audit_df = pd.DataFrame(signal_audit_rows)
+if not signal_audit_df.empty and "買い見送り理由" in signal_audit_df.columns:
+    overvalued_buy_exclusions_df = signal_audit_df[
+        signal_audit_df["買い見送り理由"].eq("割高判定のため新規買い除外")
+    ].copy()
+else:
+    overvalued_buy_exclusions_df = pd.DataFrame(columns=[
+        "コード", "銘柄名", "銘柄判定", "採用方式の買いシグナル", "最終買い", "買い見送り理由"
+    ])
 
 # カード表示だけに使う。買い・売りの採用判定やZIPの列には接続しない。
 trend_by_code = {str(r["コード"]): r for r in signal_audit_rows}
@@ -3696,6 +3725,8 @@ with main_tab:
                 st.dataframe(sell_display, use_container_width=True, hide_index=True)
 
         st.subheader("🟢 買い")
+        if not overvalued_buy_exclusions_df.empty:
+            st.caption(f"割高判定により {len(overvalued_buy_exclusions_df)}銘柄を買い候補から除外しました。")
         if buy_view.empty:
             st.info("本物の企業価値AI TOP50内に、現在BUY条件を満たす銘柄はありません。")
         else:
@@ -3998,6 +4029,7 @@ try:
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"トレンド＋振れ幅＋GC" if quality_mode else "Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
+            "割高の新規BUY除外":True,
             "SELL条件":f"保有銘柄のみ / {'トレンド確認DC' if quality_mode else 'Slow Stoch DC'} または 損切り -{float(sl):.1f}%",
             "旧49銘柄固定ユニバース使用":False,
             "短期反転フィルター":bool(churn_filter),
@@ -4010,7 +4042,8 @@ try:
             zf.writestr("value_ai_top50.csv",value_top50_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(churn_audit_df,pd.DataFrame):
             zf.writestr("stoch_churn_audit.csv",churn_audit_df.to_csv(index=False,encoding="utf-8-sig"))
-        zf.writestr("stoch_signal_quality_audit.csv", pd.DataFrame(signal_audit_rows).to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("stoch_signal_quality_audit.csv", signal_audit_df.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("overvalued_buy_exclusions.csv", overvalued_buy_exclusions_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(daily_bar_status_df,pd.DataFrame):
             zf.writestr("daily_bar_freshness.csv",daily_bar_status_df.to_csv(index=False,encoding="utf-8-sig"))
         if not sbi_trades_df.empty:
@@ -4060,7 +4093,8 @@ try:
             "TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "一次選抜_流動性重み":0.45,"一次選抜_トレンド重み":0.30,"一次選抜_安定性重み":0.25,
             "OOS検証済み":True,"OOS_PF参考":1.89,"5年通算PF参考":2.09,
-            "BUY候補件数":len(buy_export),"SELL候補件数":len(sell_view),"エラー":run_error,
+            "BUY候補件数":len(buy_export),"割高除外件数":len(overvalued_buy_exclusions_df),
+            "SELL候補件数":len(sell_view),"エラー":run_error,
             "生成日時":st.session_state.get("v177_generated_at","")
         }])
         zf.writestr("value_ai_status.csv",status_df.to_csv(index=False,encoding="utf-8-sig"))

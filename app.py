@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.18
-# BUILD: VER17-18-OVERVALUED-BUY-GUARD-20260921
+# 日本株 AI投資アシスタント Ver.17.19
+# BUILD: VER17-19-JQUANTS-YAHOO-FRESHNESS-20260923
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -20,6 +20,8 @@ import json
 import math
 import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from html import escape as html_escape, unescape as html_unescape
@@ -33,16 +35,18 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.18",
+    page_title="日本株 AI投資アシスタント Ver.17.19",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.18 STOCH OVERVALUED GUARD"
-BUILD = "VER17-18-OVERVALUED-BUY-GUARD-20260921"
+VERSION = "17.19 STOCH DUAL FUNDAMENTALS"
+BUILD = "VER17-19-JQUANTS-YAHOO-FRESHNESS-20260923"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
+JQUANTS_CALL_TIMES = []
+JQUANTS_CALL_LOCK = threading.Lock()
 
 
 def tokyo_now():
@@ -1336,6 +1340,77 @@ def info_num(info, *keys):
                 return x
     return np.nan
 
+def jquants_api_key():
+    """キーをコードやZIPに書き出さず、Streamlit secrets または環境変数から取得する。"""
+    try:
+        key = str(st.secrets.get("JQUANTS_API_KEY", "")).strip()
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get("JQUANTS_API_KEY", "").strip()
+
+
+def jquants_get(api_key, params):
+    # 財務サマリーの独立した60回/分枠に余裕を持たせる。
+    with JQUANTS_CALL_LOCK:
+        now = time.monotonic()
+        JQUANTS_CALL_TIMES[:] = [x for x in JQUANTS_CALL_TIMES if now - x < 61]
+        if len(JQUANTS_CALL_TIMES) >= 50:
+            time.sleep(max(0, 61 - (now - JQUANTS_CALL_TIMES[0])))
+            now = time.monotonic()
+            JQUANTS_CALL_TIMES[:] = [x for x in JQUANTS_CALL_TIMES if now - x < 61]
+        JQUANTS_CALL_TIMES.append(now)
+    return requests.get(
+        "https://api.jquants.com/v2/fins/summary",
+        headers={"x-api-key": api_key}, params=params, timeout=12,
+    )
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def jquants_financial_summary(ticker, api_key):
+    """J-Quants V2無料プランの開示サマリー。取得失敗は明示し、空欄を0として扱わない。"""
+    if not api_key:
+        return {}, "APIキー未設定"
+    try:
+        code4 = code(ticker)
+        response = jquants_get(api_key, {"code": code4})
+        if response.status_code == 429:
+            return {}, "取得制限（429）"
+        response.raise_for_status()
+        body = response.json()
+        rows = body.get("data", [])
+        # 長期履歴でページが分割されても最新の開示を取りこぼさない。
+        pages = 0
+        seen = set()
+        while body.get("pagination_key") and pages < 8:
+            page_key = str(body["pagination_key"])
+            if page_key in seen:
+                break
+            seen.add(page_key)
+            response = jquants_get(api_key, {"code": code4, "pagination_key": page_key})
+            response.raise_for_status()
+            body = response.json()
+            rows.extend(body.get("data", []))
+            pages += 1
+        if body.get("pagination_key"):
+            return {}, "ページ上限で最新開示を確認できず"
+        today = tokyo_now().date()
+        candidates = []
+        for row in rows:
+            d = pd.to_datetime(row.get("DiscDate"), errors="coerce")
+            if (not pd.isna(d) and d.date() <= today and
+                any(np.isfinite(safe_float(row.get(field))) for field in
+                    ("FEPS", "EPS", "BPS", "ROE"))):
+                candidates.append(row)
+        if not candidates:
+            return {}, "開示データなし（無料プランは12週間遅延）"
+        candidates.sort(key=lambda r: (str(r.get("DiscDate", "")),
+                                       str(r.get("DiscTime", "")), str(r.get("DiscNo", ""))))
+        return candidates[-1], "OK（無料プラン・12週間遅延）"
+    except Exception as exc:
+        return {}, "取得失敗: " + type(exc).__name__
+
 def parse_split_factor(v):
     """Yahooの lastSplitFactor 等を 5:1 -> 5.0 のように正規化する。"""
     if v is None:
@@ -1434,11 +1509,20 @@ def _adjust_target_for_split(target, current_price, split_factor, recent=True):
 
 
 @st.cache_data(ttl=21600)
-def fundamental_snapshot(t, market_price_hint=np.nan):
+def fundamental_snapshot(t, market_price_hint=np.nan, jq_api_key=""):
     """現在情報のみ。過去バックテストには使用しない。株式分割ズレを最優先で防止する。"""
     try:
-        tk = yf.Ticker(t)
-        info = tk.info or {}
+        try:
+            info = yf.Ticker(t).info or {}
+        except Exception:
+            info = {}
+        if not isinstance(info, dict):
+            info = {}
+        yahoo_quarter_raw = safe_float(info.get("mostRecentQuarter"))
+        yahoo_quarter = (datetime.fromtimestamp(yahoo_quarter_raw, timezone.utc).date()
+                          if np.isfinite(yahoo_quarter_raw) and yahoo_quarter_raw > 0 else None)
+        today = tokyo_now().date()
+        yahoo_quarter_age = (today - yahoo_quarter).days if yahoo_quarter else None
         info_price = info_num(info, "currentPrice", "regularMarketPrice")
         hint = safe_float(market_price_hint)
         price = hint if np.isfinite(hint) and hint > 0 else info_price
@@ -1463,6 +1547,35 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
         book_value = info_num(info, "bookValue")
         sector = str(info.get("sector") or "")
         industry = str(info.get("industry") or "")
+        jq_row, jq_status = {}, "APIキー未設定" if not jq_api_key else "Yahooの必要項目あり"
+        jq_date, jq_age = None, None
+        yahoo_value_basis = any(np.isfinite(x) and x > 0 for x in
+                                (forward_eps, trailing_eps, target_mean))
+        # J-QuantsはYahooに必要な財務値が欠けたときだけ参照する。
+        if jq_api_key and (not yahoo_value_basis or not np.isfinite(price_to_book) or not np.isfinite(roe)):
+            jq_row, jq_status = jquants_financial_summary(t, jq_api_key)
+            jq_dt = pd.to_datetime(jq_row.get("DiscDate"), errors="coerce")
+            if not pd.isna(jq_dt):
+                jq_date = jq_dt.date()
+                jq_age = (today - jq_date).days
+            fiscal_end = pd.to_datetime(jq_row.get("CurFYEn"), errors="coerce")
+            valid_forecast = not pd.isna(fiscal_end) and fiscal_end.date() >= today - timedelta(days=30)
+            jq_forward = safe_float(jq_row.get("FEPS")) if valid_forecast else np.nan
+            jq_actual = safe_float(jq_row.get("EPS")) if jq_row.get("CurPerType") == "FY" else np.nan
+            if not np.isfinite(forward_eps) and np.isfinite(jq_forward):
+                forward_eps = jq_forward
+            if not np.isfinite(trailing_eps) and np.isfinite(jq_actual):
+                trailing_eps = jq_actual
+            if not np.isfinite(book_value):
+                book_value = safe_float(jq_row.get("BPS"))
+            if not np.isfinite(roe):
+                roe = safe_float(jq_row.get("ROE"))
+            if not np.isfinite(price_to_book) and np.isfinite(book_value) and book_value > 0 and np.isfinite(price):
+                price_to_book = price / book_value
+            if not np.isfinite(forward_pe) and np.isfinite(forward_eps) and forward_eps > 0 and np.isfinite(price):
+                forward_pe = price / forward_eps
+        jq_used_for_value = bool(not yahoo_value_basis and jq_row and
+                                 (np.isfinite(forward_eps) or np.isfinite(trailing_eps)))
         # 株価ヒントだけでは企業価値の取得成功とみなさない。
         # Yahoo側が空のinfoを返す場合、従来は中立点50と「OK」が全銘柄に付いていた。
         fundamental_fields = (trailing_pe, forward_pe, price_to_book, roe,
@@ -1697,8 +1810,20 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
             0, 100
         ))
 
+        source_status = ("参考のみ: J-Quants無料12週間遅延" if jq_used_for_value else
+                         "OK" if has_fundamentals else "取得不可: 企業価値指標が全て欠損")
+        freshness = ("12週間遅延・最新開示は未確認" if jq_used_for_value else
+                     "Yahoo期末日が未来" if yahoo_quarter_age is not None and yahoo_quarter_age < 0 else
+                     "Yahoo期末日が古い" if yahoo_quarter_age is not None and yahoo_quarter_age > 200 else
+                     "Yahoo期末日を確認" if yahoo_quarter_age is not None else
+                     "Yahoo開示期末日未提供" if has_fundamentals else "最新性を確認できず")
         return {
-            "取得状態":"OK" if has_fundamentals else "取得不可: 企業価値指標が全て欠損",
+            "取得状態":source_status,"財務情報源":"J-Quants無料（補完）" if jq_used_for_value else
+            "Yahoo Finance＋J-Quants補完" if jq_row and has_fundamentals else
+            "Yahoo Finance" if has_fundamentals else "取得不可",
+            "財務情報鮮度":freshness,"Yahoo期末日":str(yahoo_quarter or ""),
+            "JQuants開示日":str(jq_date or ""),"JQuants開示経過日数":jq_age,
+            "JQuants取得状態":jq_status,
             "現在株価":price,"時価総額":market_cap,
             "PER":trailing_pe,"予想PER":forward_pe,"PBR":price_to_book,
             "ROE":roe,"営業利益率":op_margin,"売上成長率":revenue_growth,
@@ -2213,7 +2338,8 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
     fund_rows = []
     for _, r in pool.iterrows():
         t = r["ticker"]
-        f = fundamental_snapshot(t, market_price_hint=safe_float(r.get("現在株価_価格")))
+        f = fundamental_snapshot(t, market_price_hint=safe_float(r.get("現在株価_価格")),
+                                 jq_api_key=jquants_api_key())
         fund_rows.append({
             "ticker": t,
             "企業価値スコア": safe_float(f.get("企業価値スコア"), 50),
@@ -2241,6 +2367,12 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
             "適正株価異常値ガード": str(f.get("適正株価異常値ガード", "")),
             "適正株価クロスチェック": str(f.get("適正株価クロスチェック", "")),
             "ファンダ取得状態": str(f.get("取得状態", "")),
+            "財務情報源": str(f.get("財務情報源", "")),
+            "財務情報鮮度": str(f.get("財務情報鮮度", "")),
+            "Yahoo期末日": str(f.get("Yahoo期末日", "")),
+            "JQuants開示日": str(f.get("JQuants開示日", "")),
+            "JQuants開示経過日数": f.get("JQuants開示経過日数"),
+            "JQuants取得状態": str(f.get("JQuants取得状態", "")),
         })
     out = pool.merge(pd.DataFrame(fund_rows), on="ticker", how="left")
     for c in ["企業価値スコア", "成長性スコア", "バリュエーションスコア"]:
@@ -2255,6 +2387,7 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
     ).clip(0, 100)
     out["割安判定"] = out.apply(
         lambda rr: "⚠️ 分割補正確認" if "⚠️" in str(rr.get("株式分割補正", "")) else
+        "⚠️ 最新性未確認" if rr.get("財務情報鮮度") != "Yahoo期末日を確認" or rr.get("ファンダ取得状態") != "OK" else
         ("⚠️ 異常値ガード・算定不能" if "⚠️" in str(rr.get("適正株価異常値ガード", "")) and not np.isfinite(safe_float(rr.get("参考価値上昇余地%"))) else
          "算定不能" if not np.isfinite(safe_float(rr.get("参考価値上昇余地%"))) else
          "🟢 割安" if safe_float(rr.get("参考価値上昇余地%")) >= 20 else
@@ -2266,6 +2399,7 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
     # 有効な評価を持つ銘柄を先に並べ、欠損は監査用に残す。
     out["企業価値算定済"] = (
         out["ファンダ取得状態"].eq("OK") &
+        out["財務情報鮮度"].eq("Yahoo期末日を確認") &
         pd.to_numeric(out["参考価値上昇余地%"], errors="coerce").notna()
     )
     out["母集団件数"] = int(mother_count)
@@ -3054,6 +3188,8 @@ def _short_surge_label(value):
 
 def _short_value_label(value):
     text = str(value or "")
+    if "最新性未確認" in text:
+        return "⚠️ 鮮度未確認"
     if "分割補正" in text:
         return "⚠️ 分割確認"
     if "異常値" in text:
@@ -3210,12 +3346,15 @@ def current_holdings_rows(holdings, sell_candidates, signal_audit, value_df, pri
             symbol = ticker if ticker.endswith(".T") else ticker + ".T"
             history = price_data.get(symbol, pd.DataFrame()) if isinstance(price_data, dict) else pd.DataFrame()
             price_hint = safe_float(history["Close"].iloc[-1]) if isinstance(history, pd.DataFrame) and not history.empty else np.nan
-            f = (fundamental_snapshot(symbol, market_price_hint=price_hint)
+            f = (fundamental_snapshot(symbol, market_price_hint=price_hint,
+                                      jq_api_key=jquants_api_key())
                  if np.isfinite(price_hint) and price_hint > 0 else {})
             upside = safe_float(f.get("参考価値上昇余地"))
             split_status = str(f.get("株式分割補正", ""))
             guard_status = str(f.get("適正株価異常値ガード", ""))
-            if "⚠️" in split_status:
+            if f.get("財務情報鮮度") != "Yahoo期末日を確認" or f.get("取得状態") != "OK":
+                value_label = "⚠️ 最新性未確認"
+            elif "⚠️" in split_status:
                 value_label = "⚠️ 分割補正確認"
             elif "⚠️" in guard_status and not np.isfinite(upside):
                 value_label = "⚠️ 異常値ガード・算定不能"
@@ -3737,6 +3876,8 @@ with main_tab:
     else:
         if value_unrated_count:
             st.warning(f"企業価値を算定できない銘柄がTOP50中{value_unrated_count}件あります。該当銘柄の新規買いは停止しています。日足による保有銘柄の売り判定は表示します。")
+            if not jquants_api_key():
+                st.caption("J-Quants無料プランの補完はAPIキー未設定のため停止中です。")
         st.subheader("🔻 売り")
         if sell_view.empty:
             st.success("売り候補はありません。")
@@ -3797,6 +3938,7 @@ with admin_tab:
 
     with value_tab:
         st.caption("企業価値AI TOP50：重要列だけを先に表示します。")
+        st.caption("財務の鮮度は開示日・期末日で確認します。J-Quants無料版は12週間遅延するため、最新開示との一致は確認できません。")
         if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
             st.info("先に『今日の判定を更新』で企業価値AI TOP50を作成してください。")
         else:
@@ -3805,6 +3947,8 @@ with admin_tab:
                 "急騰予兆判定","割安判定","順位","コード","銘柄名","一次選抜順位",
                 "現在株価_価格","AI参考価値","参考価値上昇余地%","企業価値スコア",
                 "成長性スコア","流動性スコア","AI_TOP50スコア",
+                "財務情報源","財務情報鮮度","Yahoo期末日","JQuants開示日",
+                "JQuants開示経過日数","JQuants取得状態","ファンダ取得状態",
                 "適正株価異常値ガード","株式分割補正"
             ]
             value_full = prepare_admin_display(value_show[[c for c in show_cols if c in value_show.columns]])

@@ -1463,6 +1463,12 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
         book_value = info_num(info, "bookValue")
         sector = str(info.get("sector") or "")
         industry = str(info.get("industry") or "")
+        # 株価ヒントだけでは企業価値の取得成功とみなさない。
+        # Yahoo側が空のinfoを返す場合、従来は中立点50と「OK」が全銘柄に付いていた。
+        fundamental_fields = (trailing_pe, forward_pe, price_to_book, roe,
+                              revenue_growth, earnings_growth, trailing_eps,
+                              forward_eps, target_mean)
+        has_fundamentals = any(np.isfinite(x) for x in fundamental_fields)
 
         # Yahooが返す直近株式分割情報。基準の違うEPS/目標株価を混ぜないため最優先で確認。
         split_factor_raw = info.get("lastSplitFactor")
@@ -1692,7 +1698,8 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
         ))
 
         return {
-            "取得状態":"OK","現在株価":price,"時価総額":market_cap,
+            "取得状態":"OK" if has_fundamentals else "取得不可: 企業価値指標が全て欠損",
+            "現在株価":price,"時価総額":market_cap,
             "PER":trailing_pe,"予想PER":forward_pe,"PBR":price_to_book,
             "ROE":roe,"営業利益率":op_margin,"売上成長率":revenue_growth,
             "利益成長率":earnings_growth,"D/E":debt_to_equity,
@@ -2255,9 +2262,16 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
          "⚪ 適正圏" if safe_float(rr.get("参考価値上昇余地%")) > -10 else "🔴 割高"),
         axis=1
     )
+    # 取得不可の中立点を企業価値スコアとして競わせない。
+    # 有効な評価を持つ銘柄を先に並べ、欠損は監査用に残す。
+    out["企業価値算定済"] = (
+        out["ファンダ取得状態"].eq("OK") &
+        pd.to_numeric(out["参考価値上昇余地%"], errors="coerce").notna()
+    )
     out["母集団件数"] = int(mother_count)
     out["詳細企業価値評価件数"] = int(pool_n)
-    out = out.sort_values(["AI_TOP50スコア", "流動性スコア"], ascending=[False, False]).reset_index(drop=True)
+    out = out.sort_values(["企業価値算定済", "AI_TOP50スコア", "流動性スコア"],
+                          ascending=[False, False, False]).reset_index(drop=True)
     out.insert(0, "順位", np.arange(1, len(out) + 1))
     return out.head(int(max_rows)).copy(), audit
 
@@ -3564,6 +3578,8 @@ if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
         value_judgement_by_code = (
             value_meta.drop_duplicates("コード").set_index("コード")["割安判定"].astype(str).to_dict()
         )
+value_unrated_count = (int((~value_top50_df["企業価値算定済"].fillna(False).astype(bool)).sum())
+                       if isinstance(value_top50_df, pd.DataFrame) and "企業価値算定済" in value_top50_df else 0)
 held_code_set = set(map(str, held_codes))
 
 if data and true_top50_codes:
@@ -3587,8 +3603,12 @@ if data and true_top50_codes:
         value_judgement = value_judgement_by_code.get(c, "— 未算定")
         overvalued = "割高" in str(value_judgement)
         new_buy_target = c in true_top50_codes and c not in held_code_set
-        final_buy_hit = bool(new_buy_target and buy_signal_hit and not overvalued)
-        buy_skip_reason = "割高判定のため新規買い除外" if new_buy_target and buy_signal_hit and overvalued else ""
+        valuation_ready = bool(c in value_judgement_by_code and
+                               value_judgement not in ("算定不能", "— 未算定") and
+                               "⚠️" not in str(value_judgement))
+        final_buy_hit = bool(new_buy_target and buy_signal_hit and valuation_ready and not overvalued)
+        buy_skip_reason = ("企業価値が未算定のため新規買い停止" if new_buy_target and buy_signal_hit and not valuation_ready
+                           else "割高判定のため新規買い除外" if new_buy_target and buy_signal_hit and overvalued else "")
         if c in true_top50_codes or c in held_code_set:
             signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else "TOP50",
                                       "現行買い": buy_old, "改善買い": buy_new,
@@ -3715,6 +3735,8 @@ with main_tab:
     elif not data or not true_top50_codes:
         st.info("「今日の判定を更新」を押してください。")
     else:
+        if value_unrated_count:
+            st.warning(f"企業価値を算定できない銘柄がTOP50中{value_unrated_count}件あります。該当銘柄の新規買いは停止しています。日足による保有銘柄の売り判定は表示します。")
         st.subheader("🔻 売り")
         if sell_view.empty:
             st.success("売り候補はありません。")
@@ -3728,7 +3750,8 @@ with main_tab:
         if not overvalued_buy_exclusions_df.empty:
             st.caption(f"割高判定により {len(overvalued_buy_exclusions_df)}銘柄を買い候補から除外しました。")
         if buy_view.empty:
-            st.info("本物の企業価値AI TOP50内に、現在BUY条件を満たす銘柄はありません。")
+            st.info("企業価値を算定でき、現在BUY条件も満たす銘柄はありません。" if value_unrated_count else
+                    "本物の企業価値AI TOP50内に、現在BUY条件を満たす銘柄はありません。")
         else:
             render_mobile_trade_cards(buy_view, "buy", trend_by_code)
             simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","参考S株数","%K","%D","買付可否"] if c in buy_view.columns]
@@ -4094,6 +4117,7 @@ try:
             "一次選抜_流動性重み":0.45,"一次選抜_トレンド重み":0.30,"一次選抜_安定性重み":0.25,
             "OOS検証済み":True,"OOS_PF参考":1.89,"5年通算PF参考":2.09,
             "BUY候補件数":len(buy_export),"割高除外件数":len(overvalued_buy_exclusions_df),
+            "企業価値未算定件数":value_unrated_count,
             "SELL候補件数":len(sell_view),"エラー":run_error,
             "生成日時":st.session_state.get("v177_generated_at","")
         }])

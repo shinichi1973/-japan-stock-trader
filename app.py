@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.23
-# BUILD: VER17-23-AI-RESEARCH-HOLDOUT-20260926
+# 日本株 AI投資アシスタント Ver.17.23.1
+# BUILD: VER17-23-1-AI-RESEARCH-PL-SPLIT-20260926
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.23",
+    page_title="日本株 AI投資アシスタント Ver.17.23.1",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.23 FIXED45 STOCH + MID LONG + AI RESEARCH"
-BUILD = "VER17-23-AI-RESEARCH-HOLDOUT-20260926"
+VERSION = "17.23.1 FIXED45 STOCH + MID LONG + AI RESEARCH"
+BUILD = "VER17-23-1-AI-RESEARCH-PL-SPLIT-20260926"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2544,12 +2544,31 @@ def ai_research_backtest(close, opening, volume, method, start, end,
     equity_df["累積最高"] = equity_df["資産円"].cummax().clip(lower=initial_cash)
     equity_df["DD%"] = (equity_df["資産円"] / equity_df["累積最高"] - 1) * 100
     final = float(equity_df["資産円"].iloc[-1])
+    last_date = equity_df["日付"].iloc[-1]
+    open_rows = []
+    for c, shares in positions.items():
+        entry_price, entry_date, entry_cost = entries[c]
+        current_price = close.at[last_date, c]
+        if not np.isfinite(current_price):
+            current_price = close[c].loc[:last_date].dropna().iloc[-1]
+        open_rows.append({"方式":method,"コード":c,"買付日":entry_date,"株数":shares,
+                          "取得価格_調整値":entry_price,"最終価格_調整値":current_price,
+                          "取得額円":entry_cost,"最終評価額円":shares * current_price,
+                          "未決済評価損益円":shares * current_price - entry_cost})
+    open_df = pd.DataFrame(open_rows, columns=["方式","コード","買付日","株数",
+                                               "取得価格_調整値","最終価格_調整値",
+                                               "取得額円","最終評価額円","未決済評価損益円"])
+    realized = float(trades_df["実現損益円"].sum()) if not trades_df.empty else 0.0
+    unrealized = float(open_df["未決済評価損益円"].sum()) if not open_df.empty else 0.0
+    if not np.isclose(final - initial_cash, realized + unrealized, atol=.01):
+        raise ValueError("バックテストの確定損益と評価損益が資産と一致しません")
     summary = {"方式":method,"開始日":str(equity_df["日付"].iloc[0].date()),
                "終了日":str(equity_df["日付"].iloc[-1].date()),"初期資金円":int(initial_cash),
                "最終資産円":round(final),"損益率%":round((final/initial_cash-1)*100,2),
                "最大DD%":round(float(equity_df["DD%"].min()),2),
+               "確定損益円":round(realized),"未決済評価損益円":round(unrealized),
                "決済件数":len(trades_df),"未決済件数":len(positions)}
-    return summary, trades_df, equity_df, positions
+    return summary, trades_df, equity_df, open_df
 
 
 def compare_ai_research_methods(history, initial_cash=600000, fee_bps=10):
@@ -3934,7 +3953,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.23")
+st.title("📈 日本株 AI投資アシスタント Ver.17.23.1")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("固定45銘柄 → %K≤20のGCで買い → DCまたは終値で−7%なら翌朝売り")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -4789,6 +4808,8 @@ def render_ai_research_tab():
     selected_oos = comparison[(comparison["方式"].eq(selected)) & comparison["期間"].eq("未使用")].iloc[0]
     st.markdown(f"**学習期間だけで選んだ方式：{selected}**")
     st.caption(f"未使用期間：損益 {selected_oos['損益率%']:+.2f}% / 最大DD {selected_oos['最大DD%']:.2f}% / "
+               f"確定損益 {int(selected_oos['確定損益円']):+,}円 / "
+               f"未決済評価損益 {int(selected_oos['未決済評価損益円']):+,}円 / "
                f"決済 {int(selected_oos['決済件数'])}件。未使用期間の成績を見て方式を選び直していません。")
     if selected_oos["損益率%"] <= 0:
         st.error("未使用期間に利益が残っていません。この方式を採用候補にはしません。")
@@ -4802,7 +4823,8 @@ def render_ai_research_tab():
     with st.expander("選定方式の売買明細と未決済", expanded=False):
         trades, curve, positions = detail[(selected, "未使用")]
         st.dataframe(trades, use_container_width=True, hide_index=True)
-        st.write("未決済保有（調整後株数の概算）", positions)
+        st.caption("未決済保有（調整後株数の概算）")
+        st.dataframe(positions, use_container_width=True, hide_index=True)
     close, _, volume = prepared
     rank = ai_research_rank(ai_research_features(close, volume), close.index[-1], selected)
     candidates = pd.DataFrame([{"コード":c, "銘柄名":name(c), "研究スコア":round(float(score), 3),
@@ -4823,9 +4845,10 @@ def render_ai_research_tab():
         zf.writestr("ai_research_latest_candidates.csv", candidates.to_csv(index=False, encoding="utf-8-sig"))
         for method in AI_RESEARCH_METHODS:
             for period, suffix in (("学習", "train"), ("未使用", "holdout")):
-                trades, curve, _ = detail[(method, period)]
+                trades, curve, open_positions = detail[(method, period)]
                 zf.writestr(f"{method}_{suffix}_trades.csv", trades.to_csv(index=False, encoding="utf-8-sig"))
                 zf.writestr(f"{method}_{suffix}_equity.csv", curve.to_csv(index=False, encoding="utf-8-sig"))
+                zf.writestr(f"{method}_{suffix}_open_positions.csv", open_positions.to_csv(index=False, encoding="utf-8-sig"))
     st.download_button("AIロジック比較結果ZIP", buf.getvalue(), "ai_research_backtest.zip",
                        "application/zip", key="ai_research_result_download_v1723")
 

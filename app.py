@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.19
-# BUILD: VER17-19-JQUANTS-YAHOO-FRESHNESS-20260923
+# 日本株 AI投資アシスタント Ver.17.22
+# BUILD: VER17-22-INDEPENDENT-MID-LONG-20260926
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -16,6 +16,7 @@
 # ============================================================
 
 import io
+import hashlib
 import json
 import math
 import os
@@ -35,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.19",
+    page_title="日本株 AI投資アシスタント Ver.17.22",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.21 FIXED45 STOCH NO ADDON"
-BUILD = "VER17-21-FIXED45-GC20-DC-STOP7-STATUSFIX-20260926"
+VERSION = "17.22 FIXED45 STOCH + MID LONG"
+BUILD = "VER17-22-INDEPENDENT-MID-LONG-20260926"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2292,6 +2293,131 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
     return pd.DataFrame(rows, columns=cols)
 
 
+def holding_horizon_signal(frame, fundamentals, horizon, entry_price=np.nan):
+    """中長期の独立シグナル。財務は現時点の判定専用で、過去検証に流用しない。"""
+    if frame is None or len(frame) < (225 if horizon == "長期" else 160):
+        return {"判定": "データ不足", "理由": "必要な日足が不足"}
+    x = frame.sort_index().copy()
+    close = pd.to_numeric(x["Close"], errors="coerce")
+    if "Adj Close" in x:
+        factor = (pd.to_numeric(x["Adj Close"], errors="coerce") / close).replace(
+            [np.inf, -np.inf], np.nan).ffill().bfill()
+        signal_price = close * factor
+    else:
+        signal_price = close
+    signal_price = signal_price.dropna()
+    if len(signal_price) < (225 if horizon == "長期" else 160):
+        return {"判定": "データ不足", "理由": "調整後株価が不足"}
+    last = float(close.iloc[-1])
+    ma50 = signal_price.rolling(50).mean()
+    ma150 = signal_price.rolling(150).mean()
+    ma200 = signal_price.rolling(200).mean()
+    p = float(signal_price.iloc[-1])
+    roe = safe_float(fundamentals.get("ROE%", np.nan))
+    sales = safe_float(fundamentals.get("売上成長率%", np.nan))
+    earnings = safe_float(fundamentals.get("利益成長率%", np.nan))
+    pe = safe_float(fundamentals.get("PER", np.nan))
+    valid_finance = str(fundamentals.get("ファンダ取得状態", "")) == "OK"
+    # Yahooに開示日がない場合、古い数字を「最新」とは断定しない。
+    fresh_days = safe_float(fundamentals.get("JQuants開示経過日数", np.nan))
+    if np.isfinite(fresh_days) and fresh_days > 210:
+        valid_finance = False
+    held = np.isfinite(entry_price) and entry_price > 0
+    loss = last / entry_price - 1 if held else np.nan
+    if horizon == "中期":
+        momentum = p / float(signal_price.iloc[-61]) - 1
+        trend = p > ma50.iloc[-1] > ma150.iloc[-1] and ma50.iloc[-1] > ma50.iloc[-21]
+        quality = (valid_finance and np.isfinite(roe) and roe >= 8 and
+                   np.isfinite(sales) and sales >= 0 and np.isfinite(pe) and 0 < pe <= 45)
+        exit_trend = bool((signal_price.iloc[-2:] < ma50.iloc[-2:]).all())
+        stop = held and loss <= -0.10
+        exit_reason = "終値で取得単価−10%" if stop else "調整後終値が50日線を2日連続下回る" if exit_trend else ""
+        buy = trend and quality and .03 <= momentum <= .40
+        rule = "50日線>150日線・60日上昇3〜40%・ROE8%以上・売上成長0%以上・PER45以下"
+    else:
+        momentum = p / float(signal_price.iloc[-127]) - 1
+        trend = p > ma200.iloc[-1] and ma200.iloc[-1] > ma200.iloc[-21]
+        quality = (valid_finance and np.isfinite(roe) and roe >= 10 and
+                   np.isfinite(sales) and sales >= 0 and np.isfinite(earnings) and earnings >= 0 and
+                   np.isfinite(pe) and 0 < pe <= 35)
+        exit_trend = bool((signal_price.iloc[-5:] < ma200.iloc[-5:]).all())
+        stop = held and loss <= -0.18
+        deterioration = held and valid_finance and np.isfinite(roe) and roe < 5
+        exit_reason = ("終値で取得単価−18%" if stop else
+                       "ROEが5%未満" if deterioration else
+                       "調整後終値が200日線を5日連続下回る" if exit_trend else "")
+        buy = trend and quality and 0 < momentum <= .80
+        rule = "200日線上向き・126日上昇0〜80%・ROE10%以上・売上と利益が成長・PER35以下"
+    if held:
+        verdict = "売り" if exit_reason else "保有継続"
+        reason = exit_reason or "撤退条件に該当せず"
+    else:
+        verdict = "買い候補" if buy else "見送り"
+        reason = rule if buy else "トレンド・財務・上昇率の条件が未成立"
+    return {"判定": verdict, "理由": reason, "終値": last,
+            "上昇率%": round(momentum * 100, 2), "ROE%": roe,
+            "売上成長率%": sales, "利益成長率%": earnings, "PER": pe,
+            "順位スコア": (float(momentum) + max(roe, 0) / 200 if np.isfinite(roe) else float(momentum)),
+            "日足最終日": str(pd.Timestamp(x.index[-1]).date())}
+
+
+def build_horizon_views(data, value_df, confirmed, owned_codes, all_held_codes, horizon,
+                        budget, daily_status):
+    """枠別に候補と売却対象を分離。余力は他枠との共用を避ける。"""
+    columns = ["コード", "銘柄名", "判定", "理由", "終値", "上昇率%", "ROE%",
+               "売上成長率%", "利益成長率%", "PER", "日足最終日", "株数", "取得単価", "参考S株数"]
+    if not data:
+        return pd.DataFrame(columns=columns), pd.DataFrame(columns=columns), []
+    financial = (value_df.set_index(value_df["コード"].astype(str)).to_dict("index")
+                 if isinstance(value_df, pd.DataFrame) and not value_df.empty else {})
+    fresh = (daily_status.set_index(daily_status["コード"].astype(str))["状態"].to_dict()
+             if isinstance(daily_status, pd.DataFrame) and not daily_status.empty else {})
+    rows, notices = [], []
+    for t, frame in data.items():
+        c = code(t)
+        if c not in VERIFIED_45_CODES and c not in owned_codes:
+            continue
+        is_owned = c in owned_codes
+        if not is_owned and c in all_held_codes:
+            continue
+        if fresh.get(c) != "🟢 当日確定":
+            if is_owned:
+                notices.append(f"{c} {name(c)}：確定日足を確認できず、売り判定を保留")
+            continue
+        h = confirmed.get(c, {}) if is_owned else {}
+        signal = holding_horizon_signal(frame, financial.get(c, {}), horizon,
+                                        safe_float(h.get("avg_price", np.nan)))
+        if signal["判定"] == "データ不足":
+            if is_owned:
+                notices.append(f"{c} {name(c)}：{signal['理由']}")
+            continue
+        rows.append({"コード": c, "銘柄名": name(c), **signal,
+                     "株数": int(h.get("shares", 0)),
+                     "取得単価": h.get("avg_price", np.nan), "参考S株数": 0})
+    held = pd.DataFrame([r for r in rows if r["コード"] in owned_codes], columns=columns)
+    candidates = [r for r in rows if r["判定"] == "買い候補"]
+    candidates.sort(key=lambda r: r["順位スコア"], reverse=True)
+    slots = max(2 - len(owned_codes), 0)
+    reserved = max(int(budget), 0)
+    buys = []
+    for r in candidates[:2]:
+        row = {k: r.get(k) for k in columns}
+        limit_collateral = standard_limit_up_price(r["終値"])
+        allocation = min(reserved, max(int(budget) // 2, 0))
+        shares = (min(99, int(allocation // (r["終値"] * 1.05)),
+                      int(reserved // limit_collateral))
+                  if slots > 0 and limit_collateral > 0 else 0)
+        row["参考S株数"] = shares
+        if shares:
+            slots -= 1
+            reserved -= shares * limit_collateral
+        else:
+            row["判定"] = "見送り"
+            row["理由"] = "保有枠2銘柄または配分余力が不足"
+        buys.append(row)
+    return pd.DataFrame(buys, columns=columns), held, notices
+
+
 # ------------------------------------------------------------
 # Ver.17.4 企業価値AI TOP50 — 株式分割＋適正株価異常値ガード付き比較検証用
 # ------------------------------------------------------------
@@ -3652,7 +3778,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.21")
+st.title("📈 日本株 AI投資アシスタント Ver.17.22")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("固定45銘柄 → %K≤20のGCで買い → DCまたは終値で−7%なら翌朝売り")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -3674,6 +3800,12 @@ with input_right:
         "現物買付余力（円）", min_value=0, max_value=1_000_000_000, step=1000,
         key="sbi_buying_power_yen_v177"
     )
+with st.expander("中期・長期の保有枠を復元", expanded=False):
+    sleeve_profile_file = st.file_uploader(
+        "運用枠割当CSV（中期・長期の保有がある場合）", type=["csv"],
+        key="sleeve_profile_v1722",
+    )
+    st.caption("各タブで割当てた後に保存したCSVを、次回以降の実行時に読み込んでください。")
 
 # 約定履歴 → 保有復元
 confirmed = {}
@@ -3703,7 +3835,41 @@ if trade_files:
             }
         if parse_errors:
             st.warning("一部CSVを読めませんでした：\n- " + "\n- ".join(parse_errors))
-held_codes = list(confirmed.keys())
+all_held_codes = list(confirmed.keys())
+if sleeve_profile_file is not None:
+    profile_bytes = sleeve_profile_file.getvalue()
+    profile_hash = hashlib.sha256(profile_bytes).hexdigest()
+    if st.session_state.get("sleeve_profile_loaded_hash_v1722") != profile_hash:
+        try:
+            profile = pd.read_csv(io.BytesIO(profile_bytes), dtype={"コード": str}, encoding="utf-8-sig",
+                                  keep_default_na=False)
+            if not {"コード", "運用枠"}.issubset(profile.columns):
+                raise ValueError("必要な列は『コード』『運用枠』です")
+            if not profile.empty and {"中期配分余力", "長期配分余力"}.issubset(profile.columns):
+                st.session_state["mid_budget_v1722"] = max(int(_num(profile.iloc[0]["中期配分余力"])), 0)
+                st.session_state["long_budget_v1722"] = max(int(_num(profile.iloc[0]["長期配分余力"])), 0)
+            profile["コード"] = profile["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
+            profile = profile.drop_duplicates("コード", keep="last")
+            st.session_state["mid_owned_codes_v1722"] = profile.loc[
+                profile["運用枠"].eq("中期") & profile["コード"].isin(all_held_codes), "コード"
+            ].tolist()
+            st.session_state["long_owned_codes_v1722"] = profile.loc[
+                profile["運用枠"].eq("長期") & profile["コード"].isin(all_held_codes), "コード"
+            ].tolist()
+            st.session_state["sleeve_profile_loaded_hash_v1722"] = profile_hash
+        except Exception as e:
+            st.error(f"運用枠割当CSVを読めません：{e}")
+# タブ内の割当てウィジェットは後段に置き、選択結果を再実行時にここで反映する。
+mid_owned_codes = set(map(str, st.session_state.get("mid_owned_codes_v1722", []))) & set(all_held_codes)
+long_owned_codes = (set(map(str, st.session_state.get("long_owned_codes_v1722", []))) &
+                    set(all_held_codes)) - mid_owned_codes
+short_confirmed = {c: h for c, h in confirmed.items()
+                   if c not in mid_owned_codes and c not in long_owned_codes}
+held_codes = list(short_confirmed)
+mid_budget = max(int(st.session_state.get("mid_budget_v1722", 0)), 0)
+long_budget = max(int(st.session_state.get("long_budget_v1722", 0)), 0)
+budgets_valid = mid_budget + long_budget <= int(buying_power)
+short_buying_power = max(int(buying_power) - mid_budget - long_budget, 0) if budgets_valid else 0
 
 if int(buying_power) <= 0:
     st.warning("買付余力を入力すると参考S株数を計算できます。")
@@ -3763,7 +3929,7 @@ if run_clicked:
         for c in VERIFIED_45_CODES
     ])
     st.session_state["v177_universe_df"] = universe_df
-    all_codes = list(dict.fromkeys(list(VERIFIED_45_CODES) + [str(c) for c in held_codes]))
+    all_codes = list(dict.fromkeys(list(VERIFIED_45_CODES) + [str(c) for c in all_held_codes]))
     all_tickers = tuple(tickers(",".join(all_codes)))
     with st.spinner(f"{len(all_tickers)}銘柄の日足を一括取得中…"):
         data = batch_stock_data_light(all_tickers, months=15)
@@ -3835,8 +4001,8 @@ if data and true_top50_codes:
         buy_signal_hit = buy_old
         value_judgement = value_judgement_by_code.get(c, "— 未算定")
         overvalued = "割高" in str(value_judgement)
-        new_buy_target = c in true_top50_codes and c not in held_code_set
-        h = confirmed.get(c, {})
+        new_buy_target = c in true_top50_codes and c not in set(all_held_codes)
+        h = short_confirmed.get(c, {})
         shares = int(safe_float(h.get("shares", 0)) or 0)
         avg = safe_float(h.get("avg_price", np.nan))
         pnl_pct = ((px / avg - 1.0) * 100.0) if np.isfinite(avg) and avg > 0 else np.nan
@@ -3891,7 +4057,7 @@ trend_by_code = {str(r["コード"]): r for r in signal_audit_rows}
 if buy_signal_rows:
     buy_signal_df = pd.DataFrame(buy_signal_rows).sort_values(["%K","コード"]).reset_index(drop=True)
     plan = build_fixed45_purchase_plan(
-        buy_signal_df, buying_power, current_assets, held_codes,
+        buy_signal_df, short_buying_power, current_assets, held_codes,
     )
     buy_view = plan.merge(buy_signal_df[["コード","%K","%D","条件"]], on="コード", how="left")
     buy_view = buy_view.rename(columns={"購入株数":"参考S株数","予定購入額":"概算購入額"})
@@ -4310,15 +4476,17 @@ def render_fundamental_lab():
 
 
 # ------------------------------------------------------------
-# シンプル画面 + 目立たない管理者タブ
+# シンプル画面 + 独立した中長期枠 + 目立たない管理者タブ
 # ------------------------------------------------------------
-main_tab, admin_tab, fundamental_tab = st.tabs(["今日の売買", "管理者", "🧪 テスト"])
-with fundamental_tab:
-    render_fundamental_lab()
+main_tab, mid_tab, long_tab, admin_tab = st.tabs(["今日の売買", "中期", "長期", "管理者"])
 with main_tab:
     m1, m2 = st.columns(2)
-    m1.metric("現在保有", f"{len(held_codes)}銘柄")
-    m2.metric("買付余力", f"¥{int(buying_power):,}")
+    m1.metric("短期枠の保有", f"{len(held_codes)}銘柄")
+    m2.metric("短期枠に使える余力", f"¥{int(short_buying_power):,}")
+    if not budgets_valid:
+        st.error("中期と長期への余力配分が現物買付余力を超えています。配分を減らしてください。")
+    if confirmed and not (mid_owned_codes or long_owned_codes) and sleeve_profile_file is None:
+        st.caption("運用枠割当CSVがないため、現在の保有銘柄はすべて短期枠として判定しています。")
     if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
         current_count = int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum())
         total_count = len(daily_bar_status_df)
@@ -4333,7 +4501,7 @@ with main_tab:
         else:
             st.warning("最新日足は取引中または更新待ちです。確定後にもう一度『今日の判定を更新』を押してください。")
     render_current_holdings(current_holdings_rows(
-        confirmed, sell_view, signal_audit_rows, value_top50_df, data
+        short_confirmed, sell_view, signal_audit_rows, value_top50_df, data
     ))
     if run_error:
         st.error(run_error)
@@ -4359,6 +4527,74 @@ with main_tab:
                 buy_display = buy_view[simple_buy_cols].rename(columns={"割安判定": "銘柄判定"}).copy()
                 st.dataframe(buy_display, use_container_width=True, hide_index=True)
         st.caption(f"新規買い：固定45銘柄の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定は参考表示")
+
+def render_horizon_tab(horizon, own_key, budget_key, other_owned):
+    st.subheader(f"{horizon}保有枠")
+    st.caption("固定45銘柄から財務とトレンドで選定。短期のGC/DC判定は使いません。"
+               " この枠の条件は新設した検証段階で、過去の短期成績を引き継ぎません。")
+    st.warning("中長期の収益バックテストは未完了です。財務数値は現時点の参考値で、"
+               "過去の各時点の財務に置き換えて検証した成績ではありません。")
+    available = [c for c in all_held_codes if c not in other_owned]
+    if own_key in st.session_state:
+        st.session_state[own_key] = [c for c in st.session_state[own_key] if c in available]
+    selected = st.multiselect(
+        "この枠で管理する保有銘柄（約定履歴CSVから選択）", available,
+        format_func=lambda c: f"{c} {name(c)}", key=own_key,
+    )
+    budget_input = st.number_input(
+        "この枠に配分する現物買付余力（円）", min_value=0,
+        max_value=1_000_000_000, step=1000, key=budget_key,
+    )
+    profile_mid = set(st.session_state.get("mid_owned_codes_v1722", []))
+    profile_long = set(st.session_state.get("long_owned_codes_v1722", [])) - profile_mid
+    profile_rows = [{"コード": "", "運用枠": "設定", "中期配分余力": mid_budget,
+                     "長期配分余力": long_budget}]
+    profile_rows += [{"コード": c, "運用枠": "中期" if c in profile_mid else
+                      "長期" if c in profile_long else "短期",
+                      "中期配分余力": mid_budget, "長期配分余力": long_budget}
+                     for c in all_held_codes]
+    st.download_button(
+        "運用枠割当CSVを保存", pd.DataFrame(profile_rows).to_csv(index=False, encoding="utf-8-sig"),
+        "holding_sleeve_assignments.csv", "text/csv", key=f"{horizon}_sleeve_profile_download",
+    )
+    if mid_budget + long_budget > int(buying_power):
+        st.error("中期と長期の配分合計が買付余力を超えています。買いは表示しません。")
+    st.caption(f"配分：短期 {short_buying_power:,}円 / 中期 {mid_budget:,}円 / 長期 {long_budget:,}円。"
+               " 銘柄の割当てと配分を変更すると、各枠の判定も更新されます。")
+    if not data:
+        st.info("先に『今日の判定を更新』を押してください。")
+        return
+    buys, holdings_view, notices = build_horizon_views(
+        data, value_top50_df, confirmed, set(selected), set(all_held_codes),
+        horizon, int(budget_input) if budgets_valid else 0, daily_bar_status_df,
+    )
+    for notice in notices:
+        st.warning(notice)
+    st.subheader("保有銘柄の判定")
+    if holdings_view.empty:
+        st.info("この枠の保有銘柄はありません。")
+    else:
+        show = holdings_view.drop(columns=["参考S株数"])
+        st.dataframe(show, use_container_width=True, hide_index=True)
+    st.subheader("新規買い候補")
+    if buys.empty:
+        st.info("条件を満たす買い候補はありません。")
+    else:
+        st.dataframe(buys, use_container_width=True, hide_index=True)
+        st.caption("参考S株数は枠の配分余力と値幅制限を考慮した上限。実際の発注前にSBIの余力と約定価格を確認してください。")
+    if horizon == "中期":
+        st.caption("買い：50日線>150日線、60日上昇3〜40%、ROE≥8%、売上成長≥0%、PER≤45。"
+                   " 売り：終値で取得単価−10%、または調整後終値が50日線を2日連続下回る。"
+                   " 売却は判定の翌営業日を想定し、損失率は約定価格で変動します。")
+    else:
+        st.caption("買い：上向き200日線より上、126日上昇0〜80%、ROE≥10%、売上・利益成長≥0%、PER≤35。"
+                   " 売り：終値で取得単価−18%、ROE<5%、または調整後終値が200日線を5日連続下回る。"
+                   " 売却は判定の翌営業日を想定し、損失率は約定価格で変動します。")
+
+with mid_tab:
+    render_horizon_tab("中期", "mid_owned_codes_v1722", "mid_budget_v1722", long_owned_codes)
+with long_tab:
+    render_horizon_tab("長期", "long_owned_codes_v1722", "long_budget_v1722", mid_owned_codes)
 
 with admin_tab:
     st.caption("比較・検証用。通常の朝はここを見る必要はありません。")
@@ -4649,18 +4885,28 @@ try:
     with ZipFile(zip_buf,"w") as zf:
         settings_df=pd.DataFrame([{
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
+            "短期配分余力":short_buying_power,"中期配分余力":mid_budget,"長期配分余力":long_budget,
+            "余力配分有効":budgets_valid,"短期保有件数":len(held_codes),
+            "中期保有件数":len(mid_owned_codes),"長期保有件数":len(long_owned_codes),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":0,
             "固定45監視件数":len(VERIFIED_45_CODES),
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "新規BUY対象":"検証済み固定45銘柄の未保有株のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
             "割高の新規BUY除外":False,
-            "SELL条件":"全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%",
+            "SELL条件":"短期枠の保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%",
             "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":True,
             "短期反転フィルター":bool(churn_filter),
             "トレンド振れ幅フィルター実売買":bool(quality_mode),
         }])
         zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
+        sleeve_rows = [{"コード":"", "運用枠":"設定", "中期配分余力":mid_budget,
+                        "長期配分余力":long_budget}]
+        sleeve_rows += [{"コード":c,"運用枠": "中期" if c in mid_owned_codes else
+                         "長期" if c in long_owned_codes else "短期",
+                         "中期配分余力":mid_budget,"長期配分余力":long_budget}
+                        for c in all_held_codes]
+        zf.writestr("holding_sleeve_assignments.csv",pd.DataFrame(sleeve_rows).to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(universe_df,pd.DataFrame):
             zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(value_top50_df,pd.DataFrame):
@@ -4674,7 +4920,10 @@ try:
         if not sbi_trades_df.empty:
             zf.writestr("sbi_execution_history.csv",sbi_trades_df.to_csv(index=False,encoding="utf-8-sig"))
         if confirmed:
-            zf.writestr("current_holdings.csv",pd.DataFrame([{"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]} for c,v in confirmed.items()]).to_csv(index=False,encoding="utf-8-sig"))
+            zf.writestr("current_holdings.csv",pd.DataFrame([{
+                "コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"],
+                "運用枠": "中期" if c in mid_owned_codes else "長期" if c in long_owned_codes else "短期",
+            } for c,v in confirmed.items()]).to_csv(index=False,encoding="utf-8-sig"))
         if not sbi_warning_df.empty:
             zf.writestr("sbi_history_warnings.csv",sbi_warning_df.to_csv(index=False,encoding="utf-8-sig"))
         buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","%K","%D","AI_TOP50スコア","割安判定","買付可否"]
@@ -4684,6 +4933,17 @@ try:
             buy_export = pd.DataFrame(columns=buy_cols_default)
         zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
         zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
+        for horizon, owned, allocated, label in [
+            ("中期", mid_owned_codes, mid_budget, "mid"),
+            ("長期", long_owned_codes, long_budget, "long"),
+        ]:
+            sleeve_buys, sleeve_holdings, sleeve_notices = build_horizon_views(
+                data, value_top50_df, confirmed, owned, set(all_held_codes), horizon,
+                allocated if budgets_valid else 0, daily_bar_status_df,
+            )
+            zf.writestr(f"{label}_buy_candidates.csv", sleeve_buys.to_csv(index=False,encoding="utf-8-sig"))
+            zf.writestr(f"{label}_holdings.csv", sleeve_holdings.to_csv(index=False,encoding="utf-8-sig"))
+            zf.writestr(f"{label}_data_warnings.csv", pd.DataFrame({"警告":sleeve_notices}).to_csv(index=False,encoding="utf-8-sig"))
         compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()
         zf.writestr("indicator_compare_candidates.csv", compare_export.to_csv(index=False,encoding="utf-8-sig"))
         surge_export = surge_top50_df.copy() if isinstance(surge_top50_df, pd.DataFrame) else pd.DataFrame()

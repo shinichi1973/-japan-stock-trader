@@ -3846,9 +3846,331 @@ sell_view = add_research_judgements_first(sell_view, surge_top50_df, value_top50
 indicator_compare_df = add_research_judgements_first(indicator_compare_df, surge_top50_df, value_top50_df)
 
 # ------------------------------------------------------------
+# 独立研究: 公表日時時点の財務情報だけを用いる2年バックテスト
+# 現行の売買判定・保有・注文処理へは接続しない。
+# ------------------------------------------------------------
+def _fl_num(value):
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else np.nan
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _fl_history_from_zip(upload):
+    with ZipFile(io.BytesIO(upload)) as zf:
+        if "backtest_history_5y.csv" not in zf.namelist():
+            raise ValueError("backtest_history_5y.csv がZIP内にありません")
+        df = pd.read_csv(zf.open("backtest_history_5y.csv"), low_memory=False)
+    required = {"日付", "コード", "Open", "High", "Low", "Close", "Adj Close"}
+    if not required.issubset(df.columns):
+        raise ValueError("日足CSVに必要な列がありません: " + ", ".join(sorted(required - set(df.columns))))
+    df["date"] = pd.to_datetime(df["日付"], errors="coerce").dt.normalize()
+    df["code"] = df["コード"].astype(str).str.replace(r"\.0$", "", regex=True).str[:4]
+    for c in ["Open", "High", "Low", "Close", "Adj Close"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "Open", "High", "Low", "Close", "Adj Close"])
+    df = df[(df["Close"] > 0) & (df["Adj Close"] > 0)].copy()
+    ratio = df["Adj Close"] / df["Close"]
+    for c in ["Open", "High", "Low", "Close"]:
+        df["a" + c] = df[c] * ratio
+    return df.sort_values(["code", "date"]).drop_duplicates(["code", "date"], keep="last")
+
+
+def _fl_fetch_worker(state, key, codes):
+    # 無料プラン全体の5回/分を超えない。既存の画面処理と併用しない。
+    last_call = 0.0
+    try:
+        for code4 in codes:
+            if state["stop"]:
+                break
+            rows = []
+            page = None
+            while True:
+                interval = 12.5 - (time.monotonic() - last_call)
+                if interval > 0:
+                    time.sleep(interval)
+                params = {"code": code4}
+                if page:
+                    params["pagination_key"] = page
+                last_call = time.monotonic()
+                try:
+                    response = requests.get(
+                        "https://api.jquants.com/v2/fins/summary",
+                        headers={"x-api-key": key}, params=params, timeout=30,
+                    )
+                    if response.status_code in (401, 403):
+                        state["fatal"] = "J-Quants認証エラー。APIキーとプランを確認してください"
+                        state["stop"] = True
+                        break
+                    if response.status_code == 429:
+                        time.sleep(65)
+                        continue
+                    response.raise_for_status()
+                    body = response.json()
+                    rows.extend(body.get("data", []))
+                    next_page = body.get("pagination_key")
+                    if not next_page or next_page == page:
+                        break
+                    page = next_page
+                except Exception as exc:
+                    state["errors"][code4] = str(exc)[:180]
+                    break
+            if rows:
+                state["rows"][code4] = rows
+            state["done"].add(code4)
+    except Exception as exc:
+        state["fatal"] = str(exc)[:180]
+    finally:
+        state["running"] = False
+
+
+def _fl_events(state):
+    records = []
+    for code4, rows in state["rows"].items():
+        for r in rows:
+            d = pd.to_datetime(r.get("DiscDate"), errors="coerce")
+            if pd.isna(d):
+                continue
+            # 当日の場中開示も翌営業日から利用可能にする。
+            records.append({"code": code4, "disc_date": d.normalize(),
+                            "disc_time": str(r.get("DiscTime", "")),
+                            "disc_no": str(r.get("DiscNo", "")),
+                            "fy_end": str(r.get("CurFYEn", "")),
+                            "eps": _fl_num(r.get("FEPS")),
+                            "bps": _fl_num(r.get("BPS")),
+                            "roe": _fl_num(r.get("ROE")),
+                            "sales": _fl_num(r.get("Sales")),
+                            "forecast_sales": _fl_num(r.get("FSales"))})
+    if not records:
+        return pd.DataFrame()
+    out = pd.DataFrame(records).sort_values(["code", "disc_date", "disc_time", "disc_no"])
+    # 同一会計年度の予想値が空欄の開示で、以前の予想値を消さない。
+    out["eps"] = out.groupby(["code", "fy_end"])["eps"].ffill()
+    for col in ["bps", "roe"]:
+        out[col] = out.groupby("code")[col].ffill()
+    return out
+
+
+def _fl_backtest(prices, events, discount=0.25, fee_bps=10.0):
+    if events.empty:
+        raise ValueError("財務履歴がありません")
+    # 無料プランの開示日範囲だけを対象とし、全銘柄共通の2年窓に限定。
+    cutoff = pd.Timestamp(tokyo_now().date()) - pd.Timedelta(weeks=12)
+    end = min(cutoff, prices["date"].max())
+    start = max(events["disc_date"].min(), end - pd.DateOffset(years=2))
+    if start >= end:
+        raise ValueError("財務履歴と日足の検証期間が重なりません")
+    price_by_code = {}
+    for code4, p in prices.groupby("code", sort=False):
+        p = p.sort_values("date").copy()
+        p["ma50"] = p["aClose"].rolling(50, min_periods=50).mean()
+        p["ma200"] = p["aClose"].rolling(200, min_periods=200).mean()
+        price_by_code[code4] = p.reset_index(drop=True)
+    timeline = {}
+    available = []
+    for code4, e in events.groupby("code", sort=False):
+        if code4 not in price_by_code:
+            continue
+        p = price_by_code[code4]
+        e = e.sort_values(["disc_date", "disc_time", "disc_no"])
+        erows = e.to_dict("records")
+        pointer = 0
+        current = None
+        for i, row in p.iterrows():
+            day = row["date"]
+            if day < start or day > end:
+                continue
+            while pointer < len(erows) and erows[pointer]["disc_date"] < day:
+                current = erows[pointer]
+                pointer += 1
+            if current is None or (day - current["disc_date"]).days > 200:
+                continue
+            eps, bps, roe = (current[k] for k in ("eps", "bps", "roe"))
+            if not all(np.isfinite(x) and x > 0 for x in (eps, bps, roe)):
+                continue
+            # J-QuantsのROEは小数表記の場合があるため正規化。
+            roe_ratio = roe / 100 if roe > 1 else roe
+            if not 0.03 <= roe_ratio <= 0.40:
+                continue
+            # 事前に固定した試験用評価式。EPS×(8～18倍)とBPS×(0.7～2倍)の平均。
+            pe = min(18., max(8., 10. + (roe_ratio - .08) * 40.))
+            pb = min(2., max(.7, .8 + roe_ratio * 5.))
+            # 調整済み日足の株式分割単位に揃える。
+            ratio = row["Adj Close"] / row["Close"]
+            fair = (eps * pe + bps * pb) * .5 * ratio
+            if not np.isfinite(fair) or fair <= 0:
+                continue
+            available.append((code4, day))
+            if (i + 1 >= len(p) or not np.isfinite(row["ma200"]) or
+                row["aClose"] <= row["ma50"] or row["ma50"] <= row["ma200"] or
+                row["aClose"] > fair * (1 - discount)):
+                continue
+            nxt = p.iloc[i + 1]
+            if nxt["date"] > end or nxt["aOpen"] <= 0:
+                continue
+            timeline.setdefault(nxt["date"], []).append(
+                (code4, float(fair), float(row["aClose"]), str(current["disc_date"].date()),
+                 float(nxt["aOpen"]), float(row["ma50"])))
+    dates = sorted(prices.loc[prices["date"].between(start, end), "date"].unique())
+    positions, trades, curve = {}, [], []
+    cash, initial = 600000., 600000.
+    last_close = {}
+    fee = fee_bps / 10000.
+    for day in dates:
+        day = pd.Timestamp(day)
+        for code4 in list(positions):
+            p = price_by_code[code4]
+            match = p[p["date"].eq(day)]
+            if match.empty:
+                continue
+            bar = match.iloc[0]
+            pos = positions[code4]
+            last_close[code4] = float(bar["aClose"])
+            stop, target = pos["entry"] * .93, pos["target"]
+            # 同一日に両方触れた場合は損切りを先に約定とみなす。
+            if bar["aOpen"] <= stop:
+                price, reason = float(bar["aOpen"]), "損切り（ギャップ）"
+            elif bar["aLow"] <= stop:
+                price, reason = stop, "損切り"
+            elif bar["aOpen"] >= target:
+                price, reason = float(bar["aOpen"]), "適正株価（ギャップ）"
+            elif bar["aHigh"] >= target:
+                price, reason = target, "適正株価"
+            else:
+                continue
+            proceeds = pos["shares"] * price * (1 - fee)
+            cash += proceeds
+            trades.append({"コード": code4, "買い日":pos["day"].date(),
+                           "売り日":day.date(), "買値":pos["entry"], "売値":price,
+                           "適正株価":target, "株数":pos["shares"], "売り理由":reason,
+                           "損益円":round(proceeds - pos["cost"], 2),
+                           "損益率%":round((proceeds / pos["cost"] - 1) * 100, 2),
+                           "開示日":pos["disc_date"]})
+            del positions[code4]
+        for code4, target, signal_close, disc_date, entry, _ in sorted(
+            timeline.get(day, []), key=lambda x: (x[2] / x[1], x[0])
+        ):
+            if code4 in positions or len(positions) >= 5 or entry >= target * (1 - discount):
+                continue
+            equity = cash + sum(v["shares"] * last_close.get(c, v["entry"])
+                                for c, v in positions.items())
+            budget = min(cash, equity * .20)
+            shares = int(budget / (entry * (1 + fee)))
+            if shares < 1:
+                continue
+            cost = shares * entry * (1 + fee)
+            cash -= cost
+            positions[code4] = {"entry":entry, "target":target, "shares":shares,
+                                "cost":cost, "day":day, "disc_date":disc_date}
+            last_close[code4] = entry
+        equity = cash + sum(v["shares"] * last_close.get(c, v["entry"])
+                            for c, v in positions.items())
+        curve.append({"日付":day.date(), "総資産":round(equity, 2), "現金":round(cash, 2)})
+    tdf, edf = pd.DataFrame(trades), pd.DataFrame(curve)
+    if edf.empty:
+        raise ValueError("株価と財務情報に共通の営業日がありません")
+    peak = edf["総資産"].cummax()
+    closed = len(tdf)
+    gains = tdf["損益円"].clip(lower=0).sum() if closed else 0
+    losses = -tdf["損益円"].clip(upper=0).sum() if closed else 0
+    summary = {"開始日":str(start.date()), "終了日":str(end.date()),
+               "財務取得銘柄数":events["code"].nunique(),
+               "評価可能銘柄数":len({x[0] for x in available}),
+               "決済件数":closed, "未決済件数":len(positions),
+               "最終資産円":round(float(edf["総資産"].iloc[-1])),
+               "損益率%":round((float(edf["総資産"].iloc[-1]) / initial - 1) * 100, 2),
+               "最大DD%":round(float((edf["総資産"] / peak - 1).min() * 100), 2),
+               "勝率%":round(float((tdf["損益円"] > 0).mean() * 100), 2) if closed else np.nan,
+               "PF":round(float(gains / losses), 2) if losses else np.nan}
+    return summary, tdf, edf
+
+
+def render_fundamental_lab():
+    st.subheader("🧪 ファンダメンタル単独・2年バックテスト")
+    st.caption("研究専用です。今日の買い・売り判定には反映しません。ストキャスティクスは使いません。")
+    st.info("無料プランは過去2年・12週間遅延です。財務履歴の取得には対象銘柄数に応じて時間がかかります。")
+    st.caption("試験用の適正株価＝予想EPS×ROE連動PERとBPS×ROE連動PBRの平均。25%割安で上昇トレンドなら翌営業日寄付で買い、買った時点の適正株価または-7%に触れたら売ります。上場廃止銘柄は含まれません。")
+    source = st.file_uploader("5年日足ZIP（管理者タブで出力したファイル）", type="zip", key="fl_zip")
+    key = jquants_api_key()
+    if not key:
+        st.error("JQUANTS_API_KEY がSecretsにありません。")
+        return
+    if source is None:
+        st.caption("管理者 → 企業価値 → バックテスト用5年日足データからZIPを保存して読み込んでください。")
+        return
+    try:
+        raw = source.getvalue()
+        prices = _fl_history_from_zip(raw)
+    except Exception as exc:
+        st.error(f"日足ZIPを読めません: {exc}")
+        return
+    codes = sorted(prices["code"].unique())
+    st.caption(f"日足: {len(codes)}銘柄。現時点の母集団を遡る検証であり、過去に上場廃止した銘柄は含まれません。")
+    if "fl_state" not in st.session_state or st.session_state.fl_state["zip_name"] != source.name:
+        st.session_state.fl_state = {"zip_name":source.name, "rows":{}, "errors":{},
+                                     "done":set(), "running":False, "stop":False, "fatal":""}
+        st.session_state.pop("fl_result", None)
+    state = st.session_state.fl_state
+    if st.button("財務履歴の取得を開始・再開", disabled=state["running"], key="fl_start"):
+        state["stop"] = False
+        state["fatal"] = ""
+        for c in list(state["errors"]):
+            state["done"].discard(c)
+        state["errors"].clear()
+        st.session_state.pop("fl_result", None)
+        remaining = [c for c in codes if c not in state["done"]]
+        if remaining:
+            state["running"] = True
+            threading.Thread(target=_fl_fetch_worker, args=(state, key, remaining), daemon=True).start()
+    if st.button("取得を停止", disabled=not state["running"], key="fl_stop"):
+        state["stop"] = True
+    st.progress(len(state["done"]) / max(1, len(codes)),
+                text=f"財務取得 {len(state['done'])}/{len(codes)}銘柄、取得成功 {len(state['rows'])}銘柄")
+    if state["running"]:
+        st.caption("この画面を開いたまま待ち、進捗を確認する場合は『進捗を更新』を押してください。")
+        st.button("進捗を更新", key="fl_refresh")
+    if state["fatal"]:
+        st.error(state["fatal"])
+    if state["errors"]:
+        with st.expander(f"取得エラー {len(state['errors'])}銘柄"):
+            st.dataframe(pd.DataFrame([{"コード":c,"理由":v} for c,v in state["errors"].items()]))
+    if not state["rows"]:
+        return
+    events = _fl_events(state)
+    if not events.empty:
+        st.download_button("取得済み財務履歴CSVを保存", events.to_csv(index=False).encode("utf-8-sig"),
+                           "fundamental_history_observed.csv", "text/csv", key="fl_export")
+    discount = st.slider("買い時の必要割安率", 10, 50, 25, 5, format="%d%%", key="fl_discount")
+    fee_bps = st.number_input("片道の売買コスト（bps）", 0., 100., 10., 1., key="fl_fee")
+    if st.button("取得済み銘柄でバックテスト", key="fl_run"):
+        try:
+            summary, trades, curve = _fl_backtest(prices, events, discount/100, fee_bps)
+            st.session_state.fl_result = (summary, trades, curve, len(state["done"]) == len(codes))
+        except Exception as exc:
+            st.error(f"バックテストを実行できません: {exc}")
+    if "fl_result" in st.session_state:
+        summary, trades, curve, complete = st.session_state.fl_result
+        st.warning("一部銘柄のみの途中結果です。全銘柄の比較には使わないでください。" if not complete else
+                   "現在の母集団による研究結果です。上場廃止銘柄の欠落と株式分割の近似調整に注意してください。")
+        st.dataframe(pd.DataFrame([summary]), use_container_width=True, hide_index=True)
+        st.line_chart(curve.set_index("日付")["総資産"])
+        st.dataframe(trades, use_container_width=True, hide_index=True)
+        buf = io.BytesIO()
+        with ZipFile(buf, "w") as zf:
+            zf.writestr("summary.csv", pd.DataFrame([summary]).to_csv(index=False, encoding="utf-8-sig"))
+            zf.writestr("trades.csv", trades.to_csv(index=False, encoding="utf-8-sig"))
+            zf.writestr("equity.csv", curve.to_csv(index=False, encoding="utf-8-sig"))
+            zf.writestr("fundamentals.csv", events.to_csv(index=False, encoding="utf-8-sig"))
+        st.download_button("検証結果ZIP", buf.getvalue(), "fundamental_lab_2y.zip", "application/zip", key="fl_results")
+
+
+# ------------------------------------------------------------
 # シンプル画面 + 目立たない管理者タブ
 # ------------------------------------------------------------
-main_tab, admin_tab = st.tabs(["今日の売買", "管理者"])
+main_tab, admin_tab, fundamental_tab = st.tabs(["今日の売買", "管理者", "🧪 テスト"])
+with fundamental_tab:
+    render_fundamental_lab()
 with main_tab:
     m1, m2 = st.columns(2)
     m1.metric("現在保有", f"{len(held_codes)}銘柄")
@@ -4220,55 +4542,4 @@ try:
         if not sbi_warning_df.empty:
             zf.writestr("sbi_history_warnings.csv",sbi_warning_df.to_csv(index=False,encoding="utf-8-sig"))
         buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","%K","%D","AI_TOP50スコア","割安判定","買付可否"]
-        buy_export=buy_view.copy() if isinstance(buy_view,pd.DataFrame) and not buy_view.empty else pd.DataFrame(columns=buy_cols_default)
-        zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
-        zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
-        compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()
-        zf.writestr("indicator_compare_candidates.csv", compare_export.to_csv(index=False,encoding="utf-8-sig"))
-        surge_export = surge_top50_df.copy() if isinstance(surge_top50_df, pd.DataFrame) else pd.DataFrame()
-        zf.writestr("surge_prediction_top50.csv", surge_export.to_csv(index=False,encoding="utf-8-sig"))
-        surge_summary = pd.DataFrame([{
-            "生成日時": st.session_state.get("v177_generated_at",""),
-            "対象": "企業価値AI TOP50のみ",
-            "強い急騰予兆_70点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 70).sum()),
-            "急騰予兆_55点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55).sum()),
-            "変化検知_40点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 40).sum()),
-            "予兆55点以上かつStoch_BUY": int(((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55) & surge_export.get("Stoch_BUY", pd.Series(False, index=surge_export.index)).fillna(False).astype(bool)).sum()),
-            "株価2000円以上除外": False,
-            "ニュース加点": False,
-            "実売買へ影響": False,
-        }])
-        zf.writestr("surge_prediction_summary.csv", surge_summary.to_csv(index=False,encoding="utf-8-sig"))
-        compare_summary_row = {
-            "生成日時": st.session_state.get("v177_generated_at",""),
-            "実売買方式": "Stoch 14,3,3 / %K<=20 GC",
-            "研究_RSI5": "RSI(5) 15以下から15上抜け",
-            "研究_BB20": "BB20 -2σ外から内側復帰",
-            "Stoch_BUY件数": int(compare_export["Stoch_BUY"].sum()) if not compare_export.empty and "Stoch_BUY" in compare_export else 0,
-            "RSI5_BUY件数": int(compare_export["RSI5_BUY"].sum()) if not compare_export.empty and "RSI5_BUY" in compare_export else 0,
-            "BB20_BUY件数": int(compare_export["BB20_BUY"].sum()) if not compare_export.empty and "BB20_BUY" in compare_export else 0,
-            "2方式以上一致件数": int((pd.to_numeric(compare_export["一致数"], errors="coerce") >= 2).sum()) if not compare_export.empty and "一致数" in compare_export else 0,
-            "実売買へ影響": False,
-        }
-        compare_summary = pd.DataFrame([compare_summary_row])
-        zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
-        status_df=pd.DataFrame([{
-            "本物TOP50モード":True,"母集団最低200銘柄ガード":True,
-            "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
-            "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
-            "当日確定日足件数":int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum()) if isinstance(daily_bar_status_df,pd.DataFrame) and not daily_bar_status_df.empty else 0,
-            "TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "一次選抜_流動性重み":0.45,"一次選抜_トレンド重み":0.30,"一次選抜_安定性重み":0.25,
-            "OOS検証済み":True,"OOS_PF参考":1.89,"5年通算PF参考":2.09,
-            "BUY候補件数":len(buy_export),"割高除外件数":len(overvalued_buy_exclusions_df),
-            "企業価値未算定件数":value_unrated_count,
-            "SELL候補件数":len(sell_view),"エラー":run_error,
-            "生成日時":st.session_state.get("v177_generated_at","")
-        }])
-        zf.writestr("value_ai_status.csv",status_df.to_csv(index=False,encoding="utf-8-sig"))
-    zip_buf.seek(0)
-    st.download_button("📦 全処理結果ZIP",data=zip_buf.getvalue(),file_name="ver17_all_analysis.zip",mime="application/zip",use_container_width=True,key="v177_zip")
-except Exception as e:
-    st.warning(f"ZIP作成エラー: {e}")
-
-st.caption("売買判断補助です。自動発注は行いません。")
+        buy_export=buy_view.copy() if isinstance(buy_view,pd.DataFrame) and not buy_view.empty else 

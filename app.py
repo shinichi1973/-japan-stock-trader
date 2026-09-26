@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.23.1
-# BUILD: VER17-23-1-AI-RESEARCH-PL-SPLIT-20260926
+# 日本株 AI投資アシスタント Ver.17.23.2
+# BUILD: VER17-23-2-SHORT-ONLY-20260926
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.23.1",
+    page_title="日本株 AI投資アシスタント Ver.17.23.2",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.23.1 FIXED45 STOCH + MID LONG + AI RESEARCH"
-BUILD = "VER17-23-1-AI-RESEARCH-PL-SPLIT-20260926"
+VERSION = "17.23.2 FIXED45 STOCH SHORT ONLY"
+BUILD = "VER17-23-2-SHORT-ONLY-20260926"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3953,7 +3953,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.23.1")
+st.title("📈 日本株 AI投資アシスタント Ver.17.23.2")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("固定45銘柄 → %K≤20のGCで買い → DCまたは終値で−7%なら翌朝売り")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -3975,13 +3975,6 @@ with input_right:
         "現物買付余力（円）", min_value=0, max_value=1_000_000_000, step=1000,
         key="sbi_buying_power_yen_v177"
     )
-with st.expander("中期・長期の保有枠を復元", expanded=False):
-    sleeve_profile_file = st.file_uploader(
-        "運用枠割当CSV（中期・長期の保有がある場合）", type=["csv"],
-        key="sleeve_profile_v1722",
-    )
-    st.caption("各タブで割当てた後に保存したCSVを、次回以降の実行時に読み込んでください。")
-
 # 約定履歴 → 保有復元
 confirmed = {}
 sbi_trades_df = pd.DataFrame()
@@ -4011,41 +4004,9 @@ if trade_files:
         if parse_errors:
             st.warning("一部CSVを読めませんでした：\n- " + "\n- ".join(parse_errors))
 all_held_codes = list(confirmed.keys())
-if sleeve_profile_file is not None:
-    profile_bytes = sleeve_profile_file.getvalue()
-    profile_hash = hashlib.sha256(profile_bytes).hexdigest()
-    if st.session_state.get("sleeve_profile_loaded_hash_v1722") != profile_hash:
-        try:
-            profile = pd.read_csv(io.BytesIO(profile_bytes), dtype={"コード": str}, encoding="utf-8-sig",
-                                  keep_default_na=False)
-            if not {"コード", "運用枠"}.issubset(profile.columns):
-                raise ValueError("必要な列は『コード』『運用枠』です")
-            if not profile.empty and {"中期配分余力", "長期配分余力"}.issubset(profile.columns):
-                st.session_state["mid_budget_v1722"] = max(int(_num(profile.iloc[0]["中期配分余力"])), 0)
-                st.session_state["long_budget_v1722"] = max(int(_num(profile.iloc[0]["長期配分余力"])), 0)
-            profile["コード"] = profile["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
-            profile = profile.drop_duplicates("コード", keep="last")
-            st.session_state["mid_owned_codes_v1722"] = profile.loc[
-                profile["運用枠"].eq("中期") & profile["コード"].isin(all_held_codes), "コード"
-            ].tolist()
-            st.session_state["long_owned_codes_v1722"] = profile.loc[
-                profile["運用枠"].eq("長期") & profile["コード"].isin(all_held_codes), "コード"
-            ].tolist()
-            st.session_state["sleeve_profile_loaded_hash_v1722"] = profile_hash
-        except Exception as e:
-            st.error(f"運用枠割当CSVを読めません：{e}")
-# タブ内の割当てウィジェットは後段に置き、選択結果を再実行時にここで反映する。
-mid_owned_codes = set(map(str, st.session_state.get("mid_owned_codes_v1722", []))) & set(all_held_codes)
-long_owned_codes = (set(map(str, st.session_state.get("long_owned_codes_v1722", []))) &
-                    set(all_held_codes)) - mid_owned_codes
-short_confirmed = {c: h for c, h in confirmed.items()
-                   if c not in mid_owned_codes and c not in long_owned_codes}
-held_codes = list(short_confirmed)
-mid_budget = max(int(st.session_state.get("mid_budget_v1722", 0)), 0)
-long_budget = max(int(st.session_state.get("long_budget_v1722", 0)), 0)
-budgets_valid = mid_budget + long_budget <= int(buying_power)
-short_buying_power = max(int(buying_power) - mid_budget - long_budget, 0) if budgets_valid else 0
-
+short_confirmed = confirmed
+held_codes = all_held_codes
+short_buying_power = int(buying_power)
 if int(buying_power) <= 0:
     st.warning("買付余力を入力すると参考S株数を計算できます。")
 if not sbi_warning_df.empty:
@@ -4651,19 +4612,13 @@ def render_fundamental_lab():
 
 
 # ------------------------------------------------------------
-# シンプル画面 + 独立した中長期枠 + 目立たない管理者タブ
+# 短期売買と管理者タブ
 # ------------------------------------------------------------
-main_tab, mid_tab, long_tab, ai_tab, admin_tab = st.tabs(
-    ["今日の売買", "中期", "長期", "AI最強ロジック", "管理者"]
-)
+main_tab, admin_tab = st.tabs(["今日の売買", "管理者"])
 with main_tab:
     m1, m2 = st.columns(2)
-    m1.metric("短期枠の保有", f"{len(held_codes)}銘柄")
-    m2.metric("短期枠に使える余力", f"¥{int(short_buying_power):,}")
-    if not budgets_valid:
-        st.error("中期と長期への余力配分が現物買付余力を超えています。配分を減らしてください。")
-    if confirmed and not (mid_owned_codes or long_owned_codes) and sleeve_profile_file is None:
-        st.caption("運用枠割当CSVがないため、現在の保有銘柄はすべて短期枠として判定しています。")
+    m1.metric("保有", f"{len(held_codes)}銘柄")
+    m2.metric("買付余力", f"¥{int(short_buying_power):,}")
     if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
         current_count = int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum())
         total_count = len(daily_bar_status_df)
@@ -4704,160 +4659,6 @@ with main_tab:
                 buy_display = buy_view[simple_buy_cols].rename(columns={"割安判定": "銘柄判定"}).copy()
                 st.dataframe(buy_display, use_container_width=True, hide_index=True)
         st.caption(f"新規買い：固定45銘柄の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定は参考表示")
-
-def render_horizon_tab(horizon, own_key, budget_key, other_owned):
-    st.subheader(f"{horizon}保有枠")
-    st.caption("固定45銘柄から財務とトレンドで選定。短期のGC/DC判定は使いません。"
-               " この枠の条件は新設した検証段階で、過去の短期成績を引き継ぎません。")
-    st.warning("中長期の収益バックテストは未完了です。財務数値は現時点の参考値で、"
-               "過去の各時点の財務に置き換えて検証した成績ではありません。")
-    available = [c for c in all_held_codes if c not in other_owned]
-    if own_key in st.session_state:
-        st.session_state[own_key] = [c for c in st.session_state[own_key] if c in available]
-    selected = st.multiselect(
-        "この枠で管理する保有銘柄（約定履歴CSVから選択）", available,
-        format_func=lambda c: f"{c} {name(c)}", key=own_key,
-    )
-    budget_input = st.number_input(
-        "この枠に配分する現物買付余力（円）", min_value=0,
-        max_value=1_000_000_000, step=1000, key=budget_key,
-    )
-    profile_mid = set(st.session_state.get("mid_owned_codes_v1722", []))
-    profile_long = set(st.session_state.get("long_owned_codes_v1722", [])) - profile_mid
-    profile_rows = [{"コード": "", "運用枠": "設定", "中期配分余力": mid_budget,
-                     "長期配分余力": long_budget}]
-    profile_rows += [{"コード": c, "運用枠": "中期" if c in profile_mid else
-                      "長期" if c in profile_long else "短期",
-                      "中期配分余力": mid_budget, "長期配分余力": long_budget}
-                     for c in all_held_codes]
-    st.download_button(
-        "運用枠割当CSVを保存", pd.DataFrame(profile_rows).to_csv(index=False, encoding="utf-8-sig"),
-        "holding_sleeve_assignments.csv", "text/csv", key=f"{horizon}_sleeve_profile_download",
-    )
-    if mid_budget + long_budget > int(buying_power):
-        st.error("中期と長期の配分合計が買付余力を超えています。買いは表示しません。")
-    st.caption(f"配分：短期 {short_buying_power:,}円 / 中期 {mid_budget:,}円 / 長期 {long_budget:,}円。"
-               " 銘柄の割当てと配分を変更すると、各枠の判定も更新されます。")
-    if not data:
-        st.info("先に『今日の判定を更新』を押してください。")
-        return
-    buys, holdings_view, notices = build_horizon_views(
-        data, value_top50_df, confirmed, set(selected), set(all_held_codes),
-        horizon, int(budget_input) if budgets_valid else 0, daily_bar_status_df,
-    )
-    for notice in notices:
-        st.warning(notice)
-    st.subheader("保有銘柄の判定")
-    if holdings_view.empty:
-        st.info("この枠の保有銘柄はありません。")
-    else:
-        show = holdings_view.drop(columns=["参考S株数"])
-        st.dataframe(show, use_container_width=True, hide_index=True)
-    st.subheader("新規買い候補")
-    if buys.empty:
-        st.info("条件を満たす買い候補はありません。")
-    else:
-        st.dataframe(buys, use_container_width=True, hide_index=True)
-        st.caption("参考S株数は枠の配分余力と値幅制限を考慮した上限。実際の発注前にSBIの余力と約定価格を確認してください。")
-    if horizon == "中期":
-        st.caption("買い：50日線>150日線、60日上昇3〜40%、ROE≥8%、売上成長≥0%、PER≤45。"
-                   " 売り：終値で取得単価−10%、または調整後終値が50日線を2日連続下回る。"
-                   " 売却は判定の翌営業日を想定し、損失率は約定価格で変動します。")
-    else:
-        st.caption("買い：上向き200日線より上、126日上昇0〜80%、ROE≥10%、売上・利益成長≥0%、PER≤35。"
-                   " 売り：終値で取得単価−18%、ROE<5%、または調整後終値が200日線を5日連続下回る。"
-                   " 売却は判定の翌営業日を想定し、損失率は約定価格で変動します。")
-
-
-def render_ai_research_tab():
-    st.subheader("AI最強ロジック探索")
-    st.warning("世界中の手法の中で利益が最大と証明することはできません。"
-               " この画面は3つの公開可能な価格ルールを比較する研究用で、実売買には接続していません。")
-    for method, description in AI_RESEARCH_METHODS.items():
-        st.caption(f"{method}：{description}")
-    uploaded = st.file_uploader("5年日足ZIPまたはCSV", type=["zip", "csv"], key="ai_research_history_v1723")
-    st.caption("管理者タブの『バックテスト用5年日足データ』で出力したZIPを使えます。"
-               " 固定45銘柄を共通対象とし、学習期間の成績で1案を選んだ後、最後の約1年を未使用期間として評価します。")
-    if st.button("3方式を比較バックテスト", key="ai_research_run_v1723", disabled=uploaded is None):
-        try:
-            raw = uploaded.getvalue()
-            if uploaded.name.lower().endswith(".zip"):
-                with ZipFile(io.BytesIO(raw)) as zf:
-                    matches = [n for n in zf.namelist() if n.endswith("backtest_history_5y.csv")]
-                    if not matches:
-                        raise ValueError("ZIP内に backtest_history_5y.csv がありません")
-                    if zf.getinfo(matches[0]).file_size > 150_000_000:
-                        raise ValueError("日足CSVが大きすぎます")
-                    history = pd.read_csv(zf.open(matches[0]), low_memory=False)
-            else:
-                history = pd.read_csv(io.BytesIO(raw), low_memory=False)
-            with st.spinner("3方式と未使用期間を同じ条件で比較中…"):
-                result = compare_ai_research_methods(history, int(current_assets), 10)
-            st.session_state["ai_research_result_v1723"] = (hashlib.sha256(raw).hexdigest(), result)
-        except Exception as exc:
-            st.error(f"比較を実行できません：{exc}")
-    saved = st.session_state.get("ai_research_result_v1723")
-    if saved is None:
-        st.info("5年日足ZIPを読み込み、比較バックテストを実行してください。")
-        return
-    if uploaded is None or hashlib.sha256(uploaded.getvalue()).hexdigest() != saved[0]:
-        st.info("別の履歴を選んだため、比較をもう一度実行してください。")
-        return
-    comparison, detail, selected, prepared = saved[1]
-    st.dataframe(comparison, use_container_width=True, hide_index=True)
-    selected_oos = comparison[(comparison["方式"].eq(selected)) & comparison["期間"].eq("未使用")].iloc[0]
-    st.markdown(f"**学習期間だけで選んだ方式：{selected}**")
-    st.caption(f"未使用期間：損益 {selected_oos['損益率%']:+.2f}% / 最大DD {selected_oos['最大DD%']:.2f}% / "
-               f"確定損益 {int(selected_oos['確定損益円']):+,}円 / "
-               f"未決済評価損益 {int(selected_oos['未決済評価損益円']):+,}円 / "
-               f"決済 {int(selected_oos['決済件数'])}件。未使用期間の成績を見て方式を選び直していません。")
-    if selected_oos["損益率%"] <= 0:
-        st.error("未使用期間に利益が残っていません。この方式を採用候補にはしません。")
-    else:
-        st.info("未使用期間はプラスですが、採用判断には固定銘柄の選定偏りと実約定を含む追加検証が必要です。")
-    oos_curve = pd.concat([
-        detail[(method, "未使用")][1].set_index("日付")["資産円"].rename(method)
-        for method in AI_RESEARCH_METHODS
-    ], axis=1)
-    st.line_chart(oos_curve)
-    with st.expander("選定方式の売買明細と未決済", expanded=False):
-        trades, curve, positions = detail[(selected, "未使用")]
-        st.dataframe(trades, use_container_width=True, hide_index=True)
-        st.caption("未決済保有（調整後株数の概算）")
-        st.dataframe(positions, use_container_width=True, hide_index=True)
-    close, _, volume = prepared
-    rank = ai_research_rank(ai_research_features(close, volume), close.index[-1], selected)
-    candidates = pd.DataFrame([{"コード":c, "銘柄名":name(c), "研究スコア":round(float(score), 3),
-                                "日足最終日":str(close.index[-1].date())}
-                               for c, score in rank.items() if c not in set(all_held_codes)]).head(3)
-    st.subheader("最新日足の研究候補")
-    if candidates.empty:
-        st.info("該当銘柄はありません。")
-    else:
-        st.dataframe(candidates, use_container_width=True, hide_index=True)
-    st.caption("バックテストは前日終値で判定し次の取引日始値で約定、初期資金は現在資産欄、"
-               "同時3銘柄・各99株以下・片道10bpを仮定。調整後株価で分割と配当を近似し、"
-               "税金、値幅制限による未約定、実際のS株株数と注文余力は再現しません。"
-               " 現在の固定45銘柄を過去にも使うため、銘柄選定の生存者バイアスがあります。")
-    buf = io.BytesIO()
-    with ZipFile(buf, "w") as zf:
-        zf.writestr("ai_research_comparison.csv", comparison.to_csv(index=False, encoding="utf-8-sig"))
-        zf.writestr("ai_research_latest_candidates.csv", candidates.to_csv(index=False, encoding="utf-8-sig"))
-        for method in AI_RESEARCH_METHODS:
-            for period, suffix in (("学習", "train"), ("未使用", "holdout")):
-                trades, curve, open_positions = detail[(method, period)]
-                zf.writestr(f"{method}_{suffix}_trades.csv", trades.to_csv(index=False, encoding="utf-8-sig"))
-                zf.writestr(f"{method}_{suffix}_equity.csv", curve.to_csv(index=False, encoding="utf-8-sig"))
-                zf.writestr(f"{method}_{suffix}_open_positions.csv", open_positions.to_csv(index=False, encoding="utf-8-sig"))
-    st.download_button("AIロジック比較結果ZIP", buf.getvalue(), "ai_research_backtest.zip",
-                       "application/zip", key="ai_research_result_download_v1723")
-
-with mid_tab:
-    render_horizon_tab("中期", "mid_owned_codes_v1722", "mid_budget_v1722", long_owned_codes)
-with long_tab:
-    render_horizon_tab("長期", "long_owned_codes_v1722", "long_budget_v1722", mid_owned_codes)
-with ai_tab:
-    render_ai_research_tab()
 
 with admin_tab:
     st.caption("比較・検証用。通常の朝はここを見る必要はありません。")
@@ -5148,28 +4949,19 @@ try:
     with ZipFile(zip_buf,"w") as zf:
         settings_df=pd.DataFrame([{
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
-            "短期配分余力":short_buying_power,"中期配分余力":mid_budget,"長期配分余力":long_budget,
-            "余力配分有効":budgets_valid,"短期保有件数":len(held_codes),
-            "中期保有件数":len(mid_owned_codes),"長期保有件数":len(long_owned_codes),
+            "買付余力（短期）":short_buying_power,"保有件数":len(held_codes),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":0,
             "固定45監視件数":len(VERIFIED_45_CODES),
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "新規BUY対象":"検証済み固定45銘柄の未保有株のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
             "割高の新規BUY除外":False,
-            "SELL条件":"短期枠の保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%",
+            "SELL条件":"全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%",
             "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":True,
             "短期反転フィルター":bool(churn_filter),
             "トレンド振れ幅フィルター実売買":bool(quality_mode),
         }])
         zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
-        sleeve_rows = [{"コード":"", "運用枠":"設定", "中期配分余力":mid_budget,
-                        "長期配分余力":long_budget}]
-        sleeve_rows += [{"コード":c,"運用枠": "中期" if c in mid_owned_codes else
-                         "長期" if c in long_owned_codes else "短期",
-                         "中期配分余力":mid_budget,"長期配分余力":long_budget}
-                        for c in all_held_codes]
-        zf.writestr("holding_sleeve_assignments.csv",pd.DataFrame(sleeve_rows).to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(universe_df,pd.DataFrame):
             zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(value_top50_df,pd.DataFrame):
@@ -5185,7 +4977,6 @@ try:
         if confirmed:
             zf.writestr("current_holdings.csv",pd.DataFrame([{
                 "コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"],
-                "運用枠": "中期" if c in mid_owned_codes else "長期" if c in long_owned_codes else "短期",
             } for c,v in confirmed.items()]).to_csv(index=False,encoding="utf-8-sig"))
         if not sbi_warning_df.empty:
             zf.writestr("sbi_history_warnings.csv",sbi_warning_df.to_csv(index=False,encoding="utf-8-sig"))
@@ -5196,17 +4987,6 @@ try:
             buy_export = pd.DataFrame(columns=buy_cols_default)
         zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
         zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
-        for horizon, owned, allocated, label in [
-            ("中期", mid_owned_codes, mid_budget, "mid"),
-            ("長期", long_owned_codes, long_budget, "long"),
-        ]:
-            sleeve_buys, sleeve_holdings, sleeve_notices = build_horizon_views(
-                data, value_top50_df, confirmed, owned, set(all_held_codes), horizon,
-                allocated if budgets_valid else 0, daily_bar_status_df,
-            )
-            zf.writestr(f"{label}_buy_candidates.csv", sleeve_buys.to_csv(index=False,encoding="utf-8-sig"))
-            zf.writestr(f"{label}_holdings.csv", sleeve_holdings.to_csv(index=False,encoding="utf-8-sig"))
-            zf.writestr(f"{label}_data_warnings.csv", pd.DataFrame({"警告":sleeve_notices}).to_csv(index=False,encoding="utf-8-sig"))
         compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()
         zf.writestr("indicator_compare_candidates.csv", compare_export.to_csv(index=False,encoding="utf-8-sig"))
         surge_export = surge_top50_df.copy() if isinstance(surge_top50_df, pd.DataFrame) else pd.DataFrame()

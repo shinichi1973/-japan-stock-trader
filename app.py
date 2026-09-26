@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.22
-# BUILD: VER17-22-INDEPENDENT-MID-LONG-20260926
+# 日本株 AI投資アシスタント Ver.17.23
+# BUILD: VER17-23-AI-RESEARCH-HOLDOUT-20260926
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.22",
+    page_title="日本株 AI投資アシスタント Ver.17.23",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.22 FIXED45 STOCH + MID LONG"
-BUILD = "VER17-22-INDEPENDENT-MID-LONG-20260926"
+VERSION = "17.23 FIXED45 STOCH + MID LONG + AI RESEARCH"
+BUILD = "VER17-23-AI-RESEARCH-HOLDOUT-20260926"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2418,6 +2418,162 @@ def build_horizon_views(data, value_df, confirmed, owned_codes, all_held_codes, 
     return pd.DataFrame(buys, columns=columns), held, notices
 
 
+AI_RESEARCH_METHODS = {
+    "上昇率": "6か月上昇率を順位付け。200日線が上向きの銘柄のみ。",
+    "安定トレンド": "3か月・6か月上昇率から20日変動率を差し引く。200日線が上向きの銘柄のみ。",
+    "押し目": "200日線が上向きで6か月上昇中、50日線の付近に戻った銘柄。",
+}
+
+
+def prepare_ai_research_prices(history, allowed_codes=VERIFIED_45_CODES, min_history=300):
+    """候補の比較用。調整後株価を使い分割と配当を総収益の概算として扱う。"""
+    required = {"日付", "コード", "Open", "Close", "Adj Close", "Volume"}
+    if not required.issubset(history.columns):
+        raise ValueError("5年日足CSVに必要な列がありません: " + ", ".join(sorted(required - set(history.columns))))
+    x = history[list(required)].copy()
+    x["コード"] = x["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
+    x = x[x["コード"].isin(set(allowed_codes))].copy()
+    x["日付"] = pd.to_datetime(x["日付"], errors="coerce")
+    for col in ["Open", "Close", "Adj Close", "Volume"]:
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+    x = x.dropna(subset=["日付", "Open", "Close", "Adj Close"])
+    x = x[(x["Open"] > 0) & (x["Close"] > 0) & (x["Adj Close"] > 0)]
+    x = x.drop_duplicates(["日付", "コード"], keep="last")
+    counts = x.groupby("コード").size()
+    x = x[x["コード"].isin(counts[counts >= min_history].index)]
+    if x["コード"].nunique() < 10:
+        raise ValueError("300営業日以上の履歴がある銘柄が10未満です")
+    x["調整始値"] = x["Open"] * x["Adj Close"] / x["Close"]
+    close = x.pivot(index="日付", columns="コード", values="Adj Close").sort_index()
+    opening = x.pivot(index="日付", columns="コード", values="調整始値").reindex_like(close)
+    volume = x.pivot(index="日付", columns="コード", values="Volume").reindex_like(close)
+    return close, opening, volume
+
+
+def ai_research_features(close, volume):
+    ma50 = close.rolling(50, min_periods=50).mean()
+    ma200 = close.rolling(200, min_periods=200).mean()
+    mom63 = close / close.shift(63) - 1
+    mom126 = close / close.shift(126) - 1
+    volatility = close.pct_change(fill_method=None).rolling(20, min_periods=20).std() * np.sqrt(252)
+    liquid = volume.rolling(20, min_periods=20).mean() >= 100000
+    trend = (close > ma200) & (ma200 > ma200.shift(20)) & (mom126 > 0) & liquid
+    return {"close": close, "ma50": ma50, "ma200": ma200,
+            "mom63": mom63, "mom126": mom126, "volatility": volatility, "trend": trend}
+
+
+def ai_research_rank(features, index_date, method):
+    trend = features["trend"].loc[index_date]
+    m126 = features["mom126"].loc[index_date]
+    if method == "上昇率":
+        score = m126
+    elif method == "安定トレンド":
+        score = (m126 + .5 * features["mom63"].loc[index_date] -
+                 2.0 * features["volatility"].loc[index_date])
+    elif method == "押し目":
+        distance = features["close"].loc[index_date] / features["ma50"].loc[index_date] - 1
+        trend = trend & distance.between(-.08, .03)
+        score = m126 - (distance + .02).abs()
+    else:
+        raise ValueError("未知の比較方式")
+    score = score.where(trend).replace([np.inf, -np.inf], np.nan).dropna()
+    return score.sort_values(ascending=False)
+
+
+def ai_research_backtest(close, opening, volume, method, start, end,
+                         initial_cash=600000, fee_bps=10):
+    """前日終値だけで判定、次の取引日の調整始値で約定。月次入替と日次撤退。"""
+    features = ai_research_features(close, volume)
+    dates = close.index
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    cash = float(initial_cash)
+    positions = {}
+    entries = {}
+    trades, curve = [], []
+    for i in range(250, len(dates)):
+        date, signal_date = dates[i], dates[i-1]
+        if date < start or date > end:
+            continue
+        monthly = date.to_period("M") != signal_date.to_period("M") or not curve
+        ranking = ai_research_rank(features, signal_date, method) if monthly else pd.Series(dtype=float)
+        for c in list(positions):
+            p = opening.at[date, c]
+            prev = close.at[signal_date, c]
+            if not np.isfinite(p) or not np.isfinite(prev):
+                continue
+            trend_broken = bool((close[c].iloc[i-3:i] < features["ma200"][c].iloc[i-3:i]).all())
+            stop = prev <= entries[c][0] * .88
+            rotation = monthly and c not in ranking.index
+            if stop or trend_broken or rotation:
+                shares = positions.pop(c)
+                proceeds = shares * p * (1 - fee_bps / 10000)
+                cash += proceeds
+                entry_price, entry_date, entry_cost = entries.pop(c)
+                trades.append({"方式":method,"コード":c,"買付日":entry_date,"売却日":date,
+                               "株数":shares,"取得価格_調整値":entry_price,"売却価格_調整値":p,
+                               "実現損益円":proceeds - entry_cost,
+                               "売り理由":"12%損切り" if stop else "200日線割れ" if trend_broken else "月次見直し"})
+        if monthly:
+            equity_at_open = cash + sum(
+                shares * (opening.at[date,c] if np.isfinite(opening.at[date,c]) else close.at[signal_date,c])
+                for c, shares in positions.items())
+            for c in ranking.index:
+                if len(positions) >= 3:
+                    break
+                if c in positions:
+                    continue
+                p = opening.at[date, c]
+                if not np.isfinite(p) or p <= 0:
+                    continue
+                allocation = min(cash, equity_at_open / 3)
+                shares = min(99, int(allocation // (p * (1 + fee_bps / 10000))))
+                if shares < 1:
+                    continue
+                cost = shares * p * (1 + fee_bps / 10000)
+                cash -= cost
+                positions[c] = shares
+                entries[c] = (p, date, cost)
+        equity = cash + sum(
+            shares * (close.at[date,c] if np.isfinite(close.at[date,c]) else close.at[signal_date,c])
+            for c, shares in positions.items())
+        curve.append({"日付":date,"方式":method,"資産円":equity,"現金円":cash,"保有件数":len(positions)})
+    equity_df = pd.DataFrame(curve)
+    trades_df = pd.DataFrame(trades)
+    if equity_df.empty:
+        raise ValueError("検証期間に日足がありません")
+    equity_df["累積最高"] = equity_df["資産円"].cummax().clip(lower=initial_cash)
+    equity_df["DD%"] = (equity_df["資産円"] / equity_df["累積最高"] - 1) * 100
+    final = float(equity_df["資産円"].iloc[-1])
+    summary = {"方式":method,"開始日":str(equity_df["日付"].iloc[0].date()),
+               "終了日":str(equity_df["日付"].iloc[-1].date()),"初期資金円":int(initial_cash),
+               "最終資産円":round(final),"損益率%":round((final/initial_cash-1)*100,2),
+               "最大DD%":round(float(equity_df["DD%"].min()),2),
+               "決済件数":len(trades_df),"未決済件数":len(positions)}
+    return summary, trades_df, equity_df, positions
+
+
+def compare_ai_research_methods(history, initial_cash=600000, fee_bps=10):
+    close, opening, volume = prepare_ai_research_prices(history)
+    if len(close) < 755:
+        raise ValueError("学習・未使用期間の分離には、少なくとも約3年分の日足が必要です")
+    train_start, train_end = close.index[250], close.index[-254]
+    holdout_start, holdout_end = close.index[-253], close.index[-1]
+    summaries, detail = [], {}
+    for method in AI_RESEARCH_METHODS:
+        for period, start, end in (("学習", train_start, train_end),
+                                   ("未使用", holdout_start, holdout_end)):
+            summary, trades, curve, positions = ai_research_backtest(
+                close, opening, volume, method, start, end, initial_cash, fee_bps)
+            summary["期間"] = period
+            summaries.append(summary)
+            detail[(method, period)] = (trades, curve, positions)
+    result = pd.DataFrame(summaries)
+    training = result[result["期間"].eq("学習")].copy()
+    training["選定点"] = training["損益率%"] + .5 * training["最大DD%"]
+    selected = str(training.sort_values(["選定点", "方式"], ascending=[False, True]).iloc[0]["方式"])
+    return result, detail, selected, (close, opening, volume)
+
+
 # ------------------------------------------------------------
 # Ver.17.4 企業価値AI TOP50 — 株式分割＋適正株価異常値ガード付き比較検証用
 # ------------------------------------------------------------
@@ -3778,7 +3934,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.22")
+st.title("📈 日本株 AI投資アシスタント Ver.17.23")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("固定45銘柄 → %K≤20のGCで買い → DCまたは終値で−7%なら翌朝売り")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -4478,7 +4634,9 @@ def render_fundamental_lab():
 # ------------------------------------------------------------
 # シンプル画面 + 独立した中長期枠 + 目立たない管理者タブ
 # ------------------------------------------------------------
-main_tab, mid_tab, long_tab, admin_tab = st.tabs(["今日の売買", "中期", "長期", "管理者"])
+main_tab, mid_tab, long_tab, ai_tab, admin_tab = st.tabs(
+    ["今日の売買", "中期", "長期", "AI最強ロジック", "管理者"]
+)
 with main_tab:
     m1, m2 = st.columns(2)
     m1.metric("短期枠の保有", f"{len(held_codes)}銘柄")
@@ -4591,10 +4749,92 @@ def render_horizon_tab(horizon, own_key, budget_key, other_owned):
                    " 売り：終値で取得単価−18%、ROE<5%、または調整後終値が200日線を5日連続下回る。"
                    " 売却は判定の翌営業日を想定し、損失率は約定価格で変動します。")
 
+
+def render_ai_research_tab():
+    st.subheader("AI最強ロジック探索")
+    st.warning("世界中の手法の中で利益が最大と証明することはできません。"
+               " この画面は3つの公開可能な価格ルールを比較する研究用で、実売買には接続していません。")
+    for method, description in AI_RESEARCH_METHODS.items():
+        st.caption(f"{method}：{description}")
+    uploaded = st.file_uploader("5年日足ZIPまたはCSV", type=["zip", "csv"], key="ai_research_history_v1723")
+    st.caption("管理者タブの『バックテスト用5年日足データ』で出力したZIPを使えます。"
+               " 固定45銘柄を共通対象とし、学習期間の成績で1案を選んだ後、最後の約1年を未使用期間として評価します。")
+    if st.button("3方式を比較バックテスト", key="ai_research_run_v1723", disabled=uploaded is None):
+        try:
+            raw = uploaded.getvalue()
+            if uploaded.name.lower().endswith(".zip"):
+                with ZipFile(io.BytesIO(raw)) as zf:
+                    matches = [n for n in zf.namelist() if n.endswith("backtest_history_5y.csv")]
+                    if not matches:
+                        raise ValueError("ZIP内に backtest_history_5y.csv がありません")
+                    if zf.getinfo(matches[0]).file_size > 150_000_000:
+                        raise ValueError("日足CSVが大きすぎます")
+                    history = pd.read_csv(zf.open(matches[0]), low_memory=False)
+            else:
+                history = pd.read_csv(io.BytesIO(raw), low_memory=False)
+            with st.spinner("3方式と未使用期間を同じ条件で比較中…"):
+                result = compare_ai_research_methods(history, int(current_assets), 10)
+            st.session_state["ai_research_result_v1723"] = (hashlib.sha256(raw).hexdigest(), result)
+        except Exception as exc:
+            st.error(f"比較を実行できません：{exc}")
+    saved = st.session_state.get("ai_research_result_v1723")
+    if saved is None:
+        st.info("5年日足ZIPを読み込み、比較バックテストを実行してください。")
+        return
+    if uploaded is None or hashlib.sha256(uploaded.getvalue()).hexdigest() != saved[0]:
+        st.info("別の履歴を選んだため、比較をもう一度実行してください。")
+        return
+    comparison, detail, selected, prepared = saved[1]
+    st.dataframe(comparison, use_container_width=True, hide_index=True)
+    selected_oos = comparison[(comparison["方式"].eq(selected)) & comparison["期間"].eq("未使用")].iloc[0]
+    st.markdown(f"**学習期間だけで選んだ方式：{selected}**")
+    st.caption(f"未使用期間：損益 {selected_oos['損益率%']:+.2f}% / 最大DD {selected_oos['最大DD%']:.2f}% / "
+               f"決済 {int(selected_oos['決済件数'])}件。未使用期間の成績を見て方式を選び直していません。")
+    if selected_oos["損益率%"] <= 0:
+        st.error("未使用期間に利益が残っていません。この方式を採用候補にはしません。")
+    else:
+        st.info("未使用期間はプラスですが、採用判断には固定銘柄の選定偏りと実約定を含む追加検証が必要です。")
+    oos_curve = pd.concat([
+        detail[(method, "未使用")][1].set_index("日付")["資産円"].rename(method)
+        for method in AI_RESEARCH_METHODS
+    ], axis=1)
+    st.line_chart(oos_curve)
+    with st.expander("選定方式の売買明細と未決済", expanded=False):
+        trades, curve, positions = detail[(selected, "未使用")]
+        st.dataframe(trades, use_container_width=True, hide_index=True)
+        st.write("未決済保有（調整後株数の概算）", positions)
+    close, _, volume = prepared
+    rank = ai_research_rank(ai_research_features(close, volume), close.index[-1], selected)
+    candidates = pd.DataFrame([{"コード":c, "銘柄名":name(c), "研究スコア":round(float(score), 3),
+                                "日足最終日":str(close.index[-1].date())}
+                               for c, score in rank.items() if c not in set(all_held_codes)]).head(3)
+    st.subheader("最新日足の研究候補")
+    if candidates.empty:
+        st.info("該当銘柄はありません。")
+    else:
+        st.dataframe(candidates, use_container_width=True, hide_index=True)
+    st.caption("バックテストは前日終値で判定し次の取引日始値で約定、初期資金は現在資産欄、"
+               "同時3銘柄・各99株以下・片道10bpを仮定。調整後株価で分割と配当を近似し、"
+               "税金、値幅制限による未約定、実際のS株株数と注文余力は再現しません。"
+               " 現在の固定45銘柄を過去にも使うため、銘柄選定の生存者バイアスがあります。")
+    buf = io.BytesIO()
+    with ZipFile(buf, "w") as zf:
+        zf.writestr("ai_research_comparison.csv", comparison.to_csv(index=False, encoding="utf-8-sig"))
+        zf.writestr("ai_research_latest_candidates.csv", candidates.to_csv(index=False, encoding="utf-8-sig"))
+        for method in AI_RESEARCH_METHODS:
+            for period, suffix in (("学習", "train"), ("未使用", "holdout")):
+                trades, curve, _ = detail[(method, period)]
+                zf.writestr(f"{method}_{suffix}_trades.csv", trades.to_csv(index=False, encoding="utf-8-sig"))
+                zf.writestr(f"{method}_{suffix}_equity.csv", curve.to_csv(index=False, encoding="utf-8-sig"))
+    st.download_button("AIロジック比較結果ZIP", buf.getvalue(), "ai_research_backtest.zip",
+                       "application/zip", key="ai_research_result_download_v1723")
+
 with mid_tab:
     render_horizon_tab("中期", "mid_owned_codes_v1722", "mid_budget_v1722", long_owned_codes)
 with long_tab:
     render_horizon_tab("長期", "long_owned_codes_v1722", "long_budget_v1722", mid_owned_codes)
+with ai_tab:
+    render_ai_research_tab()
 
 with admin_tab:
     st.caption("比較・検証用。通常の朝はここを見る必要はありません。")

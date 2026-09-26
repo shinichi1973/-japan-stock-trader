@@ -40,8 +40,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.19 STOCH DUAL FUNDAMENTALS"
-BUILD = "VER17-19-JQUANTS-YAHOO-FRESHNESS-20260923"
+VERSION = "17.21 FIXED45 STOCH NO ADDON"
+BUILD = "VER17-21-FIXED45-GC20-DC-STOP7-NOADDON-20260926"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -85,7 +85,17 @@ STOCK_NAMES = {
     "7012":"川崎重工業","6085":"アーキテクツ・スタジオ・ジャパン",
 }
 
-DEFAULT_UNIVERSE = ",".join(list(STOCK_NAMES.keys()))
+# 検証ZIPで5年間の日足が揃った旧固定リストの45銘柄。
+# 欠損した3444、5885、6085、6629は新規買い対象にしない。
+VERIFIED_45_CODES = tuple(
+    "7203,6758,9984,8306,9432,6501,8035,8058,7267,2914,9433,8316,8411,6098,"
+    "4063,4519,6367,6857,7974,8766,5401,8801,8802,4502,4503,4523,4755,6594,"
+    "7741,6981,3382,4661,6146,6920,7832,4568,4452,6503,6701,6702,6324,6506,"
+    "6954,6965,7012"
+    .split(",")
+)
+assert len(VERIFIED_45_CODES) == len(set(VERIFIED_45_CODES)) == 45
+DEFAULT_UNIVERSE = ",".join(VERIFIED_45_CODES)
 
 # ------------------------------------------------------------
 # 共通関数
@@ -753,6 +763,10 @@ def _merge_same_day_quote(history, quote, session_date):
     base = _normalize_ohlcv(history)
     if base.empty or not quote or pd.isna(session_date):
         return history, False
+    if "Adj Close" in history.columns:
+        adjusted = pd.to_numeric(history["Adj Close"], errors="coerce")
+        adjusted.index = pd.DatetimeIndex(pd.to_datetime(adjusted.index)).tz_localize(None).normalize()
+        base["Adj Close"] = adjusted.reindex(base.index)
     session_date = pd.Timestamp(session_date).normalize()
     latest = pd.Timestamp(base.index.max()).normalize()
     if latest >= session_date:
@@ -769,6 +783,10 @@ def _merge_same_day_quote(history, quote, session_date):
     base.loc[session_date, ["Open","High","Low","Close","Volume"]] = [
         values["Open"], values["High"], values["Low"], values["Close"], volume
     ]
+    if "Adj Close" in base:
+        previous = base["Adj Close"].div(base["Close"]).dropna()
+        ratio = float(previous.iloc[-1]) if not previous.empty else 1.0
+        base.loc[session_date, "Adj Close"] = values["Close"] * ratio
     return base.sort_index(), True
 
 
@@ -2210,6 +2228,70 @@ def build_purchase_plan(candidates, buying_power, current_assets, held_codes, ma
     return pd.DataFrame(rows, columns=cols)
 
 
+def standard_limit_up_price(reference):
+    """東証の通常制限値幅による概算上限。臨時拡大・呼値単位は注文画面を優先。"""
+    bands = ((100, 30), (200, 50), (500, 80), (700, 100), (1000, 150),
+             (1500, 300), (2000, 400), (3000, 500), (5000, 700),
+             (7000, 1000), (10000, 1500), (15000, 3000), (20000, 4000),
+             (30000, 5000), (50000, 7000), (70000, 10000),
+             (100000, 15000), (150000, 30000), (200000, 40000),
+             (300000, 50000), (500000, 70000), (700000, 100000),
+             (1000000, 150000), (1500000, 300000), (2000000, 400000))
+    if not np.isfinite(reference) or reference <= 0:
+        return np.nan
+    for below, width in bands:
+        if reference < below:
+            return reference + width
+    return reference * 1.4
+
+
+def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_codes):
+    """3銘柄・99株・5%価格余裕。注文余力は通常制限値幅でも確認する。"""
+    cols = ["購入優先度", "コード", "銘柄名", "総合AIスコア", "現在株価", "計算用株価",
+            "購入株数", "予定購入額", "余力引当額", "買付余力使用率", "注文想定",
+            "買付可否", "見送り理由", "購入後推定余力"]
+    if candidates is None or candidates.empty:
+        return pd.DataFrame(columns=cols)
+    held = set(map(str, held_codes or []))
+    x = candidates[~candidates["コード"].astype(str).isin(held)].copy()
+    x = x.sort_values(["%K", "コード"], ascending=[True, True]).head(3)
+    remaining = max(float(buying_power or 0), 0)
+    assets = max(float(current_assets or 0), remaining)
+    new_slots = max(3 - len(held), 0)
+    rows = []
+    for i, (_, r) in enumerate(x.iterrows(), 1):
+        c = str(r["コード"])
+        price = safe_float(r["現在株価"])
+        calc_price = price * 1.05
+        collateral_price = standard_limit_up_price(price)
+        reason = ""
+        if new_slots <= 0:
+            reason = "同時保有3銘柄の上限"
+        elif remaining <= 0:
+            reason = "買付余力が0円/未入力"
+        elif not np.isfinite(calc_price) or calc_price <= 0:
+            reason = "株価データ不正"
+        budget = min(remaining, assets / 3.0) if not reason else 0
+        shares = (min(99, int(budget // calc_price), int(remaining // collateral_price))
+                  if calc_price > 0 and np.isfinite(calc_price) and
+                  np.isfinite(collateral_price) and collateral_price > 0 else 0)
+        if shares <= 0 and not reason:
+            reason = "安全余力内では1株も購入できない"
+        if shares:
+            remaining -= shares * collateral_price
+            new_slots -= 1
+        rows.append({"購入優先度": i, "コード": c, "銘柄名": r["銘柄名"],
+                     "総合AIスコア": r["総合AIスコア"], "現在株価": price,
+                     "計算用株価": calc_price, "購入株数": shares,
+                     "予定購入額": shares * price, "余力引当額": shares * collateral_price,
+                     "買付余力使用率": (shares * collateral_price / float(buying_power) * 100
+                                      if buying_power else 0),
+                     "注文想定": "S株新規",
+                     "買付可否": "🟢 BUY" if shares else "⛔ NO BUY",
+                     "見送り理由": reason, "購入後推定余力": max(remaining, 0)})
+    return pd.DataFrame(rows, columns=cols)
+
+
 # ------------------------------------------------------------
 # Ver.17.4 企業価値AI TOP50 — 株式分割＋適正株価異常値ガード付き比較検証用
 # ------------------------------------------------------------
@@ -2480,9 +2562,11 @@ def _prepare_light_history_frame(df):
     cols = ["Open", "High", "Low", "Close", "Volume"]
     if not all(c in x.columns for c in cols):
         return pd.DataFrame()
-    x = x[cols].copy()
+    x = x[cols + (["Adj Close"] if "Adj Close" in x.columns else [])].copy()
     for c in cols:
         x[c] = pd.to_numeric(x[c], errors="coerce")
+    if "Adj Close" in x:
+        x["Adj Close"] = pd.to_numeric(x["Adj Close"], errors="coerce")
     x = x.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).sort_index()
     if len(x) < 80:
         return pd.DataFrame()
@@ -2918,10 +3002,13 @@ def stoch_prepare_light(df, k_period=14, k_smooth=3, d_period=3):
     if df is None or df.empty:
         return pd.DataFrame()
     x = df.copy().sort_index()
-    low_n = x["Low"].rolling(int(k_period), min_periods=int(k_period)).min()
-    high_n = x["High"].rolling(int(k_period), min_periods=int(k_period)).max()
+    ratio = (pd.to_numeric(x["Adj Close"], errors="coerce") / x["Close"]
+             if "Adj Close" in x.columns else pd.Series(1.0, index=x.index))
+    ratio = ratio.where(np.isfinite(ratio) & ratio.gt(0), 1.0)
+    low_n = (x["Low"] * ratio).rolling(int(k_period), min_periods=int(k_period)).min()
+    high_n = (x["High"] * ratio).rolling(int(k_period), min_periods=int(k_period)).max()
     den = (high_n - low_n).replace(0, np.nan)
-    fast_k = (x["Close"] - low_n) / den * 100.0
+    fast_k = (x["Close"] * ratio - low_n) / den * 100.0
     x["STOCH_K"] = fast_k.rolling(int(k_smooth), min_periods=int(k_smooth)).mean()
     x["STOCH_D"] = x["STOCH_K"].rolling(int(d_period), min_periods=int(d_period)).mean()
     x["STOCH_GC"] = (x["STOCH_K"] > x["STOCH_D"]) & (x["STOCH_K"].shift(1) <= x["STOCH_D"].shift(1))
@@ -3231,10 +3318,9 @@ def render_mobile_trade_cards(df, side, trend_by_code=None):
         price_text = _mobile_number(row.get("現在株価"), 0, "円")
         surge_text = html_escape(_short_surge_label(row.get("急騰予兆判定")))
         value_text = html_escape(_short_value_label(row.get("割安判定")))
-        valuation_text = f"銘柄判定：{value_text}"
-        is_overvalued = side == "buy" and "割高" in str(row.get("割安判定", ""))
-        if is_overvalued:
-            valuation_text += "（買い見送ってください）"
+        valuation_text = f"銘柄判定（参考）：{value_text}"
+        # 固定45銘柄の採用条件はストキャスのみ。企業価値判定は表示用。
+        is_overvalued = False
         k_text = _mobile_number(row.get("%K"), 1)
         d_text = _mobile_number(row.get("%D"), 1)
         stop_hit = side == "sell" and "損切り" in str(row.get("売り理由", ""))
@@ -3258,7 +3344,7 @@ def render_mobile_trade_cards(df, side, trend_by_code=None):
         else:
             shares = int(max(safe_float(row.get("参考S株数"), 0), 0))
             can_buy = "BUY" in str(row.get("買付可否", "")) and shares > 0
-            action_text = "⛔ 買い見送ってください" if is_overvalued else "🟢 買い" if can_buy else "⛔ 見送り"
+            action_text = "🟢 買い" if can_buy else "⛔ 見送り"
             card_class = "skip-card" if is_overvalued else "buy-card" if can_buy else "skip-card"
             quantity_text = "割高" if is_overvalued else f"参考 {shares:,}株" if can_buy else _mobile_text(row.get("買付可否"), "購入不可")
             detail_text = (
@@ -3566,11 +3652,11 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.17")
+st.title("📈 日本株 AI投資アシスタント Ver.17.21")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
-st.success("本物の企業価値AI TOP50 → Slow Stochastic 14,3,3 → BUY候補だけをシンプル表示")
-st.caption("一次選抜は5年OOS検証済み：流動性45% / トレンド30% / 値動き安定性25%")
-st.caption("母集団は日本株の売買代金上位を数百銘柄自動取得。旧49銘柄の固定リストは新規BUY選定には使いません。")
+st.success("固定45銘柄 → %K≤20のGCで買い → DCまたは終値で−7%なら翌朝売り")
+st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
+st.caption("新規買いは45銘柄の未保有株のみ。初期60万円・同時3銘柄・1注文99株までで検証。")
 
 # ------------------------------------------------------------
 # 朝の入力：ここだけは常に見える
@@ -3627,71 +3713,81 @@ if not sbi_warning_df.empty:
 # ------------------------------------------------------------
 # 管理者設定は目立たせない
 # ------------------------------------------------------------
+for _key, _fixed in {
+    "v177_maxbuy": 100000, "v177_sl": 7.0, "v177_maxpos": 3,
+    "v177_reserve": 0, "v177_daily": 100, "v177_risk": 1.0,
+    "v177_buffer": 5.0, "v1716_churn_filter": False,
+    "v1717_quality_mode": False,
+}.items():
+    st.session_state[_key] = _fixed
 with st.expander("⚙ 管理者設定", expanded=False):
     a1, a2, a3, a4 = st.columns(4)
     current_assets = a1.number_input("現在資産（円）", 10000, 200000000, 600000, 10000, key="v177_assets")
-    maxbuy = a2.number_input("1銘柄最大購入額（円）", 1000, 20000000, 100000, 1000, key="v177_maxbuy")
-    sl = a3.slider("損切りセンサー（%）", 3.0, 15.0, 7.0, .5, key="v177_sl")
-    maxpos = a4.number_input("最大保有銘柄数", 1, 50, 10, key="v177_maxpos")
+    maxbuy = a2.number_input("1銘柄最大購入額（円）", 1000, 20000000, 100000, 1000, key="v177_maxbuy", disabled=True)
+    sl = a3.slider("損切りセンサー（%）", 3.0, 15.0, 7.0, .5, key="v177_sl", disabled=True)
+    maxpos = a4.number_input("最大保有銘柄数", 1, 50, 3, key="v177_maxpos", disabled=True)
     b1, b2, b3, b4 = st.columns(4)
-    reserve_pct = b1.slider("現金温存率（%）", 0, 80, 20, 5, key="v177_reserve")
-    daily_deploy_pct = b2.slider("1日使用上限（%）", 10, 100, 50, 5, key="v177_daily")
-    risk_per_trade_pct = b3.slider("1銘柄許容損失（資産比%）", 0.25, 3.0, 1.0, 0.25, key="v177_risk")
-    price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 3.0, .5, key="v177_buffer")
+    reserve_pct = b1.slider("現金温存率（%）", 0, 80, 0, 5, key="v177_reserve", disabled=True)
+    daily_deploy_pct = b2.slider("1日使用上限（%）", 10, 100, 100, 5, key="v177_daily", disabled=True)
+    risk_per_trade_pct = b3.slider("1銘柄許容損失（資産比%）", 0.25, 3.0, 1.0, 0.25, key="v177_risk", disabled=True)
+    price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
     c1, c2 = st.columns(2)
-    universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n")
-    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool")
-    st.caption("標準：350銘柄 → 5年OOS検証済み一次選抜（45/30/25）で90銘柄 → 企業価値AIでTOP50。BUYはそのTOP50だけ。")
-    churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=True, key="v1716_churn_filter")
-    st.caption("試験設定：20日で5回以上のクロス＋25日騰落率±5%以内、または30日で買いGC後5日以内のDCが2回以上。損切り・保有銘柄の売り判定には適用しません。")
+    universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n", disabled=True)
+    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=True)
+    st.caption("売買条件を固定：新規は45銘柄の未保有株のみ、同時3銘柄・99株以内。保有銘柄は45銘柄外も売りを判定します。")
+    churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
+    st.caption("今回の主ロジックでは短期反転除外を使用しません。")
     quality_mode = st.checkbox("トレンド＋振れ幅フィルターを実売買判定に使用（検証後に切替）",
-                               value=False, key="v1717_quality_mode")
-    st.caption("オフは従来判定。TOP50一次選抜には直近のGC後5日成績を最大5点の小幅減点として加えます。")
+                               value=False, key="v1717_quality_mode", disabled=True)
+    st.caption("トレンド＋振れ幅フィルターは主ロジックでは使用しません。")
+
+# 既存のStreamlitセッションに過去の設定が残っていても検証済み条件を固定する。
+sl, churn_filter, quality_mode = 7.0, False, False
 
 run_clicked = st.button("▶ 今日の判定を更新", type="primary", use_container_width=True, key="v177_run")
 
-if run_clicked:
-    # 1) 数百銘柄の母集団を動的取得
-    with st.spinner("日本株の大きな母集団を取得中…"):
-        universe_df = discover_japan_stock_universe(int(universe_size))
-    st.session_state["v177_universe_df"] = universe_df
-    if isinstance(universe_df, pd.DataFrame) and not universe_df.empty:
-        for _, rr in universe_df.iterrows():
-            STOCK_NAMES[str(rr["コード"])] = str(rr["銘柄名"])
+if not run_clicked:
+    previous_universe = st.session_state.get("v177_universe_df", pd.DataFrame())
+    previous_codes = (set(previous_universe["コード"].astype(str))
+                      if isinstance(previous_universe, pd.DataFrame) and
+                      "コード" in previous_universe else set())
+    if previous_codes != set(VERIFIED_45_CODES):
+        for key in ("v177_universe_df", "v177_data", "v177_daily_bar_status",
+                    "v177_value_top50", "v1716_churn_audit", "v177_run_error"):
+            st.session_state.pop(key, None)
 
-    # 「本物TOP50」の最低条件。失敗時に旧49銘柄へ戻さない。
-    if not isinstance(universe_df, pd.DataFrame) or len(universe_df) < 200:
-        st.session_state["v177_data"] = {}
-        st.session_state["v177_daily_bar_status"] = pd.DataFrame()
+if run_clicked:
+    # 新規買いは5年の日足で検証できた旧固定リスト45銘柄だけ。
+    universe_df = pd.DataFrame([
+        {"コード": c, "銘柄名": STOCK_NAMES[c], "ticker": c + ".T"}
+        for c in VERIFIED_45_CODES
+    ])
+    st.session_state["v177_universe_df"] = universe_df
+    all_codes = list(dict.fromkeys(list(VERIFIED_45_CODES) + [str(c) for c in held_codes]))
+    all_tickers = tuple(tickers(",".join(all_codes)))
+    with st.spinner(f"{len(all_tickers)}銘柄の日足を一括取得中…"):
+        data = batch_stock_data_light(all_tickers, months=15)
+    st.session_state["v177_data"] = data
+    st.session_state["v177_daily_bar_status"] = build_daily_bar_status(data)
+    mother_data = {t: d for t, d in data.items() if code(t) in VERIFIED_45_CODES}
+    if not mother_data:
+        # 固定45の取得失敗でも保有株の売り判定は止めない。
         st.session_state["v177_value_top50"] = pd.DataFrame()
         st.session_state["v1716_churn_audit"] = pd.DataFrame()
-        st.session_state["v177_run_error"] = "大規模母集団を200銘柄以上取得できなかったため、BUY判定を安全停止しました。旧49銘柄へは戻していません。"
+        st.session_state["v177_run_error"] = ("固定45銘柄と保有銘柄の日足を取得できませんでした。"
+                                               if not data else "")
     else:
-        universe_codes = universe_df["コード"].astype(str).tolist()
-        # SELL監視のため保有銘柄は母集団外でも追加する。
-        all_codes = list(dict.fromkeys(universe_codes + [str(c) for c in held_codes]))
-        all_tickers = tuple(tickers(",".join(all_codes)))
-        with st.spinner(f"{len(all_tickers)}銘柄の日足を一括取得中…"):
-            data = batch_stock_data_light(all_tickers, months=15)
-        st.session_state["v177_data"] = data
-        st.session_state["v177_daily_bar_status"] = build_daily_bar_status(data)
-        # データ取得成功数が小さすぎる場合も偽TOP50を作らない。
-        mother_data = {t:d for t,d in data.items() if code(t) in set(universe_codes)}
-        if len(mother_data) < 150:
-            st.session_state["v177_value_top50"] = pd.DataFrame()
-            st.session_state["v1716_churn_audit"] = pd.DataFrame()
-            st.session_state["v177_run_error"] = f"日足取得成功が{len(mother_data)}銘柄のみのため、BUY判定を安全停止しました。"
-        else:
-            with st.spinner("企業価値AIで一次選抜 → 本物TOP50を作成中…"):
-                value_top50_df, churn_audit_df = build_value_ai_top50(
-                    mother_data, max_rows=50, fundamental_pool_size=int(fundamental_pool_size),
-                    churn_filter=bool(churn_filter),
-                )
-            st.session_state["v177_value_top50"] = value_top50_df
-            st.session_state["v1716_churn_audit"] = churn_audit_df
-            st.session_state["v177_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
-            st.session_state["v177_run_error"] = ("反転検査後の候補が50銘柄未満のため新規買い判定を停止しました。"
-                                                  if value_top50_df.empty else "")
+        # 企業価値タブは参考表示として維持。売買対象は順位や評価で変えない。
+        eligible_count = sum(isinstance(d, pd.DataFrame) and len(d) >= 60
+                             for d in mother_data.values())
+        value_top50_df, _ = (build_value_ai_top50(
+            mother_data, max_rows=eligible_count, fundamental_pool_size=eligible_count,
+            churn_filter=False,
+        ) if eligible_count else (pd.DataFrame(), pd.DataFrame()))
+        st.session_state["v177_value_top50"] = value_top50_df
+        st.session_state["v1716_churn_audit"] = pd.DataFrame()
+        st.session_state["v177_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
+        st.session_state["v177_run_error"] = ""
 
 universe_df = st.session_state.get("v177_universe_df", pd.DataFrame())
 data = st.session_state.get("v177_data", {})
@@ -3701,30 +3797,28 @@ run_error = st.session_state.get("v177_run_error", "")
 daily_bar_status_df = st.session_state.get("v177_daily_bar_status", pd.DataFrame())
 
 # ------------------------------------------------------------
-# TOP50だけを新規BUY対象にする。SELLは保有全銘柄を監視。
+# 固定45銘柄の未保有株の新規BUYと、全保有銘柄のSELLを監視。
 # ------------------------------------------------------------
 buy_view = pd.DataFrame()
 sell_view = pd.DataFrame()
 buy_signal_rows, sell_signal_rows = [], []
 signal_audit_rows = []
-true_top50_codes = set()
+true_top50_codes = set(VERIFIED_45_CODES)
 value_judgement_by_code = {}
 if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
     value_meta = value_top50_df.head(50).copy()
     value_meta["コード"] = value_meta["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
-    true_top50_codes = set(value_meta["コード"].tolist())
     if "割安判定" in value_meta.columns:
         value_judgement_by_code = (
             value_meta.drop_duplicates("コード").set_index("コード")["割安判定"].astype(str).to_dict()
         )
-value_unrated_count = (int((~value_top50_df["企業価値算定済"].fillna(False).astype(bool)).sum())
-                       if isinstance(value_top50_df, pd.DataFrame) and "企業価値算定済" in value_top50_df else 0)
+value_unrated_count = 0  # 企業価値の算定可否は固定45銘柄の売買判定を止めない。
 held_code_set = set(map(str, held_codes))
 
 if data and true_top50_codes:
     for t, df0 in data.items():
         c = code(t)
-        # 新規BUYは本物TOP50のみ、SELLは保有のみ。それ以外は計算不要。
+        # 新規BUYは固定45の未保有株、保有銘柄は45銘柄外もSELLを判定する。
         if c not in true_top50_codes and c not in held_code_set:
             continue
         sx = stoch_quality_frame(df0, sl)
@@ -3738,22 +3832,24 @@ if data and true_top50_codes:
         buy_new = bool(r.get("BUY_改善", False))
         sell_old = bool(r.get("SELL_現行", False))
         sell_new = bool(r.get("SELL_改善", False))
-        buy_signal_hit = buy_new if quality_mode else buy_old
+        buy_signal_hit = buy_old
         value_judgement = value_judgement_by_code.get(c, "— 未算定")
         overvalued = "割高" in str(value_judgement)
         new_buy_target = c in true_top50_codes and c not in held_code_set
-        valuation_ready = bool(c in value_judgement_by_code and
-                               value_judgement not in ("算定不能", "— 未算定") and
-                               "⚠️" not in str(value_judgement))
-        final_buy_hit = bool(new_buy_target and buy_signal_hit and valuation_ready and not overvalued)
-        buy_skip_reason = ("企業価値が未算定のため新規買い停止" if new_buy_target and buy_signal_hit and not valuation_ready
-                           else "割高判定のため新規買い除外" if new_buy_target and buy_signal_hit and overvalued else "")
+        h = confirmed.get(c, {})
+        shares = int(safe_float(h.get("shares", 0)) or 0)
+        avg = safe_float(h.get("avg_price", np.nan))
+        pnl_pct = ((px / avg - 1.0) * 100.0) if np.isfinite(avg) and avg > 0 else np.nan
+        dc_hit = sell_old and np.isfinite(sk)
+        stop_hit = np.isfinite(pnl_pct) and pnl_pct <= -7.0
+        final_buy_hit = bool(new_buy_target and buy_signal_hit)
+        buy_skip_reason = ""
         if c in true_top50_codes or c in held_code_set:
             signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else "TOP50",
                                       "現行買い": buy_old, "改善買い": buy_new,
                                       "採用方式の買いシグナル": bool(buy_signal_hit),
                                       "銘柄判定": value_judgement,
-                                      "割高除外": bool(overvalued and new_buy_target),
+                                      "割高除外": False,
                                       "最終買い": final_buy_hit,
                                       "買い見送り理由": buy_skip_reason,
                                       "現行売り": sell_old if c in held_code_set else False,
@@ -3766,19 +3862,13 @@ if data and true_top50_codes:
             buy_signal_rows.append({
                 "コード": c, "銘柄名": name(t), "総合AIスコア": 100.0-float(sk),
                 "現在株価": float(px), "%K": float(sk), "%D": float(sd),
-                "条件": "買い条件成立＋割高除外通過",
+                "条件": "固定45銘柄の新規買い",
             })
         if c in held_code_set:
-            h = confirmed.get(c, {})
-            shares = int(safe_float(h.get("shares", 0)) or 0)
-            avg = safe_float(h.get("avg_price", np.nan))
-            pnl_pct = ((px / avg - 1.0) * 100.0) if np.isfinite(avg) and avg > 0 else np.nan
-            dc_hit = (sell_new if quality_mode else sell_old) and np.isfinite(sk)
-            stop_hit = np.isfinite(pnl_pct) and pnl_pct <= -float(sl)
             if dc_hit or stop_hit:
                 reasons=[]
-                if stop_hit: reasons.append(f"損切り -{float(sl):.1f}%")
-                if dc_hit: reasons.append("トレンド確認DC" if quality_mode else "ストキャスDC")
+                if stop_hit: reasons.append("損切り -7.0%")
+                if dc_hit: reasons.append("ストキャスDC")
                 sell_signal_rows.append({
                     "コード":c,"銘柄名":name(t),"保有株数":shares,"取得単価":avg,"現在株価":float(px),
                     "損益率%":pnl_pct,"%K":float(sk) if np.isfinite(sk) else np.nan,
@@ -3800,11 +3890,8 @@ trend_by_code = {str(r["コード"]): r for r in signal_audit_rows}
 
 if buy_signal_rows:
     buy_signal_df = pd.DataFrame(buy_signal_rows).sort_values(["%K","コード"]).reset_index(drop=True)
-    plan = build_purchase_plan(
+    plan = build_fixed45_purchase_plan(
         buy_signal_df, buying_power, current_assets, held_codes,
-        max(int(maxpos), len(held_code_set)+3), maxbuy, sl,
-        reserve_pct, daily_deploy_pct, risk_per_trade_pct, price_buffer_pct,
-        allow_addon=False, market_block=False,
     )
     buy_view = plan.merge(buy_signal_df[["コード","%K","%D","条件"]], on="コード", how="left")
     buy_view = buy_view.rename(columns={"購入株数":"参考S株数","予定購入額":"概算購入額"})
@@ -4253,10 +4340,6 @@ with main_tab:
     elif not data or not true_top50_codes:
         st.info("「今日の判定を更新」を押してください。")
     else:
-        if value_unrated_count:
-            st.warning(f"企業価値を算定できない銘柄がTOP50中{value_unrated_count}件あります。該当銘柄の新規買いは停止しています。日足による保有銘柄の売り判定は表示します。")
-            if not jquants_api_key():
-                st.caption("J-Quants無料プランの補完はAPIキー未設定のため停止中です。")
         st.subheader("🔻 売り")
         if sell_view.empty:
             st.success("売り候補はありません。")
@@ -4267,21 +4350,15 @@ with main_tab:
                 st.dataframe(sell_display, use_container_width=True, hide_index=True)
 
         st.subheader("🟢 買い")
-        if not overvalued_buy_exclusions_df.empty:
-            st.caption(f"割高判定により {len(overvalued_buy_exclusions_df)}銘柄を買い候補から除外しました。")
         if buy_view.empty:
-            st.info("企業価値を算定でき、現在BUY条件も満たす銘柄はありません。" if value_unrated_count else
-                    "本物の企業価値AI TOP50内に、現在BUY条件を満たす銘柄はありません。")
+            st.info("固定45銘柄と保有銘柄に、現在の買い条件を満たす銘柄はありません。")
         else:
             render_mobile_trade_cards(buy_view, "buy", trend_by_code)
             simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","参考S株数","%K","%D","買付可否"] if c in buy_view.columns]
             with st.expander("買い候補の詳細表", expanded=False):
                 buy_display = buy_view[simple_buy_cols].rename(columns={"割安判定": "銘柄判定"}).copy()
-                if "銘柄判定" in buy_display and "買付可否" in buy_display:
-                    overvalued = buy_display["銘柄判定"].astype(str).str.contains("割高", na=False)
-                    buy_display.loc[overvalued, "買付可否"] = "⛔ 割高：買い見送ってください"
                 st.dataframe(buy_display, use_container_width=True, hide_index=True)
-        st.caption(f"新規BUY監視：企業価値AI TOP50のみ / SELL監視：現在保有 {len(held_codes)}銘柄")
+        st.caption(f"新規買い：固定45銘柄の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定は参考表示")
 
 with admin_tab:
     st.caption("比較・検証用。通常の朝はここを見る必要はありません。")
@@ -4291,7 +4368,7 @@ with admin_tab:
     c1,c2,c3,c4=st.columns(4)
     c1.metric("母集団", f"{ucnt}銘柄")
     c2.metric("日足取得", f"{dcnt}銘柄")
-    c3.metric("AI TOP", f"{tcnt}銘柄")
+    c3.metric("固定45監視", f"{len(true_top50_codes)}銘柄")
     c4.metric("保有", f"{len(held_codes)}銘柄")
 
     with st.expander("🔎 TOP50選定前の短期反転チェック", expanded=False):
@@ -4316,10 +4393,10 @@ with admin_tab:
     ])
 
     with value_tab:
-        st.caption("企業価値AI TOP50：重要列だけを先に表示します。")
+        st.caption("固定45銘柄の企業価値は参考情報です。売買対象や買い判断には使用しません。")
         st.caption("財務の鮮度は開示日・期末日で確認します。J-Quants無料版は12週間遅延するため、最新開示との一致は確認できません。")
         if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
-            st.info("先に『今日の判定を更新』で企業価値AI TOP50を作成してください。")
+            st.info("先に『今日の判定を更新』で固定45銘柄のデータを取得してください。")
         else:
             value_show = add_research_judgements_first(value_top50_df, surge_top50_df, value_top50_df)
             show_cols=[
@@ -4418,7 +4495,7 @@ with admin_tab:
                                        file_name=filename, mime="text/csv", key="v1717_" + filename)
 
         with st.expander("🧪 割高除外・保有買い増しの比較バックテスト", expanded=False):
-            st.caption("5年日足で現行売買と買い増しを比較。判定日の終値で判断し、翌営業日の始値で約定します。")
+            st.caption("過去の研究用比較です。主ロジックでは買い増しを行いません。判定日の終値で判断し、翌営業日の始値で約定します。")
             st.warning("割高除外の過去検証には、各評価日当時に公表・取得できたAI参考価値が必要です。現在のTOP50や現在の参考価値を過去へ流用しません。過去評価CSVがない場合は買い増しだけを比較します。")
             new_history_file = st.file_uploader("5年日足ZIPまたはCSV", type=["zip", "csv"], key="v1718_history")
             new_value_file = st.file_uploader("過去時点の企業価値CSV（任意）", type=["csv"], key="v1718_values")
@@ -4574,10 +4651,10 @@ try:
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "新規BUY対象":"企業価値AI TOP50のみ","BUY条件":"トレンド＋振れ幅＋GC" if quality_mode else "Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
-            "割高の新規BUY除外":True,
-            "SELL条件":f"保有銘柄のみ / {'トレンド確認DC' if quality_mode else 'Slow Stoch DC'} または 損切り -{float(sl):.1f}%",
-            "旧49銘柄固定ユニバース使用":False,
+            "新規BUY対象":"検証済み固定45銘柄の未保有株のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
+            "割高の新規BUY除外":False,
+            "SELL条件":"全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%",
+            "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":True,
             "短期反転フィルター":bool(churn_filter),
             "トレンド振れ幅フィルター実売買":bool(quality_mode),
         }])
@@ -4611,7 +4688,7 @@ try:
         zf.writestr("surge_prediction_top50.csv", surge_export.to_csv(index=False,encoding="utf-8-sig"))
         surge_summary = pd.DataFrame([{
             "生成日時": st.session_state.get("v177_generated_at",""),
-            "対象": "企業価値AI TOP50のみ",
+            "対象": "固定45銘柄のみ（参考センサー）",
             "強い急騰予兆_70点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 70).sum()),
             "急騰予兆_55点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55).sum()),
             "変化検知_40点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 40).sum()),

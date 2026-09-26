@@ -41,7 +41,7 @@ st.set_page_config(
 )
 
 VERSION = "17.21 FIXED45 STOCH NO ADDON"
-BUILD = "VER17-21-FIXED45-GC20-DC-STOP7-NOADDON-20260926"
+BUILD = "VER17-21-FIXED45-GC20-DC-STOP7-STATUSFIX-20260926"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -4421,7 +4421,7 @@ with admin_tab:
                 admin_judgement_table(value_full, "v7_value_full", 560)
 
         with st.expander("🧪 5年OOS検証メモ", expanded=False):
-            st.caption("過去時点のOHLCVだけで作るTOP50フィルターを70%学習 / 30%未学習で検証。企業価値ファンダメンタル自体の過去再現ではありません。")
+            st.caption("旧TOP50一次選抜方式の研究記録です。現在の固定45銘柄の売買や今回の検証成績には使用しません。")
             st.write("採用値：流動性45% / トレンド30% / 値動き安定性25%")
             st.write("学習期間：+54.27% / PF 2.10 / 最大DD -10.04% / 257決済")
             st.write("OOS期間：+16.10% / PF 1.89 / 最大DD -5.25% / 81決済")
@@ -4650,7 +4650,9 @@ try:
         settings_df=pd.DataFrame([{
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
-            "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
+            "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":0,
+            "固定45監視件数":len(VERIFIED_45_CODES),
+            "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "新規BUY対象":"検証済み固定45銘柄の未保有株のみ","BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
             "割高の新規BUY除外":False,
             "SELL条件":"全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%",
@@ -4712,13 +4714,15 @@ try:
         compare_summary = pd.DataFrame([compare_summary_row])
         zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
         status_df=pd.DataFrame([{
-            "本物TOP50モード":True,"母集団最低200銘柄ガード":True,
+            "本物TOP50モード":False,"母集団最低200銘柄ガード":False,
+            "固定45銘柄モード":True,"固定45監視件数":len(VERIFIED_45_CODES),
             "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
             "当日確定日足件数":int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum()) if isinstance(daily_bar_status_df,pd.DataFrame) and not daily_bar_status_df.empty else 0,
-            "TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "一次選抜_流動性重み":0.45,"一次選抜_トレンド重み":0.30,"一次選抜_安定性重み":0.25,
-            "OOS検証済み":True,"OOS_PF参考":1.89,"5年通算PF参考":2.09,
+            "TOP50件数":0,
+            "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
+            "一次選抜_流動性重み":np.nan,"一次選抜_トレンド重み":np.nan,"一次選抜_安定性重み":np.nan,
+            "OOS検証済み":False,"OOS_PF参考":np.nan,"5年通算PF参考":np.nan,
             "BUY候補件数":len(buy_export),"割高除外件数":len(overvalued_buy_exclusions_df),
             "企業価値未算定件数":value_unrated_count,
             "SELL候補件数":len(sell_view),"エラー":run_error,

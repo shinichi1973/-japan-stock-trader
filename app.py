@@ -3927,7 +3927,8 @@ def _fl_fetch_worker(state, key, codes):
 
 def _fl_events(state):
     records = []
-    for code4, rows in state["rows"].items():
+    # 取得スレッドが辞書へ銘柄を追加するため、表示側は時点スナップショットを読む。
+    for code4, rows in list(state["rows"].items()):
         for r in rows:
             d = pd.to_datetime(r.get("DiscDate"), errors="coerce")
             if pd.isna(d):

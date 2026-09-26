@@ -4542,4 +4542,58 @@ try:
         if not sbi_warning_df.empty:
             zf.writestr("sbi_history_warnings.csv",sbi_warning_df.to_csv(index=False,encoding="utf-8-sig"))
         buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","%K","%D","AI_TOP50スコア","割安判定","買付可否"]
-        buy_export=buy_view.copy() if isinstance(buy_view,pd.DataFrame) and not buy_view.empty else 
+        if isinstance(buy_view, pd.DataFrame) and not buy_view.empty:
+            buy_export = buy_view.copy()
+        else:
+            buy_export = pd.DataFrame(columns=buy_cols_default)
+        zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
+        compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()
+        zf.writestr("indicator_compare_candidates.csv", compare_export.to_csv(index=False,encoding="utf-8-sig"))
+        surge_export = surge_top50_df.copy() if isinstance(surge_top50_df, pd.DataFrame) else pd.DataFrame()
+        zf.writestr("surge_prediction_top50.csv", surge_export.to_csv(index=False,encoding="utf-8-sig"))
+        surge_summary = pd.DataFrame([{
+            "生成日時": st.session_state.get("v177_generated_at",""),
+            "対象": "企業価値AI TOP50のみ",
+            "強い急騰予兆_70点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 70).sum()),
+            "急騰予兆_55点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55).sum()),
+            "変化検知_40点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 40).sum()),
+            "予兆55点以上かつStoch_BUY": int(((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55) & surge_export.get("Stoch_BUY", pd.Series(False, index=surge_export.index)).fillna(False).astype(bool)).sum()),
+            "株価2000円以上除外": False,
+            "ニュース加点": False,
+            "実売買へ影響": False,
+        }])
+        zf.writestr("surge_prediction_summary.csv", surge_summary.to_csv(index=False,encoding="utf-8-sig"))
+        compare_summary_row = {
+            "生成日時": st.session_state.get("v177_generated_at",""),
+            "実売買方式": "Stoch 14,3,3 / %K<=20 GC",
+            "研究_RSI5": "RSI(5) 15以下から15上抜け",
+            "研究_BB20": "BB20 -2σ外から内側復帰",
+            "Stoch_BUY件数": int(compare_export["Stoch_BUY"].sum()) if not compare_export.empty and "Stoch_BUY" in compare_export else 0,
+            "RSI5_BUY件数": int(compare_export["RSI5_BUY"].sum()) if not compare_export.empty and "RSI5_BUY" in compare_export else 0,
+            "BB20_BUY件数": int(compare_export["BB20_BUY"].sum()) if not compare_export.empty and "BB20_BUY" in compare_export else 0,
+            "2方式以上一致件数": int((pd.to_numeric(compare_export["一致数"], errors="coerce") >= 2).sum()) if not compare_export.empty and "一致数" in compare_export else 0,
+            "実売買へ影響": False,
+        }
+        compare_summary = pd.DataFrame([compare_summary_row])
+        zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
+        status_df=pd.DataFrame([{
+            "本物TOP50モード":True,"母集団最低200銘柄ガード":True,
+            "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
+            "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
+            "当日確定日足件数":int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum()) if isinstance(daily_bar_status_df,pd.DataFrame) and not daily_bar_status_df.empty else 0,
+            "TOP50件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
+            "一次選抜_流動性重み":0.45,"一次選抜_トレンド重み":0.30,"一次選抜_安定性重み":0.25,
+            "OOS検証済み":True,"OOS_PF参考":1.89,"5年通算PF参考":2.09,
+            "BUY候補件数":len(buy_export),"割高除外件数":len(overvalued_buy_exclusions_df),
+            "企業価値未算定件数":value_unrated_count,
+            "SELL候補件数":len(sell_view),"エラー":run_error,
+            "生成日時":st.session_state.get("v177_generated_at","")
+        }])
+        zf.writestr("value_ai_status.csv",status_df.to_csv(index=False,encoding="utf-8-sig"))
+    zip_buf.seek(0)
+    st.download_button("📦 全処理結果ZIP",data=zip_buf.getvalue(),file_name="ver17_all_analysis.zip",mime="application/zip",use_container_width=True,key="v177_zip")
+except Exception as e:
+    st.warning(f"ZIP作成エラー: {e}")
+
+st.caption("売買判断補助です。自動発注は行いません。")

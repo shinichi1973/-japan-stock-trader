@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.0
-# BUILD: VER17-24-0-ALLOCATION-20261007
+# 日本株 AI投資アシスタント Ver.17.24.1
+# BUILD: VER17-24-1-HISTORY-GUARD-20261007
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.0",
+    page_title="日本株 AI投資アシスタント Ver.17.24.1",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.0 ALLOCATION LOT RESEARCH"
-BUILD = "VER17-24-0-ALLOCATION-20261007"
+VERSION = "17.24.1 ALLOCATION LOT RESEARCH"
+BUILD = "VER17-24-1-HISTORY-GUARD-20261007"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2225,10 +2225,19 @@ def prepare_allocation_history(history):
     if h.empty:
         raise ValueError("有効な日足がありません")
     frames = {}
+    excluded = []
     split_aware = "Stock Splits" in h.columns
     for c, group in h.groupby("コード"):
         g = group.sort_values("日付").drop_duplicates("日付", keep="last").set_index("日付")
         if len(g) < 80:
+            excluded.append({"コード":c,"理由":"有効日足80日未満","日付":"","終値":np.nan,"前日比倍率":np.nan})
+            continue
+        # Yahooの分割調整済み終値で非連続・異常履歴を検出。黙って利益として計上しない。
+        ratio = g["Close"].div(g["Close"].shift(1))
+        broken = ratio.gt(3) | ratio.lt(0.2)
+        if broken.any():
+            day = broken[broken].index[0]
+            excluded.append({"コード":c,"理由":"調整済み終値が3倍超/5分の1未満に非連続。要確認のため銘柄全体を除外",                             "日付":str(day.date()),"終値":float(g.loc[day,"Close"]),"前日比倍率":float(ratio.loc[day])})
             continue
         # シグナルは現行関数と同じ調整価格。注文価格はYahooの分割調整済みOHLCから当時価格へ戻す。
         x = stoch_quality_frame(g)
@@ -2244,7 +2253,7 @@ def prepare_allocation_history(history):
         frames[c] = x
     if not frames:
         raise ValueError("80日以上の日足がある銘柄がありません")
-    return frames, split_aware
+    return frames, split_aware, pd.DataFrame(excluded, columns=["コード","理由","日付","終値","前日比倍率"])
 
 
 def allocation_portfolio_backtest(frames, allowed_codes, start, end, initial_cash=600000,
@@ -2409,7 +2418,10 @@ def render_allocation_research():
                         broad_codes = set(pd.read_csv(z.open("expanded_universe.csv"),dtype={"コード":str})["コード"])
             else:
                 history = pd.read_csv(io.BytesIO(payload),dtype={"コード":str})
-            frames, split_aware = prepare_allocation_history(history)
+            frames, split_aware, history_exclusions = prepare_allocation_history(history)
+            if not history_exclusions.empty:
+                st.warning(f"履歴の異常・不足で{len(history_exclusions)}銘柄を除外しています。")
+                st.dataframe(history_exclusions, use_container_width=True, hide_index=True)
             all_dates = sorted(set(d for x in frames.values() for d in x.index))
             first,last = all_dates[0].date(),all_dates[-1].date()
             start = st.date_input("比較開始日", min(last,first+timedelta(days=120)),min_value=first,max_value=last,key="v1724_start")
@@ -2462,6 +2474,7 @@ def render_allocation_research():
                 with ZipFile(buf,"w") as z:
                     z.writestr("comparison.csv",pd.DataFrame([r[0] for r in results]).to_csv(index=False,encoding="utf-8-sig"))
                     z.writestr("parameters.csv",pd.DataFrame([params]).to_csv(index=False,encoding="utf-8-sig"))
+                    z.writestr("history_exclusions.csv",history_exclusions.to_csv(index=False,encoding="utf-8-sig"))
                     for i,(summary,trades,curve,opened) in enumerate(results):
                         for key,frame in [("trades",trades),("equity",curve),("open_positions",opened)]:
                             z.writestr(f"scenario_{i:02d}_{key}.csv",frame.to_csv(index=False,encoding="utf-8-sig"))
@@ -4195,7 +4208,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.0")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.1")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("%K≤20のGCで買い → DCまたは終値で−7%なら翌朝売り")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")

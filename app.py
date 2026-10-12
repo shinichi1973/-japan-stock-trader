@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.2
-# BUILD: VER17-24-2-TOPIX-TOP50-20261012
+# 日本株 AI投資アシスタント Ver.17.24.3
+# BUILD: VER17-24-3-TOPIX-SIGNAL-FIRST-20261012
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.2",
+    page_title="日本株 AI投資アシスタント Ver.17.24.3",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.2 TOPIX AI TOP50"
-BUILD = "VER17-24-2-TOPIX-TOP50-20261012"
+VERSION = "17.24.3 TOPIX シグナル先行"
+BUILD = "VER17-24-3-TOPIX-SIGNAL-FIRST-20261012"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1533,6 +1533,8 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
                               revenue_growth, earnings_growth, trailing_eps,
                               forward_eps, target_mean)
         has_fundamentals = any(np.isfinite(x) for x in fundamental_fields)
+        if not has_fundamentals and yahoo_status == "OK":
+            yahoo_status = "応答に財務指標なし（取得元で欠損）"
 
         # Yahooが返す直近株式分割情報。基準の違うEPS/目標株価を混ぜないため最優先で確認。
         split_factor_raw = info.get("lastSplitFactor")
@@ -2495,7 +2497,8 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
         return pd.DataFrame(columns=cols)
     held = set(map(str, held_codes or []))
     x = candidates[~candidates["コード"].astype(str).isin(held)].copy()
-    x = x.sort_values(["%K", "コード"], ascending=[True, True]).head(3)
+    x = (x.sort_values(["候補スコア", "%K", "コード"], ascending=[False, True, True])
+         if "候補スコア" in x else x.sort_values(["%K", "コード"], ascending=[True, True])).head(3)
     remaining = max(float(buying_power or 0), 0)
     assets = max(float(current_assets or 0), remaining)
     new_slots = max(3 - len(held), 0)
@@ -2890,6 +2893,33 @@ def stoch_churn_diagnostic(df):
     return {"直近20日クロス回数": flips, "直近30日早期反転回数": int(early),
             "25日騰落率_反転検査%": round(ret25, 2) if np.isfinite(ret25) else np.nan,
             "新規買い除外理由": "／".join(reasons)}
+
+
+def signal_first_candidates(data, held_codes, min_turnover=0, filter_downtrend=False, filter_churn=False):
+    """当日までの確定日足だけから候補を抽出。財務評価は呼出し側で行う。"""
+    rows = []
+    held = set(map(str, held_codes))
+    for t, df in (data or {}).items():
+        if df is None or len(df) < 60 or code(t) in held:
+            continue
+        sx = stoch_quality_frame(df)
+        r = sx.iloc[-1]
+        if not bool(r.get("BUY_現行", False)):
+            continue
+        turnover = safe_float((df["Close"] * df["Volume"]).tail(20).mean())
+        reasons = []
+        if df.attrs.get("daily_bar_status") != "🟢 当日確定":
+            reasons.append("最新確定日足を確認できず")
+        if not np.isfinite(turnover) or turnover < min_turnover:
+            reasons.append("流動性不足")
+        if filter_downtrend and bool(r.get("下降確認", False)):
+            reasons.append("下降確認")
+        diagnostic = stoch_churn_diagnostic(df)
+        if filter_churn and diagnostic["新規買い除外理由"]:
+            reasons.append(diagnostic["新規買い除外理由"])
+        rows.append({"ticker": t, "コード": code(t), "銘柄名": name(t),
+                     "抽出除外理由": "／".join(reasons), "20日平均売買代金": turnover})
+    return pd.DataFrame(rows, columns=["ticker", "コード", "銘柄名", "抽出除外理由", "20日平均売買代金"])
 
 
 def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filter=True):
@@ -4250,7 +4280,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.2")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.3")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("%K≤20のGCで買い → DCまたは終値で−7%なら翌朝売り")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -4320,7 +4350,13 @@ for _key, _fixed in {
 }.items():
     st.session_state[_key] = _fixed
 with st.expander("⚙ 購入額・注文方式", expanded=False):
-    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIXからAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], key="v17242_universe")
+    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX全体から買いシグナル先行", "TOPIXからAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], key="v17243_universe")
+    signal_first = live_universe_mode == "TOPIX全体から買いシグナル先行"
+    block_unrated = st.checkbox("企業価値の判定不能は新規買いを見送る", value=True, key="v17243_unrated", disabled=not signal_first)
+    min_turnover = st.number_input("買い候補の20日平均売買代金下限（円・0で無効）", 0, 10000000000, 0, 10000000, key="v17243_liquidity", disabled=not signal_first)
+    filter_downtrend = st.checkbox("下降確認の候補を除外（未検証）", value=False, key="v17243_down", disabled=not signal_first)
+    filter_churn = st.checkbox("短期クロス多発の候補を除外（未検証）", value=False, key="v17243_churn", disabled=not signal_first)
+    st.caption("シグナル先行はTOPIX全体の最新確定日足からGCを抽出し、候補だけを評価・順位付けします。割高は除外。追加フィルターは単独比較用で初期値OFF。")
     cap_mode = st.selectbox("1銘柄の購入予算", ["資産の3分の1（従来）", "10万円", "15万円", "20万円"], key="v1724_cap")
     purchase_cap = {"資産の3分の1（従来）": 0, "10万円": 100000, "15万円": 150000, "20万円": 200000}[cap_mode]
     execution_mode = st.selectbox("実行する注文方式", ["自動（通常注文優先・不足はS株）", "S株のみ（1〜99株）", "100株単位（通常注文）"], key="v1724_order")
@@ -4342,8 +4378,8 @@ with st.expander("⚙ 管理者設定", expanded=False):
     price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
     c1, c2 = st.columns(2)
     universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n", disabled=True)
-    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode != "TOPIXからAI選定TOP50")
-    st.caption("TOPIXモード：JPX最新公開一覧の全銘柄を一次評価し、上位候補を企業価値評価して50銘柄を選定。日足取得に時間がかかります。公開一覧はリアルタイム構成と差が生じる場合があります。")
+    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIXからAI選定TOP50", "TOPIX全体から買いシグナル先行"))
+    st.caption("TOPIXシグナル先行は全銘柄のGC候補を抽出して評価。従来TOP50モードも選択できます。JPX公開一覧には基準日との差がある場合があります。")
     st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
     churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
     st.caption("今回の主ロジックでは短期反転除外を使用しません。")
@@ -4370,7 +4406,7 @@ if not run_clicked:
 if run_clicked:
     universe_error = ""
     try:
-        universe_df = (discover_topix_stock_universe() if live_universe_mode == "TOPIXからAI選定TOP50"
+        universe_df = (discover_topix_stock_universe() if live_universe_mode in ("TOPIXからAI選定TOP50", "TOPIX全体から買いシグナル先行")
                        else pd.DataFrame([
                            {"コード": c, "銘柄名": STOCK_NAMES[c], "ticker": c + ".T"}
                            for c in VERIFIED_45_CODES
@@ -4404,8 +4440,8 @@ if run_clicked:
         eligible_count = sum(isinstance(d, pd.DataFrame) and len(d) >= 60
                              for d in mother_data.values())
         value_top50_df, _ = (build_value_ai_top50(
-            mother_data, max_rows=50 if live_universe_mode == "TOPIXからAI選定TOP50" else eligible_count,
-            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode == "TOPIXからAI選定TOP50" else eligible_count,
+            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIXからAI選定TOP50", "TOPIX全体から買いシグナル先行") else eligible_count,
+            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIXからAI選定TOP50", "TOPIX全体から買いシグナル先行") else eligible_count,
             churn_filter=False,
         ) if eligible_count else (pd.DataFrame(), pd.DataFrame()))
         st.session_state["v177_value_top50"] = value_top50_df
@@ -4434,6 +4470,20 @@ true_top50_codes = (set(value_top50_df["コード"].astype(str))
                     if isinstance(value_top50_df, pd.DataFrame) and "コード" in value_top50_df else set()) if live_universe_mode == "TOPIXからAI選定TOP50" else (
                     set(universe_df["コード"].astype(str))
                     if isinstance(universe_df, pd.DataFrame) and "コード" in universe_df else set())
+signal_first_audit_df = pd.DataFrame()
+signal_value_df = pd.DataFrame()
+if signal_first:
+    mother_codes = set(universe_df["コード"].astype(str)) if "コード" in universe_df else set()
+    signal_data = {t: df for t, df in data.items() if code(t) in mother_codes}
+    signal_first_audit_df = signal_first_candidates(signal_data, all_held_codes, min_turnover, filter_downtrend, filter_churn)
+    pass_tickers = set(signal_first_audit_df.loc[signal_first_audit_df["抽出除外理由"].eq(""), "ticker"])
+    candidate_data = {t: df for t, df in signal_data.items() if t in pass_tickers}
+    if candidate_data:
+        signal_value_df, _ = build_value_ai_top50(candidate_data, max_rows=len(candidate_data), fundamental_pool_size=len(candidate_data), churn_filter=False)
+        signal_value_df["候補スコア"] = signal_value_df["一次選抜スコア"]
+        signal_value_df = signal_value_df.sort_values(["候補スコア", "コード"], ascending=[False, True]).reset_index(drop=True)
+        signal_value_df["順位"] = np.arange(1, len(signal_value_df) + 1)
+    true_top50_codes = mother_codes
 value_judgement_by_code = {}
 if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
     value_meta = value_top50_df.head(50).copy()
@@ -4442,6 +4492,10 @@ if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
         value_judgement_by_code = (
             value_meta.drop_duplicates("コード").set_index("コード")["割安判定"].astype(str).to_dict()
         )
+if signal_first and not signal_value_df.empty:
+    value_judgement_by_code.update(signal_value_df.set_index("コード")["割安判定"].astype(str).to_dict())
+signal_meta_by_code = signal_value_df.set_index("コード").to_dict("index") if not signal_value_df.empty else {}
+extract_reason_by_code = signal_first_audit_df.set_index("コード")["抽出除外理由"].to_dict() if not signal_first_audit_df.empty else {}
 value_unrated_count = 0  # 企業価値の算定可否は固定45銘柄の売買判定を止めない。
 held_code_set = set(map(str, held_codes))
 
@@ -4474,12 +4528,21 @@ if data and (true_top50_codes or held_code_set):
         stop_hit = np.isfinite(pnl_pct) and pnl_pct <= -7.0
         final_buy_hit = bool(new_buy_target and buy_signal_hit)
         buy_skip_reason = ""
+        if signal_first and new_buy_target and buy_signal_hit:
+            buy_skip_reason = extract_reason_by_code.get(c, "日足不足または抽出対象外")
+            meta = signal_meta_by_code.get(c, {})
+            if not buy_skip_reason and overvalued:
+                buy_skip_reason = "割高判定のため新規買い除外"
+            if not buy_skip_reason and block_unrated and not bool(meta.get("企業価値算定済", False)):
+                buy_skip_reason = "企業価値判定不能のため新規買い見送り"
+                value_unrated_count += 1
+            final_buy_hit = final_buy_hit and not buy_skip_reason
         if c in true_top50_codes or c in held_code_set:
-            signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else "TOP50",
+            signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else ("TOPIX全体" if signal_first else "監視対象"),
                                       "現行買い": buy_old, "改善買い": buy_new,
                                       "採用方式の買いシグナル": bool(buy_signal_hit),
                                       "銘柄判定": value_judgement,
-                                      "割高除外": False,
+                                      "割高除外": bool(signal_first and overvalued),
                                       "最終買い": final_buy_hit,
                                       "買い見送り理由": buy_skip_reason,
                                       "現行売り": sell_old if c in held_code_set else False,
@@ -4490,7 +4553,8 @@ if data and (true_top50_codes or held_code_set):
                                       "%K": sk, "%D": sd})
         if final_buy_hit:
             buy_signal_rows.append({
-                "コード": c, "銘柄名": name(t), "総合AIスコア": 100.0-float(sk),
+                "コード": c, "銘柄名": name(t), "総合AIスコア": safe_float(signal_meta_by_code.get(c, {}).get("候補スコア"), 100.0-float(sk)),
+                **({"候補スコア": safe_float(signal_meta_by_code.get(c, {}).get("候補スコア"), 0)} if signal_first else {}),
                 "現在株価": float(px), "%K": float(sk), "%D": float(sd),
                 "条件": live_universe_mode + "の新規買い",
             })
@@ -4506,6 +4570,11 @@ if data and (true_top50_codes or held_code_set):
                 })
 
 signal_audit_df = pd.DataFrame(signal_audit_rows)
+if signal_first and not signal_first_audit_df.empty:
+    with st.expander("TOPIX買いシグナルの抽出・見送り理由", expanded=False):
+        st.caption(f"GC抽出 {len(signal_first_audit_df)}銘柄 / 財務判定不能による見送り {value_unrated_count}銘柄。候補スコアは流動性45%・トレンド30%・安定性25%を基に順位付け（本方式は未検証）。")
+        st.dataframe(signal_audit_df[signal_audit_df["現行買い"].eq(True)], use_container_width=True, hide_index=True)
+
 if not signal_audit_df.empty and "買い見送り理由" in signal_audit_df.columns:
     overvalued_buy_exclusions_df = signal_audit_df[
         signal_audit_df["買い見送り理由"].eq("割高判定のため新規買い除外")
@@ -4519,7 +4588,8 @@ else:
 trend_by_code = {str(r["コード"]): r for r in signal_audit_rows}
 
 if buy_signal_rows:
-    buy_signal_df = pd.DataFrame(buy_signal_rows).sort_values(["%K","コード"]).reset_index(drop=True)
+    buy_signal_df = pd.DataFrame(buy_signal_rows)
+    buy_signal_df = (buy_signal_df.sort_values(["候補スコア", "%K", "コード"], ascending=[False, True, True]) if signal_first else buy_signal_df.sort_values(["%K", "コード"])).reset_index(drop=True)
     plan = build_fixed45_purchase_plan(
         buy_signal_df, short_buying_power, current_assets, held_codes,
         purchase_cap, execution_mode, lot_cap,
@@ -4529,11 +4599,12 @@ if buy_signal_rows:
     buy_view["参考購入株数"] = buy_view["参考S株数"]
     buy_view["S株注文参考株数"] = buy_view["参考S株数"].where(buy_view["注文区分"].str.startswith("S株"), 0)
     buy_view["参考S株数"] = buy_view["S株注文参考株数"]
-    meta_cols=[c for c in ["コード","順位","AI_TOP50スコア","割安判定"] if c in value_top50_df.columns]
+    buy_meta_df = signal_value_df if signal_first else value_top50_df
+    meta_cols=[c for c in ["コード","順位","候補スコア","AI_TOP50スコア","割安判定"] if c in buy_meta_df.columns]
     if meta_cols:
-        m=value_top50_df[meta_cols].copy(); m["コード"]=m["コード"].astype(str); buy_view["コード"]=buy_view["コード"].astype(str)
+        m=buy_meta_df[meta_cols].copy(); m["コード"]=m["コード"].astype(str); buy_view["コード"]=buy_view["コード"].astype(str)
         buy_view=buy_view.merge(m,on="コード",how="left")
-    cols=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","%K","%D","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","見送り理由"]
+    cols=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","%K","%D","候補スコア","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","見送り理由"]
     buy_view=buy_view[[c for c in cols if c in buy_view.columns]].head(3).copy()
     for c in ["現在株価","概算購入額"]:
         if c in buy_view: buy_view[c]=pd.to_numeric(buy_view[c],errors="coerce").round(0)
@@ -4990,7 +5061,7 @@ with main_tab:
             with st.expander("買い候補の詳細表", expanded=False):
                 buy_display = buy_view[simple_buy_cols].rename(columns={"割安判定": "銘柄判定"}).copy()
                 st.dataframe(buy_display, use_container_width=True, hide_index=True)
-        st.caption(f"新規買い：{live_universe_mode}の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定は参考表示")
+        st.caption(f"新規買い：{live_universe_mode}の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定：{'割高・判定不能を除外' if signal_first and block_unrated else '割高を除外・判定不能は許可' if signal_first else '参考表示'}")
         with st.expander("100株単位・参考IFDOCO", expanded=False):
             ifd_table = build_reference_ifdoco(buy_view, ifd_take_profit, 7.0)
             if ifd_table.empty:
@@ -5294,10 +5365,10 @@ try:
             "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIXからAI選定TOP50" else 0,
             "固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "新規BUY対象":live_universe_mode + "の未保有株", "購入予算方式":cap_mode,
+            "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(signal_first and block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(signal_first and filter_downtrend), "クロス多発除外":bool(signal_first and filter_churn), "購入予算方式":cap_mode,
             "1銘柄購入予算":maxbuy, "通常注文予算":lot_cap, "注文方式":execution_mode,
             "IFDOCO参考利確率":ifd_take_profit,"BUY条件":"Slow Stoch 14,3,3 / %K<=20 GC","管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
-            "割高の新規BUY除外":False,
+            "割高の新規BUY除外":bool(signal_first),
             "SELL条件":"全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%",
             "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":live_universe_mode == "固定45銘柄",
             "短期反転フィルター":bool(churn_filter),
@@ -5308,6 +5379,9 @@ try:
             zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(value_top50_df,pd.DataFrame):
             zf.writestr("value_ai_top50.csv",value_top50_df.to_csv(index=False,encoding="utf-8-sig"))
+        if signal_first:
+            zf.writestr("signal_first_candidates.csv",signal_first_audit_df.to_csv(index=False,encoding="utf-8-sig"))
+            zf.writestr("signal_first_values.csv",signal_value_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(churn_audit_df,pd.DataFrame):
             zf.writestr("stoch_churn_audit.csv",churn_audit_df.to_csv(index=False,encoding="utf-8-sig"))
         zf.writestr("stoch_signal_quality_audit.csv", signal_audit_df.to_csv(index=False,encoding="utf-8-sig"))
@@ -5322,7 +5396,7 @@ try:
             } for c,v in confirmed.items()]).to_csv(index=False,encoding="utf-8-sig"))
         if not sbi_warning_df.empty:
             zf.writestr("sbi_history_warnings.csv",sbi_warning_df.to_csv(index=False,encoding="utf-8-sig"))
-        buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","%K","%D","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","見送り理由"]
+        buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","%K","%D","候補スコア","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","見送り理由"]
         if isinstance(buy_view, pd.DataFrame) and not buy_view.empty:
             buy_export = buy_view.copy()
         else:

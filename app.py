@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.3
-# BUILD: VER17-24-3-TOPIX-SIGNAL-FIRST-20261012
+# 日本株 AI投資アシスタント Ver.17.24.4
+# BUILD: VER17-24-4-TOPIX-N225-SIGNAL-FIRST-20261012
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.3",
+    page_title="日本株 AI投資アシスタント Ver.17.24.4",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.3 TOPIX シグナル先行"
-BUILD = "VER17-24-3-TOPIX-SIGNAL-FIRST-20261012"
+VERSION = "17.24.4 TOPIX＋日経225 シグナル先行"
+BUILD = "VER17-24-4-TOPIX-N225-SIGNAL-FIRST-20261012"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3119,6 +3119,75 @@ def discover_topix_stock_universe():
     return parse_topix_constituents(response.content)
 
 
+class NikkeiConstituentParser(HTMLParser):
+    """公式構成一覧の表セルを読み、リンクを含む銘柄名を保持する。"""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows, self.cells, self.parts = [], [], []
+        self.in_cell = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self.cells = []
+        elif tag in ("td", "th"):
+            self.in_cell, self.parts = True, []
+
+    def handle_data(self, data):
+        if self.in_cell:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.in_cell:
+            self.cells.append(" ".join("".join(self.parts).split()))
+            self.in_cell = False
+        elif tag == "tr" and len(self.cells) >= 2:
+            if re.fullmatch(r"[0-9A-Z]{4}", self.cells[0]) and self.cells[1]:
+                self.rows.append({"コード": self.cells[0], "銘柄名": self.cells[1]})
+
+
+def parse_nikkei225_constituents(text):
+    parser = NikkeiConstituentParser()
+    parser.feed(text)
+    out = pd.DataFrame(parser.rows, columns=["コード", "銘柄名"]).drop_duplicates("コード")
+    if len(out) != 225:
+        raise ValueError(f"日経225構成一覧を確認できませんでした（{len(out)}銘柄、225銘柄が必要）")
+    out = out.reset_index(drop=True)
+    out["ticker"] = out["コード"] + ".T"
+    out["構成銘柄情報源"] = "日経平均プロフィル公式構成銘柄一覧"
+    return out
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def discover_nikkei225_stock_universe():
+    response = requests.get(
+        "https://indexes.nikkei.co.jp/nkave/index/component?idx=nk225",
+        headers={"User-Agent": "Mozilla/5.0"}, timeout=30,
+    )
+    response.raise_for_status()
+    response.encoding = "utf-8"
+    return parse_nikkei225_constituents(response.text)
+
+
+def merge_index_universes(topix, nikkei):
+    topix, nikkei = topix.copy(), nikkei.copy()
+    topix["対象指数"] = "TOPIX"
+    nikkei["対象指数"] = "日経225"
+    combined = pd.concat([topix, nikkei], ignore_index=True)
+    out = combined.drop_duplicates("コード", keep="first").copy()
+    common = set(topix["コード"]) & set(nikkei["コード"])
+    mask = out["コード"].isin(common)
+    out.loc[mask, "対象指数"] = "TOPIX＋日経225"
+    out.loc[mask, "構成銘柄情報源"] = "JPX公開TOPIX一覧＋日経平均プロフィル公式一覧"
+    return out.reset_index(drop=True)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def discover_topix_nikkei225_stock_universe():
+    # 片方の取得失敗を隠して不完全な母集団で買い判定しない。
+    return merge_index_universes(discover_topix_stock_universe(),
+                                 discover_nikkei225_stock_universe())
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def discover_japan_stock_universe(limit=350):
     """TradingView日本株スキャナーから売買代金上位の普通株を数百銘柄取得する。
@@ -4280,7 +4349,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.3")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.4")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.success("%K≤20のGCで買い → DCまたは終値で−7%なら翌朝売り")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -4350,13 +4419,13 @@ for _key, _fixed in {
 }.items():
     st.session_state[_key] = _fixed
 with st.expander("⚙ 購入額・注文方式", expanded=False):
-    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX全体から買いシグナル先行", "TOPIXからAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], key="v17243_universe")
-    signal_first = live_universe_mode == "TOPIX全体から買いシグナル先行"
+    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX＋日経225全体から買いシグナル先行", "TOPIX＋日経225からAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], key="v17244_universe")
+    signal_first = live_universe_mode == "TOPIX＋日経225全体から買いシグナル先行"
     block_unrated = st.checkbox("企業価値の判定不能は新規買いを見送る", value=True, key="v17243_unrated", disabled=not signal_first)
     min_turnover = st.number_input("買い候補の20日平均売買代金下限（円・0で無効）", 0, 10000000000, 0, 10000000, key="v17243_liquidity", disabled=not signal_first)
     filter_downtrend = st.checkbox("下降確認の候補を除外（未検証）", value=False, key="v17243_down", disabled=not signal_first)
     filter_churn = st.checkbox("短期クロス多発の候補を除外（未検証）", value=False, key="v17243_churn", disabled=not signal_first)
-    st.caption("シグナル先行はTOPIX全体の最新確定日足からGCを抽出し、候補だけを評価・順位付けします。割高は除外。追加フィルターは単独比較用で初期値OFF。")
+    st.caption("シグナル先行はTOPIX＋日経225全体の最新確定日足からGCを抽出し、候補だけを評価・順位付けします。割高は除外。追加フィルターは単独比較用で初期値OFF。")
     cap_mode = st.selectbox("1銘柄の購入予算", ["資産の3分の1（従来）", "10万円", "15万円", "20万円"], key="v1724_cap")
     purchase_cap = {"資産の3分の1（従来）": 0, "10万円": 100000, "15万円": 150000, "20万円": 200000}[cap_mode]
     execution_mode = st.selectbox("実行する注文方式", ["自動（通常注文優先・不足はS株）", "S株のみ（1〜99株）", "100株単位（通常注文）"], key="v1724_order")
@@ -4378,8 +4447,8 @@ with st.expander("⚙ 管理者設定", expanded=False):
     price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
     c1, c2 = st.columns(2)
     universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n", disabled=True)
-    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIXからAI選定TOP50", "TOPIX全体から買いシグナル先行"))
-    st.caption("TOPIXシグナル先行は全銘柄のGC候補を抽出して評価。従来TOP50モードも選択できます。JPX公開一覧には基準日との差がある場合があります。")
+    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225からAI選定TOP50", "TOPIX＋日経225全体から買いシグナル先行"))
+    st.caption("TOPIX＋日経225シグナル先行は全銘柄のGC候補を抽出して評価。従来TOP50モードも選択できます。JPX・日経の公式構成一覧を結合し、重複を除外します。公開一覧には基準日との差がある場合があります。")
     st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
     churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
     st.caption("今回の主ロジックでは短期反転除外を使用しません。")
@@ -4406,7 +4475,7 @@ if not run_clicked:
 if run_clicked:
     universe_error = ""
     try:
-        universe_df = (discover_topix_stock_universe() if live_universe_mode in ("TOPIXからAI選定TOP50", "TOPIX全体から買いシグナル先行")
+        universe_df = (discover_topix_nikkei225_stock_universe() if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX＋日経225全体から買いシグナル先行")
                        else pd.DataFrame([
                            {"コード": c, "銘柄名": STOCK_NAMES[c], "ticker": c + ".T"}
                            for c in VERIFIED_45_CODES
@@ -4420,6 +4489,9 @@ if run_clicked:
         st.error("対象銘柄の取得に失敗しました。保有銘柄のみ確認します。" + universe_error)
     else:
         STOCK_NAMES.update(dict(zip(universe_df["コード"].astype(str), universe_df["銘柄名"].astype(str))))
+        if "対象指数" in universe_df.columns:
+            index_tags = universe_df["対象指数"].astype(str)
+            st.caption(f"監視対象：TOPIX {index_tags.str.contains('TOPIX').sum()}銘柄／日経225 {index_tags.str.contains('日経225').sum()}銘柄／重複除外後 {len(universe_df)}銘柄")
     st.session_state["v177_universe_df"] = universe_df
     selected_codes = universe_df["コード"].astype(str).tolist() if not universe_df.empty else []
     all_codes = list(dict.fromkeys(selected_codes + [str(c) for c in all_held_codes]))
@@ -4440,15 +4512,15 @@ if run_clicked:
         eligible_count = sum(isinstance(d, pd.DataFrame) and len(d) >= 60
                              for d in mother_data.values())
         value_top50_df, _ = (build_value_ai_top50(
-            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIXからAI選定TOP50", "TOPIX全体から買いシグナル先行") else eligible_count,
-            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIXからAI選定TOP50", "TOPIX全体から買いシグナル先行") else eligible_count,
+            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX＋日経225全体から買いシグナル先行") else eligible_count,
+            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX＋日経225全体から買いシグナル先行") else eligible_count,
             churn_filter=False,
         ) if eligible_count else (pd.DataFrame(), pd.DataFrame()))
         st.session_state["v177_value_top50"] = value_top50_df
         st.session_state["v1716_churn_audit"] = pd.DataFrame()
         st.session_state["v177_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
-        st.session_state["v177_run_error"] = ("TOPIXから50銘柄を選定できませんでした。新規買いを停止し、保有銘柄の売り判定のみ行います。"
-            if live_universe_mode == "TOPIXからAI選定TOP50" and value_top50_df.empty else "")
+        st.session_state["v177_run_error"] = ("TOPIX＋日経225から50銘柄を選定できませんでした。新規買いを停止し、保有銘柄の売り判定のみ行います。"
+            if live_universe_mode == "TOPIX＋日経225からAI選定TOP50" and value_top50_df.empty else "")
 
 universe_df = st.session_state.get("v177_universe_df", pd.DataFrame())
 if isinstance(universe_df, pd.DataFrame) and not universe_df.empty:
@@ -4467,7 +4539,7 @@ sell_view = pd.DataFrame()
 buy_signal_rows, sell_signal_rows = [], []
 signal_audit_rows = []
 true_top50_codes = (set(value_top50_df["コード"].astype(str))
-                    if isinstance(value_top50_df, pd.DataFrame) and "コード" in value_top50_df else set()) if live_universe_mode == "TOPIXからAI選定TOP50" else (
+                    if isinstance(value_top50_df, pd.DataFrame) and "コード" in value_top50_df else set()) if live_universe_mode == "TOPIX＋日経225からAI選定TOP50" else (
                     set(universe_df["コード"].astype(str))
                     if isinstance(universe_df, pd.DataFrame) and "コード" in universe_df else set())
 signal_first_audit_df = pd.DataFrame()
@@ -4538,7 +4610,7 @@ if data and (true_top50_codes or held_code_set):
                 value_unrated_count += 1
             final_buy_hit = final_buy_hit and not buy_skip_reason
         if c in true_top50_codes or c in held_code_set:
-            signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else ("TOPIX全体" if signal_first else "監視対象"),
+            signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else ("TOPIX＋日経225全体" if signal_first else "監視対象"),
                                       "現行買い": buy_old, "改善買い": buy_new,
                                       "採用方式の買いシグナル": bool(buy_signal_hit),
                                       "銘柄判定": value_judgement,
@@ -4571,7 +4643,7 @@ if data and (true_top50_codes or held_code_set):
 
 signal_audit_df = pd.DataFrame(signal_audit_rows)
 if signal_first and not signal_first_audit_df.empty:
-    with st.expander("TOPIX買いシグナルの抽出・見送り理由", expanded=False):
+    with st.expander("TOPIX＋日経225買いシグナルの抽出・見送り理由", expanded=False):
         st.caption(f"GC抽出 {len(signal_first_audit_df)}銘柄 / 財務判定不能による見送り {value_unrated_count}銘柄。候補スコアは流動性45%・トレンド30%・安定性25%を基に順位付け（本方式は未検証）。")
         st.dataframe(signal_audit_df[signal_audit_df["現行買い"].eq(True)], use_container_width=True, hide_index=True)
 
@@ -5132,7 +5204,7 @@ with admin_tab:
                 admin_judgement_table(value_full, "v7_value_full", 560)
 
         with st.expander("🧪 5年OOS検証メモ", expanded=False):
-            st.caption("TOPIXモードではAI上位50銘柄を新規買い監視対象に使用します。固定45・売買代金上位モードでは企業価値は参考表示です。現在の構成一覧を過去に流用した検証は、過去の選定を再現しません。")
+            st.caption("TOPIX＋日経225モードではAI上位50銘柄を新規買い監視対象に使用します。固定45・売買代金上位モードでは企業価値は参考表示です。現在の構成一覧を過去に流用した検証は、過去の選定を再現しません。")
             st.write("採用値：流動性45% / トレンド30% / 値動き安定性25%")
             st.write("学習期間：+54.27% / PF 2.10 / 最大DD -10.04% / 257決済")
             st.write("OOS期間：+16.10% / PF 1.89 / 最大DD -5.25% / 81決済")
@@ -5362,7 +5434,7 @@ try:
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
             "買付余力（短期）":short_buying_power,"保有件数":len(held_codes),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
-            "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIXからAI選定TOP50" else 0,
+            "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225からAI選定TOP50" else 0,
             "固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(signal_first and block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(signal_first and filter_downtrend), "クロス多発除外":bool(signal_first and filter_churn), "購入予算方式":cap_mode,
@@ -5434,12 +5506,12 @@ try:
         compare_summary = pd.DataFrame([compare_summary_row])
         zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
         status_df=pd.DataFrame([{
-            "本物TOP50モード":live_universe_mode == "TOPIXからAI選定TOP50","母集団最低200銘柄ガード":False,
+            "本物TOP50モード":live_universe_mode == "TOPIX＋日経225からAI選定TOP50","母集団最低200銘柄ガード":False,
             "固定45銘柄モード":live_universe_mode == "固定45銘柄","固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
             "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
             "当日確定日足件数":int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum()) if isinstance(daily_bar_status_df,pd.DataFrame) and not daily_bar_status_df.empty else 0,
-            "TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIXからAI選定TOP50" else 0,
+            "TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225からAI選定TOP50" else 0,
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "一次選抜_流動性重み":np.nan,"一次選抜_トレンド重み":np.nan,"一次選抜_安定性重み":np.nan,
             "OOS検証済み":False,"OOS_PF参考":np.nan,"5年通算PF参考":np.nan,

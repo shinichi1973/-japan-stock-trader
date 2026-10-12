@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.10
-# BUILD: VER17-24-10-FREE-TRIPLE-NEWS-PICK-20261012
+# 日本株 AI投資アシスタント Ver.17.24.11
+# BUILD: VER17-24-11-GFS-RESEARCH-20261012
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.10",
+    page_title="日本株 AI投資アシスタント Ver.17.24.11",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.10 TOPIX＋日経225 シグナル先行"
-BUILD = "VER17-24-10-FREE-TRIPLE-NEWS-PICK-20261012"
+VERSION = "17.24.11 TOPIX＋日経225 シグナル先行"
+BUILD = "VER17-24-11-GFS-RESEARCH-20261012"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -4529,7 +4529,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.10")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.11")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。終値7%損切り・最大3銘柄は共通です。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5554,6 +5554,162 @@ def render_triple_news_pick(compare, freshness, price_data, held_codes, values, 
     return result, exclusions, signature
 
 
+# GFSの公開講義概要を参考にした独立研究。動画本編の完全再現ではない。
+GFS_RESEARCH_SOURCES = [
+    {"資料": "新高値ブレイク投資・実践編", "確認できた考え方": "年初来高値・52週高値を起点に選別", "URL": "https://gfs.tokyo/video/6031"},
+    {"資料": "最も重要な損切りと資金管理", "確認できた考え方": "取得価格から8%損切り・資金管理", "URL": "https://gfs.tokyo/video/6032"},
+    {"資料": "売り方の極意", "確認できた考え方": "株価2倍で半分利確という例", "URL": "https://gfs.tokyo/video/6373"},
+]
+
+
+def build_gfs_research_signals(price_data, freshness, holdings, value_frames, live_audit,
+                               high_window=252, volume_min=0.0, ma_exit=False):
+    """終値で前日までの高値を更新。8%損切り/2倍半分利確は保有の取得単価基準。"""
+    buy_cols = ["コード", "銘柄名", "日足日", "現在株価", "前日までの高値", "高値超過率%", "出来高倍率", "銘柄判定", "研究買い理由", "現行の買い条件も一致", "扱い"]
+    sell_cols = ["コード", "銘柄名", "日足日", "現在株価", "保有株数", "取得単価", "損益率%", "研究売り理由", "参考売却株数", "現行の売り条件も一致", "扱い"]
+    buys, sells, audit = [], [], []
+    fresh_map = {str(r["コード"]): r.to_dict() for _, r in freshness.iterrows()} if isinstance(freshness, pd.DataFrame) and "コード" in freshness else {}
+    values, live = {}, {}
+    for frame in value_frames:
+        if isinstance(frame, pd.DataFrame) and "コード" in frame:
+            values.update({str(r["コード"]): str(r.get("割安判定", "— 未算定")) for _, r in frame.iterrows()})
+    if isinstance(live_audit, pd.DataFrame) and "コード" in live_audit:
+        live = {str(r["コード"]): r.to_dict() for _, r in live_audit.iterrows()}
+    held = {str(c): v for c, v in holdings.items()}
+    for ticker, df in (price_data or {}).items():
+        c = code(ticker)
+        company = name(ticker)
+        f = fresh_map.get(c, {})
+        status = ""
+        if not isinstance(df, pd.DataFrame) or df.empty or not {"Close", "High"}.issubset(df.columns):
+            status = "有効日足なし"
+        elif f.get("状態") != "🟢 当日確定":
+            status = "最新確定日足を確認できず"
+        if status:
+            audit.append({"コード": c, "銘柄名": company, "状態": status, "研究買い": False, "研究売り": False})
+            continue
+        x = df.sort_index().copy()
+        close = pd.to_numeric(x["Close"], errors="coerce")
+        high = pd.to_numeric(x["High"], errors="coerce")
+        px = safe_float(close.iloc[-1])
+        if not np.isfinite(px) or px <= 0:
+            audit.append({"コード": c, "銘柄名": company, "状態": "終値欠損", "研究買い": False, "研究売り": False})
+            continue
+        # Both series share the data source's split-adjusted price basis.
+        previous_high = safe_float(high.shift(1).rolling(high_window, min_periods=high_window).max().iloc[-1])
+        ma25 = safe_float(close.rolling(25, min_periods=25).mean().iloc[-1])
+        volume_ratio = np.nan
+        if "Volume" in x:
+            vol = pd.to_numeric(x["Volume"], errors="coerce")
+            previous_volume = safe_float(vol.shift(1).rolling(20, min_periods=20).mean().iloc[-1])
+            if np.isfinite(previous_volume) and previous_volume > 0:
+                volume_ratio = safe_float(vol.iloc[-1]) / previous_volume
+        verdict = values.get(c, "— 未算定")
+        raw_buy = bool(np.isfinite(previous_high) and px > previous_high)
+        reason = ""
+        if c in held:
+            reason = "既に保有中（買い増しなし）"
+        elif not np.isfinite(previous_high):
+            reason = f"前日までの{high_window}営業日日足不足"
+        elif "割高" in verdict:
+            reason = "割高の研究買い除外（独自補完）"
+        elif volume_min > 0 and (not np.isfinite(volume_ratio) or volume_ratio < volume_min):
+            reason = "独自の出来高条件を満たさない"
+        final_buy = raw_buy and not reason
+        bar_date = str(f.get("日足最終日", ""))
+        if final_buy:
+            buys.append({"コード": c, "銘柄名": company, "日足日": bar_date, "現在株価": px,
+                         "前日までの高値": previous_high, "高値超過率%": round((px/previous_high-1)*100, 2),
+                         "出来高倍率": round(volume_ratio, 2) if np.isfinite(volume_ratio) else np.nan,
+                         "銘柄判定": verdict, "研究買い理由": f"終値が前日までの{high_window}営業日高値を更新",
+                         "現行の買い条件も一致": bool(live.get(c, {}).get("最終買い", False)), "扱い": "研究候補・注文には使用しない"})
+        sell_reason = []
+        if c in held:
+            h = held[c]
+            qty = int(safe_float(h.get("shares"), 0))
+            avg = safe_float(h.get("avg_price"))
+            pnl = (px / avg - 1) * 100 if np.isfinite(avg) and avg > 0 else np.nan
+            sell_qty = 0
+            if qty > 0 and np.isfinite(pnl):
+                if px <= avg * 0.92:
+                    sell_reason.append("終値で8%損切り（研究）")
+                    sell_qty = qty
+                elif px >= avg * 2.0 and qty >= 2:
+                    sell_reason.append("株価2倍・半分利確候補（初回のみ／過去利確未確認）")
+                    sell_qty = qty // 2
+                if ma_exit and np.isfinite(ma25) and px < ma25:
+                    sell_reason.append("MA25割れ（独自補完）")
+                    sell_qty = qty
+            else:
+                reason = "保有株数または取得単価を確認できず"
+            if sell_reason:
+                live_sell = bool(live.get(c, {}).get("現行売り", False)) or bool(np.isfinite(pnl) and pnl <= -7.0)
+                sells.append({"コード": c, "銘柄名": company, "日足日": bar_date, "現在株価": px,
+                              "保有株数": qty, "取得単価": avg, "損益率%": round(pnl, 2),
+                              "研究売り理由": " / ".join(sell_reason), "参考売却株数": sell_qty,
+                              "現行の売り条件も一致": live_sell, "扱い": "研究候補・注文には使用しない"})
+        audit.append({"コード": c, "銘柄名": company, "状態": reason or "判定済み", "研究買い": final_buy,
+                      "研究売り": bool(sell_reason), "高値更新のみ": raw_buy, "銘柄判定": verdict,
+                      "前日までの高値": previous_high, "現在株価": px})
+    buy = pd.DataFrame(buys, columns=buy_cols)
+    if not buy.empty:
+        buy = buy.sort_values(["高値超過率%", "コード"], ascending=[False, True]).reset_index(drop=True)
+    return buy, pd.DataFrame(sells, columns=sell_cols), pd.DataFrame(audit)
+
+
+def render_gfs_research(price_data, freshness, holdings, value_frames, live_audit):
+    st.subheader("GFSロジック研究")
+    st.warning("GFSの公開講義概要を参考にした研究案です。動画本編の完全再現・GFS公認・収益検証済みのロジックではありません。")
+    st.caption("現在取得している監視対象＋保有銘柄を判定します。ここで点灯しても、今日の売買・購入株数・正式注文には反映しません。")
+    conditions = pd.DataFrame([
+        {"項目": "買いの着想", "内容": "年初来高値・52週高値の銘柄選別", "根拠": "公式講義概要で確認"},
+        {"項目": "研究買いの計算", "内容": "前日までの252営業日高値を当日の終値で上回る", "根拠": "52週の近似と終値判定は独自補完"},
+        {"項目": "研究売り", "内容": "取得単価から終値8%損切り／株価2倍で初回のみ半分利確", "根拠": "割合は公開概要、終値判定等は独自補完"},
+        {"項目": "補助条件", "内容": "既知の割高・未確定日足・保有中の新規買いを除外", "根拠": "独自補完。財務未算定は研究参考として残す"},
+        {"項目": "未再現", "内容": "カップ形状・事業の成長ストーリー・材料の持続性・地合い判断", "根拠": "詳細条件を確認できず自動判定しない"},
+    ])
+    with st.expander("研究条件・出典", expanded=False):
+        st.dataframe(conditions, use_container_width=True, hide_index=True)
+        for source in GFS_RESEARCH_SOURCES:
+            st.link_button(source["資料"], source["URL"])
+        st.caption("公開概要の確認日：2026-10-12。2倍利確は過去の利確実施を追跡していないため、繰り返し半分売る指示ではありません。")
+    volume_min = st.number_input("追加研究：出来高倍率の下限（0で無効）", 0.0, 10.0, 0.0, 0.1, key="v172411_gfs_vol")
+    ma_exit = st.checkbox("追加研究：MA25割れを売り条件にする（GFS原文の条件ではない）", value=False, key="v172411_gfs_maexit")
+    buy, sell, audit = build_gfs_research_signals(price_data, freshness, holdings, value_frames, live_audit, 252, volume_min, ma_exit)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("研究買い", len(buy)); c2.metric("研究売り", len(sell)); c3.metric("確認対象", len(audit))
+    st.write("**研究買いシグナル**")
+    if buy.empty:
+        st.info("研究条件に該当する新規買い銘柄はありません。")
+    else:
+        st.dataframe(buy, use_container_width=True, hide_index=True)
+    st.write("**保有銘柄の研究売りシグナル**")
+    if sell.empty:
+        st.info("現在保有している銘柄に研究売りシグナルはありません。")
+    else:
+        st.dataframe(sell, use_container_width=True, hide_index=True)
+    st.caption("研究用8%損切りは現行の7%損切りを変更しません。日中の逆指値条件とも異なります。")
+    with st.expander("判定不足・見送り理由", expanded=False):
+        if not audit.empty:
+            st.dataframe(audit[audit["状態"].ne("判定済み")], use_container_width=True, hide_index=True)
+    st.write("**新しい動画・ロジックの監視**")
+    st.caption("ChatGPTの監視タスクで公式サイト・公式YouTubeを確認します。新着は通知で確認し、本文や字幕から条件を検証してから研究案を更新します。このアプリのコードが自動で書き換わることはありません。")
+    st.link_button("GFS公式YouTube", "https://www.youtube.com/channel/UCpLNShj3M-bQVPDZ8lD66fw")
+    params = {"研究名": "GFS公開概要に基づく新高値研究", "高値期間_営業日": 252,
+              "研究損切り%": 8.0, "半分利確_上昇率%": 100.0, "追加出来高下限": volume_min,
+              "追加MA25売り": ma_exit, "正式売買に接続": False, "原文完全再現": False,
+              "資料確認日": "2026-10-12"}
+    buf = io.BytesIO()
+    with ZipFile(buf, "w") as z:
+        for filename, frame in [("gfs_research_buy.csv", buy), ("gfs_research_sell.csv", sell),
+                                ("gfs_research_audit.csv", audit), ("gfs_research_conditions.csv", conditions),
+                                ("gfs_research_sources.csv", pd.DataFrame(GFS_RESEARCH_SOURCES)),
+                                ("gfs_research_settings.csv", pd.DataFrame([params]))]:
+            z.writestr(filename, frame.to_csv(index=False, encoding="utf-8-sig"))
+    st.download_button("GFS研究シグナルZIP", buf.getvalue(), "gfs_research_signals.zip", "application/zip", key="v172411_gfs_download")
+    return buy, sell, audit, params
+
+
 # ------------------------------------------------------------
 # 短期売買と管理者タブ
 # ------------------------------------------------------------
@@ -5643,8 +5799,8 @@ with admin_tab:
         else:
             st.info("『今日の判定を更新』後に日足最終日と取得元を表示します。")
 
-    value_tab, surge_tab, compare_tab, holdings_tab = st.tabs([
-        "企業価値", "急騰予兆", "3指標比較", "保有銘柄"
+    value_tab, surge_tab, compare_tab, gfs_tab, holdings_tab = st.tabs([
+        "企業価値", "急騰予兆", "3指標比較", "GFSロジック研究", "保有銘柄"
     ])
 
     with value_tab:
@@ -5884,6 +6040,11 @@ with admin_tab:
                 admin_judgement_table(comp_full, "v7_comp_full", 520)
         st.caption("比較結果は全処理ZIP内の indicator_compare_candidates.csv に保存します。")
 
+    with gfs_tab:
+        gfs_research_buy, gfs_research_sell, gfs_research_audit, gfs_research_settings = render_gfs_research(
+            data, daily_bar_status_df, short_confirmed, [value_top50_df, signal_value_df], signal_audit_df
+        )
+
     with holdings_tab:
         st.caption("SBI約定履歴CSVから復元できた現在保有銘柄だけを表示します。")
         if confirmed:
@@ -5927,6 +6088,12 @@ try:
             "トレンド振れ幅フィルター実売買":bool(quality_mode),
         }])
         zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
+        for gfs_name, gfs_frame in [("gfs_research_buy.csv", gfs_research_buy),
+                                    ("gfs_research_sell.csv", gfs_research_sell),
+                                    ("gfs_research_audit.csv", gfs_research_audit),
+                                    ("gfs_research_settings.csv", pd.DataFrame([gfs_research_settings])),
+                                    ("gfs_research_sources.csv", pd.DataFrame(GFS_RESEARCH_SOURCES))]:
+            zf.writestr(gfs_name, gfs_frame.to_csv(index=False, encoding="utf-8-sig"))
         if isinstance(universe_df,pd.DataFrame):
             zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(value_top50_df,pd.DataFrame):

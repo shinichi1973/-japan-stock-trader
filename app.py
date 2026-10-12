@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.7
-# BUILD: VER17-24-7-REPLACEMENT-RESEARCH-TOPIX-N225-SIGNAL-FIRST-20261012
+# 日本株 AI投資アシスタント Ver.17.24.8
+# BUILD: VER17-24-8-COMPARISON-AUDIT-20261012
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.7",
+    page_title="日本株 AI投資アシスタント Ver.17.24.8",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.7 TOPIX＋日経225 シグナル先行"
-BUILD = "VER17-24-7-REPLACEMENT-RESEARCH-TOPIX-N225-SIGNAL-FIRST-20261012"
+VERSION = "17.24.8 TOPIX＋日経225 シグナル先行"
+BUILD = "VER17-24-8-COMPARISON-AUDIT-20261012"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1483,6 +1483,14 @@ def _adjust_target_for_split(target, current_price, split_factor, recent=True):
     return np.nan, False, True, "⚠️分割基準不明のため目標株価を除外"
 
 
+def financial_unavailable_label(status, freshness):
+    if str(status) != "OK":
+        return "⚠️ 財務取得不可・算定不能"
+    if str(freshness) != "Yahoo期末日を確認":
+        return "⚠️ 最新性未確認"
+    return ""
+
+
 @st.cache_data(ttl=300)
 def fundamental_snapshot(t, market_price_hint=np.nan):
     """現在情報のみ。過去バックテストには使用しない。株式分割ズレを最優先で防止する。"""
@@ -2305,6 +2313,7 @@ def allocation_portfolio_backtest(frames, allowed_codes, start, end, initial_cas
             trades.append({"コード":c,"買い日":pos["date"],"売り日":day,
                            "買い株数":pos["initial_qty"],"売り株数":pos["qty"],
                            "買い始値":pos["original_entry"],"売り始値":price,
+                           "保有営業日数":sum(pos["date"] < d <= day for d in dates),
                            "買い費用込":pos["cost"],"売却費用引後":proceeds,
                            "損益":pnl,"騰落率%":pnl/pos["cost"]*100,"売り理由":reason})
             del sells[c]
@@ -2379,6 +2388,7 @@ def allocation_portfolio_backtest(frames, allowed_codes, start, end, initial_cas
                "利益率%":round((e["総資産"].iloc[-1]/initial_cash-1)*100,2),
                "最大DD%":round(dd.min()*100,2),"決済件数":len(t),
                "勝率%":round((t["損益"] > 0).mean()*100,2) if len(t) else np.nan,
+               "平均保有営業日数":round(t["保有営業日数"].mean(),2) if len(t) else np.nan,
                "PF":round(gain/loss,3) if loss else np.nan,"未決済件数":len(opened),
                "購入見送り件数":skipped,"欠損による注文待ち/見送り":missing,
                "平均投資比率%":round((1-e["現金"]/e["総資産"]).mean()*100,2),
@@ -2423,7 +2433,9 @@ def public_replacement_frame(df, method):
 PUBLIC_RESEARCH_RESULTS_20261012 = [{'対象': '取得済み全銘柄', '方式': '現行GC', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': 4.96, '最大DD%': -19.4, '決済件数': 341}, {'対象': '取得済み全銘柄', '方式': '現行GC', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 13.08, '最大DD%': -17.35, '決済件数': 187}, {'対象': '固定45（取得済み）', '方式': '現行GC', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': 23.66, '最大DD%': -8.69, '決済件数': 263}, {'対象': '固定45（取得済み）', '方式': '現行GC', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 16.77, '最大DD%': -9.84, '決済件数': 167}, {'対象': '取得済み全銘柄', '方式': 'GC＋下降回避', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': 11.35, '最大DD%': -12.09, '決済件数': 286}, {'対象': '取得済み全銘柄', '方式': 'GC＋下降回避', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 7.69, '最大DD%': -14.13, '決済件数': 177}, {'対象': '固定45（取得済み）', '方式': 'GC＋下降回避', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': 3.73, '最大DD%': -6.08, '決済件数': 122}, {'対象': '固定45（取得済み）', '方式': 'GC＋下降回避', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 3.16, '最大DD%': -6.21, '決済件数': 81}, {'対象': '取得済み全銘柄', '方式': 'GC＋上昇確認', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': -3.98, '最大DD%': -7.94, '決済件数': 61}, {'対象': '取得済み全銘柄', '方式': 'GC＋上昇確認', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': -3.68, '最大DD%': -6.82, '決済件数': 49}, {'対象': '固定45（取得済み）', '方式': 'GC＋上昇確認', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': -2.15, '最大DD%': -2.21, '決済件数': 9}, {'対象': '固定45（取得済み）', '方式': 'GC＋上昇確認', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': -0.42, '最大DD%': -1.98, '決済件数': 8}, {'対象': '取得済み全銘柄', '方式': '高値更新20・安値割れ10', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': -13.65, '最大DD%': -26.17, '決済件数': 92}, {'対象': '取得済み全銘柄', '方式': '高値更新20・安値割れ10', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 38.96, '最大DD%': -28.01, '決済件数': 50}, {'対象': '固定45（取得済み）', '方式': '高値更新20・安値割れ10', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': 1.02, '最大DD%': -14.5, '決済件数': 76}, {'対象': '固定45（取得済み）', '方式': '高値更新20・安値割れ10', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 14.66, '最大DD%': -13.18, '決済件数': 43}, {'対象': '取得済み全銘柄', '方式': '高値更新55＋MA200・安値割れ20', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': 8.76, '最大DD%': -18.29, '決済件数': 50}, {'対象': '取得済み全銘柄', '方式': '高値更新55＋MA200・安値割れ20', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 90.85, '最大DD%': -15.16, '決済件数': 23}, {'対象': '固定45（取得済み）', '方式': '高値更新55＋MA200・安値割れ20', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': 7.52, '最大DD%': -15.02, '決済件数': 40}, {'対象': '固定45（取得済み）', '方式': '高値更新55＋MA200・安値割れ20', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 32.39, '最大DD%': -14.36, '決済件数': 27}, {'対象': '取得済み全銘柄', '方式': '63日モメンタム＋MA200', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': 22.23, '最大DD%': -32.45, '決済件数': 50}, {'対象': '取得済み全銘柄', '方式': '63日モメンタム＋MA200', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 125.28, '最大DD%': -43.93, '決済件数': 20}, {'対象': '固定45（取得済み）', '方式': '63日モメンタム＋MA200', '期間': '前半70%', '開始': '2022-08-02', '終了': '2025-04-04', '利益率%': -7.62, '最大DD%': -24.95, '決済件数': 40}, {'対象': '固定45（取得済み）', '方式': '63日モメンタム＋MA200', '期間': '後半30%（再確認）', '開始': '2025-04-07', '終了': '2026-10-07', '利益率%': 25.84, '最大DD%': -14.93, '決済件数': 23}]
 
 
-def compare_public_research_logic(frames, initial_cash=600000, fee_bps=10.0):
+def compare_public_research_logic(frames, initial_cash=600000, fee_bps=10.0,
+                                  cap_yen=100000, normal_cap=100000, lot_size=0,
+                                  max_shares=None, return_details=False):
     """公開研究のトレンド着想を現行と比較。閾値最適化・学習モデルは使用しない。"""
     dates = sorted(set(d for x in frames.values() for d in x.index))
     if len(dates) < 500:
@@ -2436,7 +2448,7 @@ def compare_public_research_logic(frames, initial_cash=600000, fee_bps=10.0):
     fixed = [c for c in VERIFIED_45_CODES if c in frames]
     if fixed:
         groups.append(("固定45（取得済み）", fixed))
-    rows = []
+    rows, details = [], []
     for mode in ("現行GC", "GC＋下降回避", "GC＋上昇確認",
                  "高値更新20・安値割れ10", "高値更新55＋MA200・安値割れ20", "63日モメンタム＋MA200"):
         filtered = {}
@@ -2451,46 +2463,81 @@ def compare_public_research_logic(frames, initial_cash=600000, fee_bps=10.0):
                 y["SELL_現行"] = y[mode + "_SELL_研究"]
                 y["ready"] = y[mode + "_ready_研究"]
                 y["buy_priority"] = y[mode + "_buy_priority"]
+            # Require 200 valid bars for every mode, including newly listed stocks.
+            # Common availability prevents comparing different eligible histories.
+            common_ready = x["高値更新55＋MA200・安値割れ20_ready_研究"].fillna(False)
+            y["ready"] = y["ready"].fillna(False) & common_ready
+            y["BUY_現行"] = y["BUY_現行"].fillna(False) & y["ready"]
             filtered[c] = y
         for group, codes in groups:
             for period, begin, finish in periods:
-                summary, _, _, _ = allocation_portfolio_backtest(
+                summary, trades, curve, opened = allocation_portfolio_backtest(
                     filtered, codes, begin, finish, initial_cash=initial_cash,
-                    cap_yen=100000, max_shares=None, lot_size=0,
-                    fee_bps=fee_bps, normal_cap=100000)
+                    cap_yen=cap_yen, max_shares=max_shares, lot_size=lot_size,
+                    fee_bps=fee_bps, normal_cap=normal_cap)
                 rows.append({"対象":group,"方式":mode,"期間":period,
                              "開始":str(begin.date()),"終了":str(finish.date()),**summary})
-    return pd.DataFrame(rows)
+                details.append(({"対象": group, "方式": mode, "期間": period}, trades, curve, opened))
+    result = pd.DataFrame(rows)
+    return (result, details) if return_details else result
 
 
 def render_public_research_logic():
     with st.expander("🧪 公開研究ロジックの比較", expanded=False):
-        st.caption("トレンド追随の着想を現行GCと比較します。3銘柄上限・1銘柄10万円・終値7%損切り・翌日始値は共通。独立3案では売り判定と候補順位もStochを使いません。FinRLの期間分割・コスト評価の考え方を取り入れた検証で、学習済みAIモデルではありません。")
+        st.caption("トレンド追随の着想を現行GCと比較します。3銘柄上限・終値7%損切り・翌日始値は共通。資金・予算・注文方式は下で指定します。全方式に200日以上の日足を要求します。独立3案では売り判定と候補順位もStochを使いません。FinRLの期間分割・コスト評価の考え方を取り入れた検証で、学習済みAIモデルではありません。")
         st.caption("過去の構成銘柄と当時の財務判定を再現しない参考検証です。後半30%も既存検証で見た可能性があり、未使用データとは断定できません。結果による自動切替は行いません。")
-        st.info("2026/10/12比較：広い対象では55日高値更新＋MA200が両期間で利益・最大DDを改善。試験採用を追加。固定45では優位性が一貫せず、初期設定は現行GCを維持します。")
+        st.info("保存済みの参考値では55日方式が有望でしたが、現在のTOPIX全体での優位性は未確認です。正式採用は行わず、初期設定は現行GCを維持します。")
         st.caption("保存済み結果：10/7の拡大対象履歴・有効344銘柄（6銘柄除外）、初期60万円・片道10bps。TOPIX全体の検証ではなく、現在の割高除外と候補順位も再現していません。")
         st.dataframe(pd.DataFrame(PUBLIC_RESEARCH_RESULTS_20261012), use_container_width=True, hide_index=True)
         upload = st.file_uploader("比較用5年日足ZIP / CSV", type=["zip", "csv"], key="v17246_research_upload")
+        initial = st.number_input("ロジック比較の初期資金（円）", 10000, 200000000, 600000, 10000, key="v17248_initial")
+        budget = st.selectbox("ロジック比較の1銘柄予算", ["10万円", "資産の3分の1（従来）", "15万円", "20万円"], key="v17248_budget")
+        cap = {"10万円": 100000, "資産の3分の1（従来）": 0, "15万円": 150000, "20万円": 200000}[budget]
+        order = st.selectbox("ロジック比較の注文方式", ["自動（通常注文優先・不足はS株）", "S株のみ（1〜99株）", "100株単位（通常注文）"], key="v17248_order")
+        lot, limit = ((0, None) if order.startswith("自動") else (1, 99) if order.startswith("S株") else (100, None))
+        normal_cap = st.number_input("ロジック比較の通常注文予算（円）", 10000, 2000000, 100000, 10000, key="v17248_normal")
+        st.caption("現在の財務情報は過去に流用しません。割高・財務判定不能の除外と現行GCの流動性等による順位は再現せず、GC側は%K順で比較します。後半は未使用期間とは扱いません。IFDOCOの日中注文も含みません。")
         cost = st.number_input("研究比較の片道コスト（bps）", 0.0, 100.0, 10.0, 1.0, key="v17246_cost")
+        signature = hashlib.sha256(upload.getvalue()).hexdigest() if upload is not None else ""
+        params = {"元日足SHA256": signature, "初期資金": initial, "1銘柄予算": budget, "通常注文予算": normal_cap, "注文方式": order, "片道bps": cost, "最大保有": 3, "終値損切り%": 7, "共通最低日足": 200, "財務除外再現": False, "GC順位": "%K順（現行シグナル先行の順位は未再現）", "後半未使用保証": False}
         if upload is not None and st.button("Stochを使わない3案も含めて比較", key="v17246_research_run"):
             try:
                 payload = upload.getvalue()
                 if upload.name.lower().endswith(".zip"):
                     with ZipFile(io.BytesIO(payload)) as z:
-                        history = pd.read_csv(z.open("backtest_history_5y.csv"), dtype={"コード":str})
+                        matches = [n for n in z.namelist() if n.endswith("backtest_history_5y.csv")]
+                        if len(matches) != 1:
+                            raise ValueError("backtest_history_5y.csv が1つ必要です。通常の分析ZIPではなく5年日足ZIPを使用してください。")
+                        history = pd.read_csv(z.open(matches[0]), dtype={"コード":str})
                 else:
                     history = pd.read_csv(io.BytesIO(payload), dtype={"コード":str})
                 frames, split_aware, exclusions = prepare_allocation_history(history)
                 if not split_aware:
                     raise ValueError("Stock Splits列付きの新しい5年日足を使用してください")
                 with st.spinner("同じ資金と売買条件で比較中…"):
-                    result = compare_public_research_logic(frames, fee_bps=cost)
-                st.dataframe(result, use_container_width=True, hide_index=True)
-                if not exclusions.empty:
-                    st.dataframe(exclusions, use_container_width=True, hide_index=True)
-                st.download_button("研究比較CSV", result.to_csv(index=False).encode("utf-8-sig"), "public_logic_comparison.csv", "text/csv", key="v17246_download")
+                    result, details = compare_public_research_logic(frames, initial_cash=initial, fee_bps=cost, cap_yen=cap, normal_cap=normal_cap, lot_size=lot, max_shares=limit, return_details=True)
+                buf = io.BytesIO()
+                with ZipFile(buf, "w") as z:
+                    z.writestr("comparison.csv", result.to_csv(index=False, encoding="utf-8-sig"))
+                    z.writestr("parameters.csv", pd.DataFrame([params]).to_csv(index=False, encoding="utf-8-sig"))
+                    z.writestr("history_exclusions.csv", exclusions.to_csv(index=False, encoding="utf-8-sig"))
+                    for i, (metadata, trades, curve, opened) in enumerate(details):
+                        for suffix, frame in (("trades", trades), ("curve", curve), ("open_positions", opened)):
+                            export = frame.copy()
+                            for field, value in metadata.items():
+                                export[field] = value
+                            z.writestr(f"{i:02d}_{suffix}.csv", export.to_csv(index=False, encoding="utf-8-sig"))
+                st.session_state["v17248_research_result"] = {"params": params, "result": result, "exclusions": exclusions, "zip": buf.getvalue()}
             except Exception as exc:
                 st.error(f"研究比較を実行できませんでした：{exc}")
+        saved = st.session_state.get("v17248_research_result")
+        if saved and saved["params"] == params:
+            st.dataframe(saved["result"], use_container_width=True, hide_index=True)
+            if not saved["exclusions"].empty:
+                st.dataframe(saved["exclusions"], use_container_width=True, hide_index=True)
+            st.download_button("比較結果ZIP（条件・売買明細・資産推移）", saved["zip"], "public_logic_comparison.zip", "application/zip", key="v17248_download")
+        elif saved:
+            st.info("日足または比較条件が変わりました。比較を再実行してください。")
         st.markdown("研究元：[AQRのトレンド追随研究](https://www.aqr.com/insights/research/journal-article/a-century-of-evidence-on-trend-following-investing) / [FinRL論文](https://arxiv.org/abs/2011.09607)")
 
 
@@ -3167,7 +3214,7 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
     ).clip(0, 100)
     out["割安判定"] = out.apply(
         lambda rr: "⚠️ 分割補正確認" if "⚠️" in str(rr.get("株式分割補正", "")) else
-        "⚠️ 最新性未確認" if rr.get("財務情報鮮度") != "Yahoo期末日を確認" or rr.get("ファンダ取得状態") != "OK" else
+        financial_unavailable_label(rr.get("ファンダ取得状態"), rr.get("財務情報鮮度")) if financial_unavailable_label(rr.get("ファンダ取得状態"), rr.get("財務情報鮮度")) else
         ("⚠️ 異常値ガード・算定不能" if "⚠️" in str(rr.get("適正株価異常値ガード", "")) and not np.isfinite(safe_float(rr.get("参考価値上昇余地%"))) else
          "算定不能" if not np.isfinite(safe_float(rr.get("参考価値上昇余地%"))) else
          "🟢 割安" if safe_float(rr.get("参考価値上昇余地%")) >= 20 else
@@ -4101,6 +4148,8 @@ def _short_surge_label(value):
 
 def _short_value_label(value):
     text = str(value or "")
+    if "財務取得不可" in text:
+        return "⚠️ 財務取得不可"
     if "最新性未確認" in text:
         return "⚠️ 財務鮮度未確認"
     if "分割補正" in text:
@@ -4267,7 +4316,7 @@ def current_holdings_rows(holdings, sell_candidates, signal_audit, value_df, pri
             split_status = str(f.get("株式分割補正", ""))
             guard_status = str(f.get("適正株価異常値ガード", ""))
             if f.get("財務情報鮮度") != "Yahoo期末日を確認" or f.get("取得状態") != "OK":
-                value_label = "⚠️ 最新性未確認"
+                value_label = financial_unavailable_label(f.get("取得状態"), f.get("財務情報鮮度"))
             elif "⚠️" in split_status:
                 value_label = "⚠️ 分割補正確認"
             elif "⚠️" in guard_status and not np.isfinite(upside):
@@ -4480,7 +4529,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.7")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.8")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。終値7%損切り・最大3銘柄は共通です。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5321,7 +5370,13 @@ with admin_tab:
     with value_tab:
         render_allocation_research()
         render_public_research_logic()
-        st.caption("監視対象の企業価値は参考情報です。売買対象や買い判断には使用しません。")
+        if isinstance(signal_value_df, pd.DataFrame) and not signal_value_df.empty:
+            missing_finance = signal_value_df[~signal_value_df["ファンダ取得状態"].eq("OK")]
+            if not missing_finance.empty:
+                st.warning(f"財務指標を取得できない銘柄：{len(missing_finance)} / {len(signal_value_df)}。日足の鮮度とは別です。判定不能除外が有効なら新規買いを見送ります。")
+                with st.expander("財務取得不可の詳細", expanded=False):
+                    st.dataframe(missing_finance[["コード", "銘柄名", "ファンダ取得状態", "Yahoo取得状態", "財務情報鮮度", "財務取得日時"]], use_container_width=True, hide_index=True)
+        st.caption("シグナル先行では企業価値を割高除外・判定不能除外に使用します。他の監視対象設定では参考表示です。")
         st.caption("朝の企業価値参考評価はYahoo Financeのみを使用します。J-Quantsの遅延財務は使用しません。期末日を確認できない場合は財務鮮度未確認と表示します。")
         if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
             st.info("先に『今日の判定を更新』で監視対象のデータを取得してください。")
@@ -5586,7 +5641,7 @@ try:
             "1銘柄購入予算":maxbuy, "通常注文予算":lot_cap, "注文方式":execution_mode,
             "IFDOCO参考利確率":ifd_take_profit,"BUY条件":live_trade_method,"管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
             "割高の新規BUY除外":bool(signal_first),
-            "SELL条件":"全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%",
+            "SELL条件":("全保有銘柄 / 前日までの20日安値を終値で割る または終値で含み損 -7.0%" if replacement_live else "全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%"),
             "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":live_universe_mode == "固定45銘柄",
             "短期反転フィルター":bool(churn_filter),
             "トレンド振れ幅フィルター実売買":bool(quality_mode),

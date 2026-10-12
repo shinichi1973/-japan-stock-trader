@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.12
-# BUILD: VER17-24-12-GFS-HISTORY-FIX-20261012
+# 日本株 AI投資アシスタント Ver.17.24.13
+# BUILD: VER17-24-13-FINANCE-FALLBACK-20261013
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.12",
+    page_title="日本株 AI投資アシスタント Ver.17.24.13",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.12 TOPIX＋日経225 シグナル先行"
-BUILD = "VER17-24-12-GFS-HISTORY-FIX-20261012"
+VERSION = "17.24.13 TOPIX＋日経225 シグナル先行"
+BUILD = "VER17-24-13-FINANCE-FALLBACK-20261013"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1483,10 +1483,99 @@ def _adjust_target_for_split(target, current_price, split_factor, recent=True):
     return np.nan, False, True, "⚠️分割基準不明のため目標株価を除外"
 
 
+DOMESTIC_FINANCE_FRESHNESS = "国内参考指標の基準日を確認（決算鮮度未保証）"
+
+
+def finance_freshness_usable(freshness):
+    return str(freshness) in ("Yahoo期末日を確認", DOMESTIC_FINANCE_FRESHNESS)
+
+
+def _parse_domestic_finance(html, today):
+    """参考指標のdlだけを読み、広告・AI要約の数値は取り込まない。"""
+    def plain(value):
+        return re.sub(r"\s+", "", html_unescape(re.sub(r"<[^>]+>", " ", value)))
+
+    start = re.search(r'<(?:section|div)\b[^>]*id=[\"\']referenc[\"\']', html)
+    if not start:
+        raise ValueError("参考指標セクションなし（ページ変更またはアクセス制限）")
+    section = html[start.start():]
+    end = section.find("</section>")
+    if end >= 0:
+        section = section[:end]
+    values = {}
+    labels = {"PER（会社予想）":"forwardPE", "PBR（実績）":"priceToBook",
+              "EPS（会社予想）":"forwardEps", "BPS（実績）":"bookValue",
+              "ROE（実績）":"returnOnEquity", "時価総額":"marketCap",
+              "発行済株式数":"sharesOutstanding"}
+    reference_date = None
+    forecast_period = ""
+    for block in re.findall(r'<dl\b[^>]*>(.*?)</dl>', section, re.S | re.I):
+        dt = re.search(r'<dt\b[^>]*>(.*?)</dt>', block, re.S | re.I)
+        dd = re.search(r'<dd\b[^>]*>(.*?)</dd>', block, re.S | re.I)
+        if not dt or not dd:
+            continue
+        label = plain(dt.group(1)).replace("用語", "")
+        key = labels.get(label)
+        if not key:
+            continue
+        value_text = plain(dd.group(1)).replace("(連)", "").replace("(単)", "")
+        number = re.match(r'([-+−]?[0-9][0-9,]*(?:\.[0-9]+)?)', value_text)
+        if not number:
+            continue  # --や未提供をゼロに変換しない
+        value = safe_float(number.group(1).replace(",", "").replace("−", "-"))
+        if not np.isfinite(value):
+            continue
+        if key == "returnOnEquity":
+            value /= 100.0
+        elif key == "marketCap":
+            if "百万円" not in value_text:
+                continue
+            value *= 1_000_000
+        values[key] = value
+        if key == "forwardPE":
+            date_match = re.search(r'\((\d{1,2})/(\d{1,2})\)', value_text)
+            if date_match:
+                month, day = map(int, date_match.groups())
+                try:
+                    reference_date = today.replace(month=month, day=day)
+                    if reference_date > today:
+                        reference_date = reference_date.replace(year=today.year - 1)
+                except ValueError:
+                    reference_date = None
+        if key == "forwardEps":
+            period = re.search(r'\((20\d{2})/(\d{2})\)', value_text)
+            if period:
+                forecast_period = "-".join(period.groups())
+    if not any(k in values for k in ("forwardEps", "priceToBook", "returnOnEquity")):
+        raise ValueError("参考指標に有効な財務値なし")
+    valid_date = reference_date is not None and 0 <= (today - reference_date).days <= 10
+    valid_period = False
+    if forecast_period:
+        period_end = pd.Timestamp(forecast_period + "-01") + pd.offsets.MonthEnd(0)
+        valid_period = -100 <= (period_end.date() - today).days <= 550
+    usable = valid_date and valid_period and values.get("forwardPE", 0) > 0 and values.get("forwardEps", 0) > 0
+    values["_reference_date"] = str(reference_date or "")
+    values["_forecast_period"] = forecast_period
+    values["_freshness"] = DOMESTIC_FINANCE_FRESHNESS if usable else "国内参考指標の基準日・予想期を確認できず"
+    return values
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _domestic_finance_snapshot(t):
+    if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)):
+        raise ValueError("国内株コード形式が不正")
+    response = requests.get(
+        f"https://finance.yahoo.co.jp/quote/{t}",
+        headers={"User-Agent":"Mozilla/5.0", "Accept":"text/html"}, timeout=12,
+    )
+    response.raise_for_status()
+    return _parse_domestic_finance(response.text, tokyo_now().date())
+
+
 def financial_unavailable_label(status, freshness):
     if str(status) != "OK":
         return "⚠️ 財務取得不可・算定不能"
-    if str(freshness) != "Yahoo期末日を確認":
+    if not finance_freshness_usable(freshness):
         return "⚠️ 最新性未確認"
     return ""
 
@@ -1495,17 +1584,37 @@ def financial_unavailable_label(status, freshness):
 def fundamental_snapshot(t, market_price_hint=np.nan):
     """現在情報のみ。過去バックテストには使用しない。株式分割ズレを最優先で防止する。"""
     try:
-        # 朝の参考評価はYahooのみ。遅延財務による補完は行わない。
+        # yfinance失敗・財務欠損・期末日欠損時は日本版の公開参考指標を補完。
         yahoo_status = "OK"
+        finance_source = "Yahoo Finance"
+        domestic = None
         try:
             info = yf.Ticker(t).info or {}
         except Exception as exc:
             info = {}
-            yahoo_status = "取得失敗: " + type(exc).__name__
-        if not isinstance(info, dict) or not info:
+            yahoo_status = "yfinance取得失敗: " + type(exc).__name__
+        if not isinstance(info, dict):
             info = {}
+        required = ("forwardEps", "trailingEps", "targetMeanPrice")
+        quarter_value = safe_float(info.get("mostRecentQuarter"))
+        if (not any(np.isfinite(safe_float(info.get(k))) for k in required)
+                or not np.isfinite(quarter_value)
+                or quarter_value <= 0
+                or not 0 <= (tokyo_now().date() - datetime.fromtimestamp(quarter_value, timezone.utc).date()).days <= 200):
             if yahoo_status == "OK":
-                yahoo_status = "空応答・財務情報なし"
+                yahoo_status = "yfinance財務材料・期末日不足"
+            try:
+                domestic = _domestic_finance_snapshot(t)
+                # 同一ページのEPS/PER/BPS/PBRを一組として採用する。
+                # 海外版の古いEPSや目標株価とは混ぜない。
+                info = {k:v for k,v in info.items() if k in ("sector", "industry")}
+                info.update({k:v for k,v in domestic.items() if not k.startswith("_")})
+                finance_source = "Yahoo!ファイナンス日本版・公開参考指標"
+                yahoo_status += " / 日本版補完成功"
+            except Exception as exc:
+                yahoo_status += " / 日本版補完失敗: " + type(exc).__name__ + ": " + str(exc)[:160]
+        if not info:
+            yahoo_status += " / 有効な財務情報なし"
         yahoo_quarter_raw = safe_float(info.get("mostRecentQuarter"))
         yahoo_quarter = (datetime.fromtimestamp(yahoo_quarter_raw, timezone.utc).date()
                           if np.isfinite(yahoo_quarter_raw) and yahoo_quarter_raw > 0 else None)
@@ -1557,7 +1666,7 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
         elif np.isfinite(split_factor) and split_factor > 1.01:
             split_notes.append(f"過去分割 {split_factor:g}:1（3年以上前）")
         else:
-            split_notes.append("直近分割情報なし")
+            split_notes.append("日本版の株式分割履歴は未提供・EPS/PER整合性で照合" if domestic else "直近分割情報なし")
 
         if np.isfinite(info_price) and np.isfinite(price) and price > 0:
             price_gap = abs(info_price / price - 1.0)
@@ -1776,9 +1885,13 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
                      "Yahoo期末日が古い" if yahoo_quarter_age is not None and yahoo_quarter_age > 200 else
                      "Yahoo期末日を確認" if yahoo_quarter_age is not None else
                      "Yahoo開示期末日未提供" if has_fundamentals else "最新性を確認できず")
+        if domestic is not None:
+            freshness = domestic["_freshness"]
         return {
             "取得状態":source_status,
-            "財務情報源":"Yahoo Finance" if has_fundamentals else "取得不可",
+            "財務情報源":finance_source if has_fundamentals else "取得不可",
+            "参考指標基準日":domestic.get("_reference_date", "") if domestic else "",
+            "予想EPS対象期":domestic.get("_forecast_period", "") if domestic else "",
             "財務情報鮮度":freshness,"Yahoo期末日":str(yahoo_quarter or ""),
             "Yahoo取得状態":yahoo_status,
             "財務取得日時":tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST"),
@@ -3200,6 +3313,8 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
             "Yahoo期末日": str(f.get("Yahoo期末日", "")),
             "Yahoo取得状態": str(f.get("Yahoo取得状態", "")),
             "財務取得日時": str(f.get("財務取得日時", "")),
+            "参考指標基準日": str(f.get("参考指標基準日", "")),
+            "予想EPS対象期": str(f.get("予想EPS対象期", "")),
         })
     out = pool.merge(pd.DataFrame(fund_rows), on="ticker", how="left")
     for c in ["企業価値スコア", "成長性スコア", "バリュエーションスコア"]:
@@ -3226,7 +3341,7 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
     # 有効な評価を持つ銘柄を先に並べ、欠損は監査用に残す。
     out["企業価値算定済"] = (
         out["ファンダ取得状態"].eq("OK") &
-        out["財務情報鮮度"].eq("Yahoo期末日を確認") &
+        out["財務情報鮮度"].map(finance_freshness_usable) &
         pd.to_numeric(out["参考価値上昇余地%"], errors="coerce").notna()
     )
     out["母集団件数"] = int(mother_count)
@@ -4324,7 +4439,7 @@ def current_holdings_rows(holdings, sell_candidates, signal_audit, value_df, pri
             upside = safe_float(f.get("参考価値上昇余地"))
             split_status = str(f.get("株式分割補正", ""))
             guard_status = str(f.get("適正株価異常値ガード", ""))
-            if f.get("財務情報鮮度") != "Yahoo期末日を確認" or f.get("取得状態") != "OK":
+            if not finance_freshness_usable(f.get("財務情報鮮度")) or f.get("取得状態") != "OK":
                 value_label = financial_unavailable_label(f.get("取得状態"), f.get("財務情報鮮度"))
             elif "⚠️" in split_status:
                 value_label = "⚠️ 分割補正確認"
@@ -4538,7 +4653,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.12")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.13")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。終値7%損切り・最大3銘柄は共通です。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5832,7 +5947,7 @@ with admin_tab:
                 with st.expander("財務取得不可の詳細", expanded=False):
                     st.dataframe(missing_finance[["コード", "銘柄名", "ファンダ取得状態", "Yahoo取得状態", "財務情報鮮度", "財務取得日時"]], use_container_width=True, hide_index=True)
         st.caption("シグナル先行では企業価値を割高除外・判定不能除外に使用します。他の監視対象設定では参考表示です。")
-        st.caption("朝の企業価値参考評価はYahoo Financeのみを使用します。J-Quantsの遅延財務は使用しません。期末日を確認できない場合は財務鮮度未確認と表示します。")
+        st.caption("朝の企業価値参考評価はYahoo Financeを取得し、財務材料不足時はYahoo日本版の公開参考指標を補完します。国内補完は指標基準日（10日以内）とEPS予想期を確認しますが、最新決算への反映は保証できません。売上・利益成長率や目標株価を推測で補いません。J-Quantsの遅延財務は使用しません。")
         if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
             st.info("先に『今日の判定を更新』で監視対象のデータを取得してください。")
         else:
@@ -5842,7 +5957,7 @@ with admin_tab:
                 "現在株価_価格","AI参考価値","参考価値上昇余地%","企業価値スコア",
                 "成長性スコア","流動性スコア","AI_TOP50スコア",
                 "財務情報源","財務情報鮮度","Yahoo期末日","Yahoo取得状態",
-                "財務取得日時","ファンダ取得状態",
+                "財務取得日時","参考指標基準日","予想EPS対象期","ファンダ取得状態",
                 "適正株価異常値ガード","株式分割補正"
             ]
             value_full = prepare_admin_display(value_show[[c for c in show_cols if c in value_show.columns]])

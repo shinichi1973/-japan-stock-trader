@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.11
-# BUILD: VER17-24-11-GFS-RESEARCH-20261012
+# 日本株 AI投資アシスタント Ver.17.24.12
+# BUILD: VER17-24-12-GFS-HISTORY-FIX-20261012
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.11",
+    page_title="日本株 AI投資アシスタント Ver.17.24.12",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.11 TOPIX＋日経225 シグナル先行"
-BUILD = "VER17-24-11-GFS-RESEARCH-20261012"
+VERSION = "17.24.12 TOPIX＋日経225 シグナル先行"
+BUILD = "VER17-24-12-GFS-HISTORY-FIX-20261012"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3454,7 +3454,16 @@ def _prepare_light_history_frame(df):
     ], axis=1).max(axis=1)
     x["ATR14"] = tr.rolling(14).mean()
     x["Return_25d"] = x["Close"].pct_change(25) * 100.0
-    return x.dropna(subset=["MA25", "MA75", "ATR14", "Return_25d"])
+    # GFS研究の252日高値は、MA75の準備期間74行を削る前に計算する。
+    # スカラーだけをattrsへ保存し、現行売買に渡す行・列・指標値は変えない。
+    gfs_high = safe_float(x["High"].shift(1).rolling(252, min_periods=252).max().iloc[-1])
+    out = x.dropna(subset=["MA25", "MA75", "ATR14", "Return_25d"])
+    if not out.empty:
+        out.attrs.update({"gfs_history_version": 2,
+                          "gfs_252_previous_high": float(gfs_high) if np.isfinite(gfs_high) else None,
+                          "gfs_prior_bars": max(len(x) - 1, 0),
+                          "gfs_source_final_date": pd.Timestamp(x.index[-1]).isoformat()})
+    return out
 
 
 
@@ -3521,7 +3530,7 @@ def export_backtest_history_5y(tickers_tuple):
     return hist, pd.DataFrame(failed)
 
 @st.cache_data(ttl=300, show_spinner=False)
-def batch_stock_data_light(tickers_tuple, months=15):
+def batch_stock_data_light(tickers_tuple, months=15, gfs_history_version=2):
     """数百銘柄の日足を取得し、16時以降は直近東証日を一括補完する。
 
     過去履歴はyfinanceを使い、遅れやすい最終1日だけTradingViewの東証
@@ -4529,7 +4538,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.11")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.12")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。終値7%損切り・最大3銘柄は共通です。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -4647,6 +4656,9 @@ sl, churn_filter, quality_mode = 7.0, False, False
 run_clicked = st.button("▶ 今日の判定を更新", type="primary", use_container_width=True, key="v177_run")
 
 if not run_clicked:
+    previous_data = st.session_state.get("v177_data", {})
+    if previous_data and any(isinstance(d, pd.DataFrame) and d.attrs.get("gfs_history_version") != 2 for d in previous_data.values()):
+        st.session_state["v172412_history_refresh_required"] = True
     previous_universe = st.session_state.get("v177_universe_df", pd.DataFrame())
     previous_codes = (set(previous_universe["コード"].astype(str))
                       if isinstance(previous_universe, pd.DataFrame) and
@@ -4658,6 +4670,7 @@ if not run_clicked:
             st.session_state.pop(key, None)
 
 if run_clicked:
+    st.session_state.pop("v172412_history_refresh_required", None)
     universe_error = ""
     try:
         universe_df = (discover_topix_nikkei225_stock_universe() if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX＋日経225全体から買いシグナル先行")
@@ -5596,7 +5609,12 @@ def build_gfs_research_signals(price_data, freshness, holdings, value_frames, li
             audit.append({"コード": c, "銘柄名": company, "状態": "終値欠損", "研究買い": False, "研究売り": False})
             continue
         # Both series share the data source's split-adjusted price basis.
-        previous_high = safe_float(high.shift(1).rolling(high_window, min_periods=high_window).max().iloc[-1])
+        source_date = str(df.attrs.get("gfs_source_final_date", ""))
+        raw_high_ready = (high_window == 252 and df.attrs.get("gfs_history_version") == 2 and
+                          source_date == pd.Timestamp(x.index[-1]).isoformat())
+        previous_high = (safe_float(df.attrs.get("gfs_252_previous_high")) if raw_high_ready else
+                         safe_float(high.shift(1).rolling(high_window, min_periods=high_window).max().iloc[-1]))
+        prior_bars = int(df.attrs.get("gfs_prior_bars", 0)) if raw_high_ready else max(len(x) - 1, 0)
         ma25 = safe_float(close.rolling(25, min_periods=25).mean().iloc[-1])
         volume_ratio = np.nan
         if "Volume" in x:
@@ -5650,7 +5668,8 @@ def build_gfs_research_signals(price_data, freshness, holdings, value_frames, li
                               "現行の売り条件も一致": live_sell, "扱い": "研究候補・注文には使用しない"})
         audit.append({"コード": c, "銘柄名": company, "状態": reason or "判定済み", "研究買い": final_buy,
                       "研究売り": bool(sell_reason), "高値更新のみ": raw_buy, "銘柄判定": verdict,
-                      "前日までの高値": previous_high, "現在株価": px})
+                      "前日までの高値": previous_high, "現在株価": px, "高値計算に使える前日日足本数": prior_bars,
+                      "高値取得元": "準備期間を削る前の日足" if raw_high_ready else "受取日足から計算"})
     buy = pd.DataFrame(buys, columns=buy_cols)
     if not buy.empty:
         buy = buy.sort_values(["高値超過率%", "コード"], ascending=[False, True]).reset_index(drop=True)
@@ -5698,7 +5717,7 @@ def render_gfs_research(price_data, freshness, holdings, value_frames, live_audi
     params = {"研究名": "GFS公開概要に基づく新高値研究", "高値期間_営業日": 252,
               "研究損切り%": 8.0, "半分利確_上昇率%": 100.0, "追加出来高下限": volume_min,
               "追加MA25売り": ma_exit, "正式売買に接続": False, "原文完全再現": False,
-              "資料確認日": "2026-10-12"}
+              "資料確認日": "2026-10-12", "高値計算の履歴処理版": 2}
     buf = io.BytesIO()
     with ZipFile(buf, "w") as z:
         for filename, frame in [("gfs_research_buy.csv", buy), ("gfs_research_sell.csv", sell),
@@ -6041,6 +6060,8 @@ with admin_tab:
         st.caption("比較結果は全処理ZIP内の indicator_compare_candidates.csv に保存します。")
 
     with gfs_tab:
+        if st.session_state.get("v172412_history_refresh_required"):
+            st.warning("旧版の取得日足が残っています。『今日の判定を更新』を押して研究用高値を再計算してください。")
         gfs_research_buy, gfs_research_sell, gfs_research_audit, gfs_research_settings = render_gfs_research(
             data, daily_bar_status_df, short_confirmed, [value_top50_df, signal_value_df], signal_audit_df
         )

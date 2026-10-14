@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.13
-# BUILD: VER17-24-13-FINANCE-FALLBACK-20261013
+# 日本株 AI投資アシスタント Ver.17.24.14
+# BUILD: VER17-24-14-JAPAN-SOURCES-20261014
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.13",
+    page_title="日本株 AI投資アシスタント Ver.17.24.14",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.13 TOPIX＋日経225 シグナル先行"
-BUILD = "VER17-24-13-FINANCE-FALLBACK-20261013"
+VERSION = "17.24.14 TOPIX＋日経225 シグナル先行"
+BUILD = "VER17-24-14-JAPAN-SOURCES-20261014"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1106,10 +1106,53 @@ def _append_1321_proxy_market_row(raw_market, required_date):
     return out
 
 
+def _nikkei_japan_daily():
+    """日経平均そのものの日足は日本経済新聞社の公式CSVを優先。"""
+    response = requests.get(
+        "https://indexes.nikkei.co.jp/nkave/historical/nikkei_stock_average_daily_jp.csv",
+        headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "ja-JP,ja;q=0.9"}, timeout=20,
+    )
+    response.raise_for_status()
+    for encoding in ("utf-8-sig", "cp932"):
+        try:
+            text = response.content.decode(encoding)
+        except UnicodeError:
+            continue
+        for start, line in enumerate(text.splitlines()[:30]):
+            if "日付" not in line:
+                continue
+            try:
+                frame = pd.read_csv(io.StringIO("\n".join(text.splitlines()[start:])), dtype=str)
+                frame.columns = [str(c).strip() for c in frame.columns]
+                dates = pd.to_datetime(frame["日付"], errors="coerce")
+                raw = pd.DataFrame(index=pd.DatetimeIndex(dates))
+                for dest, src in (("Open", "始値"), ("High", "高値"), ("Low", "安値"), ("Close", "終値")):
+                    raw[dest] = pd.to_numeric(frame[src].str.replace(",", "", regex=False), errors="coerce").to_numpy()
+                raw["Volume"] = 0.0  # 指数の出来高は非提供。市場判定は終値のみ使用。
+                raw = _normalize_ohlcv(raw)
+                if len(raw) < 220:
+                    continue
+                return raw
+            except (KeyError, ValueError, pd.errors.ParserError):
+                continue
+    raise ValueError("日経日本公式日足CSVの形式または履歴本数を確認できません")
+
+
 @st.cache_data(ttl=1800)
 def market_data(required_date=None):
     start, end = yahoo_history_window(5)
     required_date = pd.Timestamp(required_date).normalize() if pd.notna(required_date) else pd.NaT
+    try:
+        raw = _nikkei_japan_daily()
+        out = _market_indicators(raw)
+        latest = pd.Timestamp(raw.index.max()).normalize()
+        if not out.empty and (pd.isna(required_date) or latest >= required_date):
+            out.attrs.update({"source": "日経日本公式日次CSV", "market_mode": "NIKKEI225_DIRECT",
+                              "market_symbol": "^N225", "market_name": "日経平均",
+                              "regular_market_date": latest})
+            return out
+    except (requests.RequestException, ValueError):
+        pass
     try:
         raw, meta = _yahoo_chart("^N225", 5)
         if pd.notna(required_date) and not raw.empty and pd.Timestamp(raw.index.max()).normalize() < required_date:
@@ -1584,35 +1627,25 @@ def financial_unavailable_label(status, freshness):
 def fundamental_snapshot(t, market_price_hint=np.nan):
     """現在情報のみ。過去バックテストには使用しない。株式分割ズレを最優先で防止する。"""
     try:
-        # yfinance失敗・財務欠損・期末日欠損時は日本版の公開参考指標を補完。
         yahoo_status = "OK"
-        finance_source = "Yahoo Finance"
+        finance_source = "Yahoo!ファイナンス日本版・公開参考指標"
         domestic = None
         try:
-            info = yf.Ticker(t).info or {}
+            domestic = _domestic_finance_snapshot(t)
+            info = {k: v for k, v in domestic.items() if not k.startswith("_")}
+            if not info:
+                raise ValueError("日本版の有効な参考指標なし")
         except Exception as exc:
-            info = {}
-            yahoo_status = "yfinance取得失敗: " + type(exc).__name__
-        if not isinstance(info, dict):
-            info = {}
-        required = ("forwardEps", "trailingEps", "targetMeanPrice")
-        quarter_value = safe_float(info.get("mostRecentQuarter"))
-        if (not any(np.isfinite(safe_float(info.get(k))) for k in required)
-                or not np.isfinite(quarter_value)
-                or quarter_value <= 0
-                or not 0 <= (tokyo_now().date() - datetime.fromtimestamp(quarter_value, timezone.utc).date()).days <= 200):
-            if yahoo_status == "OK":
-                yahoo_status = "yfinance財務材料・期末日不足"
+            domestic = None
+            yahoo_status = "日本版取得失敗: " + type(exc).__name__ + ": " + str(exc)[:120]
+            finance_source = "Yahoo Finance（日本版取得失敗時の予備）"
             try:
-                domestic = _domestic_finance_snapshot(t)
-                # 同一ページのEPS/PER/BPS/PBRを一組として採用する。
-                # 海外版の古いEPSや目標株価とは混ぜない。
-                info = {k:v for k,v in info.items() if k in ("sector", "industry")}
-                info.update({k:v for k,v in domestic.items() if not k.startswith("_")})
-                finance_source = "Yahoo!ファイナンス日本版・公開参考指標"
-                yahoo_status += " / 日本版補完成功"
-            except Exception as exc:
-                yahoo_status += " / 日本版補完失敗: " + type(exc).__name__ + ": " + str(exc)[:160]
+                info = yf.Ticker(t).info or {}
+            except Exception as fallback_exc:
+                info = {}
+                yahoo_status += " / 予備取得失敗: " + type(fallback_exc).__name__
+            if not isinstance(info, dict):
+                info = {}
         if not info:
             yahoo_status += " / 有効な財務情報なし"
         yahoo_quarter_raw = safe_float(info.get("mostRecentQuarter"))
@@ -3436,27 +3469,69 @@ NIKKEI225_SNAPSHOT_DATE = '2026-10-09'
 NIKKEI225_SNAPSHOT = [('285A', 'キオクシア'), ('4062', 'イビデン'), ('6479', 'ミネベア'), ('6501', '日立'), ('6503', '三菱電'), ('6504', '富士電機'), ('6506', '安川電'), ('6525', 'コクサイエレ'), ('6526', 'ソシオネクス'), ('6645', 'オムロン'), ('6701', 'ＮＥＣ'), ('6702', '富士通'), ('6723', 'ルネサス'), ('6724', 'エプソン'), ('6752', 'パナＨＤ'), ('6753', 'シャープ'), ('6758', 'ソニーＧ'), ('6762', 'ＴＤＫ'), ('6770', 'アルプスアル'), ('6841', '横河電'), ('6857', 'アドテスト'), ('6861', 'キーエンス'), ('6902', 'デンソー'), ('6920', 'レーザーテク'), ('6954', 'ファナック'), ('6963', 'ローム'), ('6971', '京セラ'), ('6976', '太陽誘電'), ('6981', '村田製'), ('7735', 'スクリン'), ('7751', 'キヤノン'), ('7752', 'リコー'), ('8035', '東エレク'), ('7201', '日産自'), ('7202', 'いすゞ'), ('7203', 'トヨタ'), ('7211', '三菱自'), ('7261', 'マツダ'), ('7267', 'ホンダ'), ('7269', 'スズキ'), ('7270', 'ＳＵＢＡＲＵ'), ('7272', 'ヤマハ発'), ('4543', 'テルモ'), ('6146', 'ディスコ'), ('7731', 'ニコン'), ('7733', 'オリンパス'), ('7741', 'ＨＯＹＡ'), ('2432', 'ディーエヌエ'), ('3659', 'ネクソン'), ('3697', 'ＳＨＩＦＴ'), ('4307', '野村総研'), ('4385', 'メルカリ'), ('4689', 'ラインヤフー'), ('4704', 'トレンド'), ('7974', '任天堂'), ('9432', 'ＮＴＴ'), ('9433', 'ＫＤＤＩ'), ('9434', 'ＳＢ'), ('9602', '東宝'), ('9697', 'カプコン'), ('9766', 'コナミＧ'), ('9984', 'ＳＢＧ'), ('5831', 'しずおかＦＧ'), ('7186', '横浜ＦＧ'), ('8304', 'あおぞら銀'), ('8306', '三菱ＵＦＪ'), ('8308', 'りそなＨＤ'), ('8309', '三井住友トラ'), ('8316', '三井住友ＦＧ'), ('8331', '千葉銀'), ('8354', 'ふくおかＦＧ'), ('8411', 'みずほＦＧ'), ('8253', 'クレセゾン'), ('8591', 'オリックス'), ('8697', '日本取引所'), ('8601', '大和'), ('8604', '野村'), ('8630', 'ＳＯＭＰＯ'), ('8725', 'ＭＳ＆ＡＤ'), ('8750', '第一ライフ'), ('8766', '東京海上'), ('8795', 'Ｔ＆Ｄ'), ('1332', 'ニッスイ'), ('2002', '日清粉Ｇ'), ('2269', '明治ＨＤ'), ('2282', '日ハム'), ('2501', 'サッポロ'), ('2502', 'アサヒ'), ('2503', 'キリンＨＤ'), ('2801', 'キッコマン'), ('2802', '味の素'), ('2871', 'ニチレイ'), ('2914', 'ＪＴ'), ('4151', '協和キリン'), ('4502', '武田'), ('4503', 'アステラス'), ('4506', '住友ファーマ'), ('4507', '塩野義'), ('4519', '中外薬'), ('4523', 'エーザイ'), ('4568', '第一三共'), ('4578', '大塚ＨＤ'), ('3086', 'Ｊフロント'), ('3092', 'ＺＯＺＯ'), ('3099', '三越伊勢丹'), ('3382', 'セブン＆アイ'), ('7453', '良品計画'), ('7532', 'パンパシＨＤ'), ('8233', '高島屋'), ('8252', '丸井Ｇ'), ('8267', 'イオン'), ('9843', 'ニトリＨＤ'), ('9983', 'ファストリ'), ('2413', 'エムスリー'), ('4324', '電通グループ'), ('4661', 'ＯＬＣ'), ('4751', 'サイバー'), ('4755', '楽天グループ'), ('6098', 'リクルート'), ('6178', '日本郵政'), ('6532', 'ベイカレント'), ('9735', 'セコム'), ('1605', 'ＩＮＰＥＸ'), ('3401', '帝人'), ('3402', '東レ'), ('3861', '王子ＨＤ'), ('3405', 'クラレ'), ('3407', '旭化成'), ('4004', 'レゾナック'), ('4005', '住友化'), ('4021', '日産化'), ('4042', '東ソー'), ('4043', 'トクヤマ'), ('4061', 'デンカ'), ('4063', '信越化'), ('4183', '三井化学'), ('4188', '三菱ケミＧ'), ('4208', 'ＵＢＥ'), ('4452', '花王'), ('4901', '富士フイルム'), ('4911', '資生堂'), ('6988', '日東電'), ('5019', '出光興産'), ('5020', 'ＥＮＥＯＳ'), ('5101', '浜ゴム'), ('5108', 'ブリヂストン'), ('5201', 'ＡＧＣ'), ('5214', '日電硝'), ('5233', '太平洋セメ'), ('5301', '東海カーボン'), ('5332', 'ＴＯＴＯ'), ('5333', 'ＮＧＫ'), ('5401', '日本製鉄'), ('5406', '神戸鋼'), ('5411', 'ＪＦＥ'), ('3436', 'ＳＵＭＣＯ'), ('5016', 'ＪＸ金属'), ('5706', '三井金属'), ('5711', '三菱マ'), ('5713', '住友鉱'), ('5714', 'ＤＯＷＡ'), ('5801', '古河電'), ('5802', '住友電'), ('5803', 'フジクラ'), ('2768', '双日'), ('8001', '伊藤忠'), ('8002', '丸紅'), ('8015', '豊田通商'), ('8031', '三井物'), ('8053', '住友商'), ('8058', '三菱商'), ('1721', 'コムシスＨＤ'), ('1801', '大成建'), ('1802', '大林組'), ('1803', '清水建'), ('1808', '長谷工'), ('1812', '鹿島'), ('1925', 'ハウス'), ('1928', '積ハウス'), ('1963', '日揮ＨＤ'), ('5631', '日製鋼'), ('6103', 'オークマ'), ('6113', 'アマダ'), ('6273', 'ＳＭＣ'), ('6301', 'コマツ'), ('6302', '住友重'), ('6305', '日立建機'), ('6326', 'クボタ'), ('6361', '荏原'), ('6367', 'ダイキン'), ('6471', '日精工'), ('6472', 'ＮＴＮ'), ('6473', 'ジェイテクト'), ('7011', '三菱重'), ('7013', 'ＩＨＩ'), ('7012', '川重'), ('7832', 'バンナムＨＤ'), ('7911', 'ＴＯＰＰＡＮ'), ('7912', '大日印'), ('7951', 'ヤマハ'), ('3289', '東急不ＨＤ'), ('8801', '三井不'), ('8802', '菱地所'), ('8804', '東建物'), ('8830', '住友不'), ('9001', '東武'), ('9005', '東急'), ('9007', '小田急'), ('9008', '京王'), ('9009', '京成'), ('9020', 'ＪＲ東日本'), ('9021', 'ＪＲ西日本'), ('9022', 'ＪＲ東海'), ('9064', 'ヤマトＨＤ'), ('9147', 'ＮＸＨＤ'), ('9101', '郵船'), ('9104', '商船三井'), ('9107', '川崎汽'), ('9201', 'ＪＡＬ'), ('9202', 'ＡＮＡＨＤ'), ('9501', '東電ＨＤ'), ('9502', '中部電'), ('9503', '関西電'), ('9531', '東ガス'), ('9532', '大ガス')]
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+def parse_nikkei225_csv(content):
+    """日経日本公式ウエートCSV。先頭の説明行と文字コードの差を許容。"""
+    for encoding in ("utf-8-sig", "cp932", "utf-16"):
+        try:
+            text = content.decode(encoding)
+        except UnicodeError:
+            continue
+        for start, line in enumerate(text.splitlines()[:30]):
+            if "コード" not in line:
+                continue
+            try:
+                frame = pd.read_csv(io.StringIO("\n".join(text.splitlines()[start:])), dtype=str)
+                frame.columns = [str(c).strip() for c in frame.columns]
+                cc = next(c for c in frame if "コード" in c)
+                nc = next(c for c in frame if "銘柄名" in c or "社名" in c)
+                codes = frame[cc].str.strip().str.upper().str.replace(r"\.0$", "", regex=True)
+                mask = codes.str.fullmatch(r"[0-9A-Z]{4}", na=False)
+                out = pd.DataFrame({"コード": codes[mask], "銘柄名": frame.loc[mask, nc].str.strip()})
+                out = out.drop_duplicates("コード").reset_index(drop=True)
+                if len(out) != 225 or out["銘柄名"].isna().any():
+                    continue
+                out["ticker"] = out["コード"] + ".T"
+                out["構成銘柄情報源"] = "日経日本公式ウエート一覧CSV"
+                return out
+            except (ValueError, StopIteration, pd.errors.ParserError):
+                continue
+    raise ValueError("日経日本公式CSVで225銘柄を確認できません")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def discover_nikkei225_stock_universe():
-    try:
-        response = requests.get(
-            "https://indexes.nikkei.co.jp/nkave/index/component?idx=nk225",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
-        )
-        response.raise_for_status()
-        response.encoding = "utf-8"
-        return parse_nikkei225_constituents(response.text)
-    except (requests.RequestException, ValueError) as exc:
-        out = pd.DataFrame(NIKKEI225_SNAPSHOT, columns=["コード", "銘柄名"])
-        if len(out) != 225 or not out["コード"].is_unique:
-            raise ValueError("日経225の保存済み構成一覧が不正です") from exc
-        out["ticker"] = out["コード"] + ".T"
-        out["構成銘柄情報源"] = f"日経公式保存一覧（{NIKKEI225_SNAPSHOT_DATE}更新）"
-        out.attrs["universe_notice"] = (
-            f"日経225のオンライン取得に失敗したため、公式保存一覧（{NIKKEI225_SNAPSHOT_DATE}更新・225銘柄）を使用しています。"
-            "最新の構成変更は未確認です。株価日足は通常どおり別途取得します。"
-        )
-        return out
+    errors = []
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "ja-JP,ja;q=0.9"}
+    sources = (
+        ("https://indexes.nikkei.co.jp/nkave/archives/file/nikkei_stock_average_weight_jp.csv", "csv"),
+        ("https://indexes.nikkei.co.jp/nkave/index/component?idx=nk225", "html"),
+    )
+    for url, kind in sources:
+        try:
+            response = requests.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            if kind == "csv":
+                out = parse_nikkei225_csv(response.content)
+            else:
+                response.encoding = "utf-8"
+                out = parse_nikkei225_constituents(response.text)
+            out.attrs["universe_notice"] = ""
+            out.attrs["confirmed_at_jst"] = tokyo_now().isoformat()
+            out.attrs["source_url"] = url
+            return out
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(kind + ": " + type(exc).__name__ + " " + str(exc)[:120])
+    out = pd.DataFrame(NIKKEI225_SNAPSHOT, columns=["コード", "銘柄名"])
+    if len(out) != 225 or not out["コード"].is_unique:
+        raise ValueError("日経225の保存済み構成一覧が不正です")
+    out["ticker"] = out["コード"] + ".T"
+    out["構成銘柄情報源"] = f"日経公式保存一覧（{NIKKEI225_SNAPSHOT_DATE}更新）"
+    out.attrs["universe_notice"] = (
+        f"日経日本公式CSV・公式ページの取得に失敗したため、保存一覧（{NIKKEI225_SNAPSHOT_DATE}・225銘柄）を使用しています。"
+        "最新の構成変更は未確認です。30分後に再取得します。"
+        " 取得状況: " + " / ".join(errors)
+    )
+    return out
 
 
 def merge_index_universes(topix, nikkei):
@@ -4653,7 +4728,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.13")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.14")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。終値7%損切り・最大3銘柄は共通です。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")

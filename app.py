@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.14
-# BUILD: VER17-24-14-JAPAN-SOURCES-20261014
+# 日本株 AI投資アシスタント Ver.17.24.15
+# BUILD: VER17-24-15-UNLIMITED-ALLOCATION-20261015
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.14",
+    page_title="日本株 AI投資アシスタント Ver.17.24.15",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.14 TOPIX＋日経225 シグナル先行"
-BUILD = "VER17-24-14-JAPAN-SOURCES-20261014"
+VERSION = "17.24.15 TOPIX＋日経225 シグナル先行"
+BUILD = "VER17-24-15-UNLIMITED-ALLOCATION-20261015"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2630,7 +2630,7 @@ def compare_public_research_logic(frames, initial_cash=600000, fee_bps=10.0,
 
 def render_public_research_logic():
     with st.expander("🧪 公開研究ロジックの比較", expanded=False):
-        st.caption("トレンド追随の着想を現行GCと比較します。3銘柄上限・終値7%損切り・翌日始値は共通。資金・予算・注文方式は下で指定します。全方式に200日以上の日足を要求します。独立3案では売り判定と候補順位もStochを使いません。FinRLの期間分割・コスト評価の考え方を取り入れた検証で、学習済みAIモデルではありません。")
+        st.caption("トレンド追随の着想を現行GCと比較します。この研究比較は旧条件の3銘柄上限・終値7%損切り・翌日始値で検証します（現在の実売買の上限解除は未反映）。資金・予算・注文方式は下で指定します。全方式に200日以上の日足を要求します。独立3案では売り判定と候補順位もStochを使いません。FinRLの期間分割・コスト評価の考え方を取り入れた検証で、学習済みAIモデルではありません。")
         st.caption("過去の構成銘柄と当時の財務判定を再現しない参考検証です。後半30%も既存検証で見た可能性があり、未使用データとは断定できません。結果による自動切替は行いません。")
         st.info("保存済みの参考値では55日方式が有望でしたが、現在のTOPIX全体での優位性は未確認です。正式採用は行わず、初期設定は現行GCを維持します。")
         st.caption("保存済み結果：10/7の拡大対象履歴・有効344銘柄（6銘柄除外）、初期60万円・片道10bps。TOPIX全体の検証ではなく、現在の割高除外と候補順位も再現していません。")
@@ -2736,7 +2736,7 @@ def render_allocation_research():
             initial = st.number_input("比較の初期資金（円）",10000,200000000,600000,10000,key="v1724_initial")
             fee_bps = st.number_input("片道コスト（bps、10bps＝0.1%）",0.0,100.0,10.0,1.0,key="v1724_fee")
             bt_normal_cap = st.number_input("比較時の通常注文予算上限（円）",10000,2000000,100000,10000,key="v1724_bt_normal_cap")
-            st.caption("全案：最大3銘柄、終値判定→翌取引日始値。自動方式は通常注文の予算内で100株単位、不可ならS株最大99株。優先度は%Kの低い順→コード。5%の価格余裕と注文余力引当を適用。IFDOCOの日中利確・逆指値はこの比較に含めません。")
+            st.caption("この比較は旧条件です（現在の実売買の上限解除は未反映）。全案：最大3銘柄、終値判定→翌取引日始値。自動方式は通常注文の予算内で100株単位、不可ならS株最大99株。優先度は%Kの低い順→コード。5%の価格余裕と注文余力引当を適用。IFDOCOの日中利確・逆指値はこの比較に含めません。")
             if not split_aware:
                 st.warning("旧CSVには分割イベントがありません。株数・100株単位の比較には、上のボタンで新しく作成したZIPを使用してください。")
                 return
@@ -2791,9 +2791,9 @@ def render_allocation_research():
 
 
 def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_codes,
-                                cap_yen=0, execution_mode="自動（通常注文優先・不足はS株）",
-                                lot_cap=100000):
-    """3銘柄・5%価格余裕。S株または100株単位。候補順位順に注文余力を引き当てる。"""
+                                cap_yen=None, execution_mode="自動（通常注文優先・不足はS株）",
+                                lot_cap=None):
+    """保有数・購入額の固定上限なし。TOP3へ候補順に注文余力を引き当てる。"""
     cols = ["購入優先度", "コード", "銘柄名", "総合AIスコア", "現在株価", "計算用株価",
             "購入株数", "予定購入額", "余力引当額", "買付余力使用率", "注文想定",
             "買付可否", "見送り理由", "購入後推定余力", "注文区分",
@@ -2805,8 +2805,6 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
     x = (x.sort_values(["候補スコア", "%K", "コード"], ascending=[False, True, True])
          if "候補スコア" in x else x.sort_values(["%K", "コード"], ascending=[True, True])).head(3)
     remaining = max(float(buying_power or 0), 0)
-    assets = max(float(current_assets or 0), remaining)
-    new_slots = max(3 - len(held), 0)
     rows = []
     for i, (_, r) in enumerate(x.iterrows(), 1):
         c = str(r["コード"])
@@ -2814,14 +2812,12 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
         calc_price = price * 1.05
         collateral_price = standard_limit_up_price(price)
         reason = ""
-        if new_slots <= 0:
-            reason = "同時保有3銘柄の上限"
-        elif remaining <= 0:
+        if remaining <= 0:
             reason = "買付余力が0円/未入力"
         elif not np.isfinite(calc_price) or calc_price <= 0:
             reason = "株価データ不正"
-        budget = min(remaining, float(cap_yen) if cap_yen else assets / 3.0) if not reason else 0
-        lot_budget = min(budget, float(lot_cap))
+        budget = (min(remaining, float(cap_yen)) if cap_yen is not None and cap_yen > 0 else remaining) if not reason else 0
+        lot_budget = min(budget, float(lot_cap)) if lot_cap is not None and lot_cap > 0 else budget
         lot_shares = (100 * (min(int(lot_budget // calc_price),
                                 int(remaining // collateral_price)) // 100)
                       if not reason and calc_price > 0 and np.isfinite(calc_price)
@@ -2842,7 +2838,6 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
             reason = "予算・注文余力内で購入単位を満たせない"
         if shares:
             remaining -= shares * collateral_price
-            new_slots -= 1
         rows.append({"購入優先度": i, "コード": c, "銘柄名": r["銘柄名"],
                      "総合AIスコア": r["総合AIスコア"], "現在株価": price,
                      "計算用株価": calc_price, "購入株数": shares,
@@ -4728,9 +4723,9 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.14")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.15")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
-st.caption("売買条件は管理者設定の売買ロジックで選択。終値7%損切り・最大3銘柄は共通です。")
+st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
 st.caption("監視対象・購入予算・注文方式は設定欄で選択。株数上限解除・対象拡大の成績は比較検証で確認してください。")
 
@@ -4810,20 +4805,22 @@ with st.expander("⚙ 購入額・注文方式", expanded=False):
     filter_downtrend = st.checkbox("下降確認の候補を除外（未検証）", value=False, key="v17243_down", disabled=not signal_first or replacement_live)
     filter_churn = st.checkbox("短期クロス多発の候補を除外（未検証）", value=False, key="v17243_churn", disabled=not signal_first or replacement_live)
     st.caption("シグナル先行は全体の最新確定日足から選択方式の買い候補を抽出して評価します。割高は除外。追加フィルターは初期値OFF。")
-    cap_mode = st.selectbox("1銘柄の購入予算", ["資産の3分の1（従来）", "10万円", "15万円", "20万円"], key="v1724_cap")
-    purchase_cap = {"資産の3分の1（従来）": 0, "10万円": 100000, "15万円": 150000, "20万円": 200000}[cap_mode]
+    cap_mode = "上限なし（買付余力内・候補順に引当）"
+    purchase_cap = None
+    lot_cap = None
+    st.caption("1銘柄の購入額・通常注文予算の固定上限は解除済みです。資産の3分の1による制限も適用しません。")
     execution_mode = st.selectbox("実行する注文方式", ["自動（通常注文優先・不足はS株）", "S株のみ（1〜99株）", "100株単位（通常注文）"], key="v1724_order")
-    lot_cap = st.number_input("通常注文の予算上限（円）", 10000, 2000000, 100000, 10000, key="v1724_lot_cap")
     ifd_take_profit = st.slider("参考IFDOCOの利確率（%）", 3.0, 30.0, 15.0, 0.5, key="v1724_tp")
-    st.caption("最大3銘柄。自動は通常注文の予算内で100株買えれば通常注文、買えなければS株（最大99株）。参考IFDOCO表は代替案なので、買いカードと二重発注しないでください。")
+    st.caption("保有数上限なし。買い候補TOP3へ順位順に余力を引き当てます。1位が余力の大半を使う場合があります。自動は余力内で100株買えれば通常注文、買えなければS株（最大99株）。参考IFDOCO表は代替案なので、買いカードと二重発注しないでください。")
     st.caption("IFDOCOは参考案です。日中の逆指値と固定利確は、終値損切り・Stoch売りとは異なります。利確15%は検証結果ではなく初期値です。")
 with st.expander("⚙ 管理者設定", expanded=False):
     a1, a2, a3, a4 = st.columns(4)
     current_assets = a1.number_input("現在資産（円）", 10000, 200000000, 600000, 10000, key="v177_assets")
-    maxbuy = purchase_cap or int(current_assets / 3)
-    a2.metric("1銘柄の購入予算", f"{maxbuy:,}円")
+    maxbuy = "上限なし（買付余力内）"
+    a2.metric("1銘柄の購入予算", "上限なし")
     sl = a3.slider("損切りセンサー（%）", 3.0, 15.0, 7.0, .5, key="v177_sl", disabled=True)
-    maxpos = a4.number_input("最大保有銘柄数", 1, 50, 3, key="v177_maxpos", disabled=True)
+    maxpos = None
+    a4.metric("最大保有銘柄数", "上限なし")
     b1, b2, b3, b4 = st.columns(4)
     reserve_pct = b1.slider("現金温存率（%）", 0, 80, 0, 5, key="v177_reserve", disabled=True)
     daily_deploy_pct = b2.slider("1日使用上限（%）", 10, 100, 100, 5, key="v177_daily", disabled=True)
@@ -5668,11 +5665,9 @@ def request_free_news_pick(candidates, now, window_days=7):
 
 
 def triple_news_purchase_status(selected, buy_view, signal_audit, held_codes, buying_power, block_unrated):
-    """AIは既存の財務除外・正式BUY・TOP3引当・保有上限を解除しない。"""
+    """既存の財務除外・正式BUY・TOP3の余力引当を照合する。"""
     c = selected["code"]
     reasons = []
-    if len(set(map(str, held_codes))) >= 3:
-        reasons.append("同時保有3銘柄の上限")
     if buying_power <= 0:
         reasons.append("買付余力なし")
     if "割高" in selected["value_status"]:
@@ -5747,7 +5742,7 @@ def render_triple_news_pick(compare, freshness, price_data, held_codes, values, 
         st.info("今日の一推し：該当なし。" + ("出典付きの有力材料を確認できませんでした。" if status == "完了" else status))
     if result:
         st.caption(f"調査時刻 {result.get('generated_at', '')} / 比較対象 {len(candidates)}銘柄 / 評価方式 {result.get('model') or model}")
-    st.caption("3つの点灯は独立した3つの証拠ではありません。無料材料評価の選定効果は未検証です。売り・損切り・購入予算・保有上限は維持します。")
+    st.caption("3つの点灯は独立した3つの証拠ではありません。無料材料評価の選定効果は未検証です。売り・損切りと買付余力による注文計画を適用します。")
     with st.expander("一推しの比較・見送り理由", expanded=False):
         if result and result.get("assessments"):
             audit = pd.DataFrame([{ "コード": a["code"], "銘柄名": a["name"], "無料材料評価（勝率ではない）": a["assessment"], "銘柄判定": a["value_status"], "理由": a["reason"], "注意点": a["risk"], "見送り理由": a["skip_reason"]} for a in result["assessments"]])
@@ -6290,7 +6285,7 @@ try:
             "固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "売買ロジック":live_trade_method, "Stoch不使用の試験採用":bool(replacement_live), "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(signal_first and block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(signal_first and filter_downtrend), "クロス多発除外":bool(signal_first and filter_churn), "購入予算方式":cap_mode,
-            "1銘柄購入予算":maxbuy, "通常注文予算":lot_cap, "注文方式":execution_mode,
+            "最大保有銘柄数":"上限なし", "1銘柄購入予算":maxbuy, "通常注文予算":"上限なし（買付余力内）", "注文方式":execution_mode,
             "IFDOCO参考利確率":ifd_take_profit,"BUY条件":live_trade_method,"管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
             "割高の新規BUY除外":bool(signal_first),
             "SELL条件":("全保有銘柄 / 前日までの20日安値を終値で割る または終値で含み損 -7.0%" if replacement_live else "全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%"),

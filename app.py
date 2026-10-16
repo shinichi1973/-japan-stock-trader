@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.19
-# BUILD: VER17-24-19-INDEPENDENT-FINANCE-DAILY-DIAGNOSTICS-20261016
+# 日本株 AI投資アシスタント Ver.17.24.20
+# BUILD: VER17-24-20-FINANCE-STABILITY-CACHE-PACING-20261016
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -22,6 +22,7 @@ import math
 import os
 import re
 import threading
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -36,13 +37,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.19",
+    page_title="日本株 AI投資アシスタント Ver.17.24.20",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.19 TOPIX売買代金TOP100・国内データ"
-BUILD = "VER17-24-19-INDEPENDENT-FINANCE-DAILY-DIAGNOSTICS-20261016"
+VERSION = "17.24.20 TOPIX売買代金TOP100・国内データ"
+BUILD = "VER17-24-20-FINANCE-STABILITY-CACHE-PACING-20261016"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1683,22 +1684,132 @@ def _parse_kabutan_finance(html, today):
     return values
 
 
+@st.cache_resource(show_spinner=False)
+def _finance_transport_state():
+    # 1プロセスの全スレッドでホストごとの間隔と停止時刻を共有する。
+    return {"lock": threading.Lock(), "hosts": {}, "local": threading.local()}
+
+
+def _finance_host(url):
+    from urllib.parse import urlsplit
+    return urlsplit(url).netloc.lower()
+
+
+def _finance_paced_get(url):
+    state = _finance_transport_state()
+    host = _finance_host(url)
+    with state["lock"]:
+        meta = state["hosts"].setdefault(host, {"next": 0.0, "blocked_until": 0.0, "reason": ""})
+        now = time.monotonic()
+        if now < meta["blocked_until"]:
+            raise RuntimeError(f"{host}: 取得先の{meta['reason']}により一時休止中。連続再アクセスを抑制")
+        slot = max(now, meta["next"])
+        meta["next"] = slot + 0.8
+    delay = slot - time.monotonic()
+    if delay > 0: time.sleep(delay)
+    if not hasattr(state["local"], "session"):
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "text/html", "Accept-Language": "ja,en;q=0.5"})
+        state["local"].session = session
+    response = state["local"].session.get(url, timeout=(15, 20))
+    if response.status_code in (403, 405, 429):
+        with state["lock"]:
+            meta["blocked_until"] = time.monotonic() + (900 if response.status_code in (403, 405) else 60)
+            meta["reason"] = f"HTTP {response.status_code}"
+    return response
+
+
 def _fetch_free_finance_html(url):
-    for attempt in range(2):
-        response = requests.get(url, headers={"User-Agent":"Mozilla/5.0", "Accept":"text/html"}, timeout=12)
-        if response.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-            time.sleep(0.4)
-            continue
-        response.raise_for_status()
-        return response.content.decode("utf-8", errors="replace")
+    # タイムアウト・接続切断も再試行。403/405/429は連打しない。
+    for attempt in range(3):
+        try:
+            response = _finance_paced_get(url)
+            response.raise_for_status()
+            return response.content.decode("utf-8", errors="replace")
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if attempt < 2 and (status is None or status in (500, 502, 503, 504)):
+                time.sleep(0.8 * (2 ** attempt))
+                continue
+            raise
     raise ValueError("無料公開ページ取得失敗")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _domestic_finance_snapshot(t):
+def _finance_cache_file(t):
     if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)):
         raise ValueError("国内株コード形式が不正")
-    today = tokyo_now().date()
+    root = os.environ.get("FINANCE_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "jp_stock_finance_cache_v20")
+    return os.path.join(root, str(t).upper() + ".json")
+
+
+def _finance_cache_read(t):
+    try:
+        with open(_finance_cache_file(t), encoding="utf-8") as f: payload = json.load(f)
+        if payload.get("schema") != 1 or payload.get("ticker") != t or not isinstance(payload.get("values"), dict):
+            return None
+        fetched = datetime.fromisoformat(payload["fetched_at"])
+        if fetched.tzinfo is None or fetched > tokyo_now(): return None
+        if (tokyo_now() - fetched).total_seconds() > 7 * 86400: return None
+        return payload
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _finance_json_safe(value):
+    if isinstance(value, dict): return {k: _finance_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (float, np.floating)): return float(value) if np.isfinite(value) else None
+    if isinstance(value, np.integer): return int(value)
+    if isinstance(value, np.bool_): return bool(value)
+    if isinstance(value, list): return [_finance_json_safe(v) for v in value]
+    return value
+
+
+def _finance_cache_write(t, values):
+    path = _finance_cache_file(t)
+    temp_path = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {"schema": 1, "ticker": t, "fetched_at": values["_fetched_at"], "values": _finance_json_safe(values)}
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path), suffix=".tmp", delete=False) as f:
+            temp_path = f.name
+            json.dump(payload, f, ensure_ascii=False, allow_nan=False)
+        os.replace(temp_path, path)
+        return "保存済"
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return "保存失敗（取得値は利用可）: " + type(exc).__name__
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try: os.unlink(temp_path)
+            except OSError: pass
+
+
+def _finance_cache_fresh(payload, today_now):
+    if not payload: return False
+    try:
+        fetched = datetime.fromisoformat(payload["fetched_at"])
+        values = payload["values"]
+        age = (today_now - fetched).total_seconds()
+        complete = finance_freshness_usable(values.get("_freshness"))
+        if today_now.hour >= 16 and fetched.hour < 16: return False
+        # 正常取得は当日6時間、数値不足は15分だけ再利用し無駄な再取得を防ぐ。
+        ttl = 6 * 3600 if complete else 15 * 60
+        reference = pd.Timestamp(values.get("_reference_date", "")).date()
+        return fetched.date() == today_now.date() and 0 <= age <= ttl and 0 <= (today_now.date()-reference).days <= 10
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _domestic_finance_refresh(t):
+    if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)):
+        raise ValueError("国内株コード形式が不正")
+    now = tokyo_now()
+    cached = _finance_cache_read(t)
+    if _finance_cache_fresh(cached, now):
+        values = dict(cached["values"])
+        values["_cache_mode"] = "当日保存値（6時間以内）" if finance_freshness_usable(values.get("_freshness")) else "一部保存値（15分以内）"
+        values["_attempts"] = "再アクセス抑制: " + values["_cache_mode"] + " / 前回: " + str(values.get("_attempts", ""))
+        return values
     sources = [
         ("Yahoo!日本版", f"https://finance.yahoo.co.jp/quote/{t}", _parse_domestic_finance),
         ("株探", f"https://kabutan.jp/stock/?code={code(t)}", _parse_kabutan_finance),
@@ -1706,21 +1817,44 @@ def _domestic_finance_snapshot(t):
     attempts, partials = [], []
     for label, url, parser in sources:
         try:
-            values = parser(_fetch_free_finance_html(url), today)
-            values["_url"] = url
+            html = _fetch_free_finance_html(url)
+            title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+            if not title or not re.search(r"(?<![0-9A-Z])" + re.escape(code(t)) + r"(?:\.T)?(?![0-9A-Z])", _finance_plain(title.group(1)), re.I):
+                raise ValueError("取得ページの銘柄コードを確認できず（別ページ・アクセス制限の可能性）")
+            values = parser(html, now.date())
+            values.update({"_url": url, "_fetched_at": tokyo_now().isoformat(), "_cache_mode": "今回取得"})
             attempts.append(label + ": " + values.get("_freshness", "不明"))
             partials.append(values)
             if finance_freshness_usable(values.get("_freshness")):
                 values["_attempts"] = " / ".join(attempts)
+                values["_cache_storage"] = _finance_cache_write(t, values)
                 return values
         except Exception as exc:
             attempts.append(label + ": " + type(exc).__name__ + " " + str(exc)[:160])
     if partials:
-        # 期の違うEPS/PERを混ぜず、1社分のスナップショット単位で採用する。
         values = max(partials, key=lambda v: sum(not k.startswith("_") for k in v))
         values["_attempts"] = " / ".join(attempts)
+        # 以前の正常取得を数値不足の応答で上書きしない。
+        if not cached or not finance_freshness_usable(cached["values"].get("_freshness")):
+            values["_cache_storage"] = _finance_cache_write(t, values)
+        return values
+    if cached:
+        values = dict(cached["values"])
+        values.update({"_cache_mode": "過去保存値・表示のみ", "_freshness": "保存値・再取得失敗のため新規買い停止",
+                       "_attempts": " / ".join(attempts) + " / 前回保存値を参考表示。最新性は未確認"})
         return values
     raise ValueError(" / ".join(attempts))
+
+
+def _domestic_finance_snapshot(t):
+    # Streamlitの短期メモリキャッシュより先に保存日時・使用区分を確認する。
+    cached = _finance_cache_read(t)
+    if _finance_cache_fresh(cached, tokyo_now()):
+        values = dict(cached["values"])
+        values["_cache_mode"] = "当日保存値（6時間以内）" if finance_freshness_usable(values.get("_freshness")) else "一部保存値（15分以内）"
+        values["_attempts"] = "再アクセス抑制: " + values["_cache_mode"] + " / 前回: " + str(values.get("_attempts", ""))
+        return values
+    return _domestic_finance_refresh(t)
 
 
 def financial_unavailable_label(status, freshness):
@@ -2034,7 +2168,8 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
             "実績EPS対象期":domestic.get("_actual_period", "") if domestic else "",
             "財務情報鮮度":freshness,"Yahoo期末日":str(yahoo_quarter or ""),
             "Yahoo取得状態":yahoo_status,
-            "財務取得日時":tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST"),
+            "財務取得日時":domestic.get("_fetched_at", "") if domestic else "",
+            "財務データ区分":domestic.get("_cache_mode", "") if domestic else "",
             "現在株価":price,"時価総額":market_cap,
             "PER":trailing_pe,"予想PER":forward_pe,"PBR":price_to_book,
             "ROE":roe,"営業利益率":op_margin,"売上成長率":revenue_growth,
@@ -3411,7 +3546,8 @@ def batch_domestic_finance_audit(tickers_tuple):
         row = {"コード": code(t), "銘柄名": name(t), "財務取得状態": "取得不可",
                "財務情報源": "", "財務情報鮮度": "", "参考指標基準日": "", "予想EPS対象期": "",
                "業績発表日": "", "予想EPS": np.nan, "予想PER": np.nan, "PBR": np.nan,
-               "財務参照URL": "", "財務取得経路": "", "財務取得日時": tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")}
+               "財務参照URL": "", "財務取得経路": "", "財務取得日時": "", "財務データ区分": "", "欠損項目": "",
+               "今回確認日時": tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")}
         try:
             f = _domestic_finance_snapshot(t)
             row.update({"財務取得状態": "取得済" if finance_freshness_usable(f.get("_freshness")) else "一部取得・最新性未確認",
@@ -3419,11 +3555,13 @@ def batch_domestic_finance_audit(tickers_tuple):
                 "参考指標基準日": f.get("_reference_date", ""), "予想EPS対象期": f.get("_forecast_period", ""),
                 "業績発表日": f.get("_disclosure_date", ""), "予想EPS": safe_float(f.get("forwardEps")),
                 "予想PER": safe_float(f.get("forwardPE")), "PBR": safe_float(f.get("priceToBook")),
-                "財務参照URL": f.get("_url", ""), "財務取得経路": f.get("_attempts", "")})
+                "財務参照URL": f.get("_url", ""), "財務取得経路": f.get("_attempts", ""),
+                "財務取得日時": f.get("_fetched_at", ""), "財務データ区分": f.get("_cache_mode", ""),
+                "欠損項目": "／".join(label for label, key in (("予想EPS", "forwardEps"), ("予想PER", "forwardPE"), ("PBR", "priceToBook")) if not np.isfinite(safe_float(f.get(key))))})
         except Exception as exc:
             row["財務取得経路"] = type(exc).__name__ + ": " + str(exc)[:500]
         return row
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         return pd.DataFrame(list(pool.map(fetch, tickers_tuple)))
 
 
@@ -3627,7 +3765,7 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
             "財務取得日時": str(f.get("財務取得日時", "")),
             "参考指標基準日": str(f.get("参考指標基準日", "")),
             "予想EPS対象期": str(f.get("予想EPS対象期", "")),
-            **{k: str(f.get(k, "")) for k in ("財務参照URL", "財務取得経路", "業績発表日", "実績EPS対象期")},
+            **{k: str(f.get(k, "")) for k in ("財務参照URL", "財務取得経路", "業績発表日", "実績EPS対象期", "財務データ区分")},
         })
     out = pool.merge(pd.DataFrame(fund_rows), on="ticker", how="left")
     for c in ["企業価値スコア", "成長性スコア", "バリュエーションスコア"]:
@@ -5014,7 +5152,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.19")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.20")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -6322,6 +6460,7 @@ with admin_tab:
 
     with value_tab:
         st.subheader("無料国内財務の取得結果（日足とは独立）")
+        st.caption("正常取得値は当日6時間以内だけ再利用し、過去保存値は表示専用です。取得日時と今回確認日時を区別します。403・405等の取得先は一時休止し、連続アクセスを抑制します。保存値は同一サーバー内のため再起動等で失われる場合があります。")
         if not finance_acquisition_df.empty:
             _ok = int(finance_acquisition_df["財務取得状態"].eq("取得済").sum())
             st.caption(f"財務取得済 {_ok} / {len(finance_acquisition_df)}銘柄。取得済でも日足不足・割安条件未達なら買い候補にはなりません。")
@@ -6345,7 +6484,7 @@ with admin_tab:
             _finance_frames = [f for f in (signal_value_df, value_top50_df) if isinstance(f, pd.DataFrame) and not f.empty]
             if _finance_frames:
                 _finance_audit = pd.concat(_finance_frames, ignore_index=True).drop_duplicates("コード", keep="first")
-                _audit_cols = ["コード", "銘柄名", "割安判定", "ファンダ取得状態", "財務情報源", "財務情報鮮度", "参考指標基準日", "予想EPS対象期", "業績発表日", "実績EPS対象期", "財務取得日時", "財務参照URL", "財務取得経路"]
+                _audit_cols = ["コード", "銘柄名", "割安判定", "ファンダ取得状態", "財務情報源", "財務情報鮮度", "参考指標基準日", "予想EPS対象期", "業績発表日", "実績EPS対象期", "財務取得日時", "財務参照URL", "財務取得経路", "財務データ区分"]
                 st.dataframe(_finance_audit[[c for c in _audit_cols if c in _finance_audit]], use_container_width=True, hide_index=True)
             else:
                 st.info("判定更新後に財務の取得状況を表示します。")

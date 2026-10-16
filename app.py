@@ -3753,7 +3753,7 @@ def selection_range_metrics(df):
     pct = safe_float(tr.tail(14).mean() / close.iloc[-1] * 100) if close.iloc[-1] > 0 else np.nan
     lows = [safe_float(low.iloc[a:b].min()) for a,b in [(-30,-20),(-20,-10),(-10,None)]]
     rising = all(np.isfinite(v) for v in lows) and lows[0] < lows[1] < lows[2] and close.iloc[-1] > close.tail(25).mean()
-    return {"値幅区分": "値幅未確認" if not np.isfinite(pct) else "値幅大" if pct >= 3 else "値幅中" if pct >= 1.5 else "値幅小",
+    return {"値幅区分": "値幅未確認" if not np.isfinite(pct) else "値動きが大きい" if pct >= 3 else "値動きが中くらい" if pct >= 1.5 else "値動きが小さい",
             "ATR比率%": pct, "安値切上げ": bool(rising)}
 
 
@@ -3803,8 +3803,8 @@ def signal_first_candidates(data, held_codes, min_turnover=0, filter_downtrend=F
         turnover = safe_float((df["Close"] * df["Volume"]).tail(20).mean())
         reasons = []
         metrics = selection_range_metrics(df)
-        if metrics["値幅区分"] != "値幅大":
-            reasons.append("値幅大条件未達（ATR14/終値3%未満または不明）")
+        if metrics["値幅区分"] != "値動きが大きい":
+            reasons.append("値動きが大きい条件未達（ATR14/終値3%未満または不明）")
         if not metrics["安値切上げ"]:
             reasons.append("安値切上げ未確認")
         if df.attrs.get("daily_bar_status") != "🟢 当日確定":
@@ -5404,8 +5404,8 @@ for _key, _fixed in {
 }.items():
     st.session_state[_key] = _fixed
 with st.expander("⚙ 購入額・注文方式", expanded=False):
-    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX売買代金TOP100・値幅大＋買いサイン", "TOPIX＋日経225からAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], key="v172417_universe")
-    signal_first = live_universe_mode == "TOPIX売買代金TOP100・値幅大＋買いサイン"
+    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX売買代金TOP100・値動きが大きい＋買いサイン", "TOPIX＋日経225からAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], index=3, key="v172417_universe")
+    signal_first = live_universe_mode == "TOPIX売買代金TOP100・値動きが大きい＋買いサイン"
     live_trade_method = st.selectbox("売買ロジック", ["現行Stoch GC/DC", "55日高値更新＋MA200（試験採用）"], key="v17247_method")
     replacement_live = live_trade_method == "55日高値更新＋MA200（試験採用）"
     st.caption("試験採用：買い＝前日までの55日高値を終値で更新＋終値>MA200、売り＝前日までの20日安値を終値で割る、または取得単価から終値7%損切り。候補は63日騰落率順。Stochは売買・順位に使いません。")
@@ -5440,8 +5440,8 @@ with st.expander("⚙ 管理者設定", expanded=False):
     price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
     c1, c2 = st.columns(2)
     universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n", disabled=True)
-    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値幅大＋買いサイン"))
-    st.caption("標準選定：TOPIX→国内売買代金上位100→値幅大＋買いサイン→流動性→安値切上げ→国内財務で割安／やや割安。構成一覧には基準日の差があります。")
+    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値動きが大きい＋買いサイン"))
+    st.caption("標準選定：TOPIX→国内売買代金上位100→値動きが大きい＋買いサイン→流動性→安値切上げ→国内財務で割安／やや割安。構成一覧には基準日の差があります。")
     st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
     churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
     st.caption("今回の主ロジックでは短期反転除外を使用しません。")
@@ -5473,7 +5473,7 @@ if run_clicked:
     st.session_state.pop("v172412_history_refresh_required", None)
     universe_error = ""
     try:
-        universe_df = (discover_domestic_topix_turnover100() if live_universe_mode == "TOPIX売買代金TOP100・値幅大＋買いサイン" else discover_topix_nikkei225_stock_universe() if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値幅大＋買いサイン")
+        universe_df = (discover_domestic_topix_turnover100() if live_universe_mode == "TOPIX売買代金TOP100・値動きが大きい＋買いサイン" else discover_topix_nikkei225_stock_universe() if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値動きが大きい＋買いサイン")
                        else pd.DataFrame([
                            {"コード": c, "銘柄名": STOCK_NAMES[c], "ticker": c + ".T"}
                            for c in VERIFIED_45_CODES
@@ -5522,8 +5522,8 @@ if run_clicked:
         eligible_count = sum(isinstance(d, pd.DataFrame) and len(d) >= 60
                              for d in mother_data.values())
         value_top50_df, _ = (build_value_ai_top50(
-            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値幅大＋買いサイン") else eligible_count,
-            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値幅大＋買いサイン") else eligible_count,
+            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値動きが大きい＋買いサイン") else eligible_count,
+            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値動きが大きい＋買いサイン") else eligible_count,
             churn_filter=False,
         ) if eligible_count else (pd.DataFrame(), pd.DataFrame()))
         st.session_state["v177_value_top50"] = value_top50_df

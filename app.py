@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.23
-# BUILD: VER17-24-23-GROWTH-RESEARCH-20261017
+# 日本株 AI投資アシスタント Ver.17.24.24
+# BUILD: VER17-24-24-GROWTH-DATE-FIX-20261017
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,13 +39,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.23",
+    page_title="日本株 AI投資アシスタント Ver.17.24.24",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.23 大化け候補研究・国内データ"
-BUILD = "VER17-24-23-GROWTH-RESEARCH-20261017"
+VERSION = "17.24.24 大化け候補・欠損日付修正"
+BUILD = "VER17-24-24-GROWTH-DATE-FIX-20261017"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -5349,7 +5349,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.23")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.24")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -6624,9 +6624,15 @@ def build_multibagger_research(finance, price_data, freshness, valuations, buy, 
         elif not 0 < pe <= 35: failed.append("予想PER条件外")
         def age_ok(value, days):
             try:
-                d = pd.Timestamp(str(value)).normalize()
-                return not pd.isna(d) and 0 <= (today-d).days <= days
-            except (ValueError, TypeError): return False
+                d = pd.to_datetime(value, errors="coerce")
+                if pd.isna(d):
+                    return False
+                # NaTにはnormalizeがないため欠損判定を先に行う。
+                # 時刻・タイムゾーンを除き、日本の暦日として比較する。
+                d = pd.Timestamp(d.date())
+                return 0 <= (today-d).days <= days
+            except (ValueError, TypeError, OverflowError):
+                return False
         if not age_ok(str(r.get("財務取得日時", ""))[:10], 0): missing.append("当日の財務取得")
         if not age_ok(r.get("参考指標基準日", ""), 10) or not finance_freshness_usable(r.get("財務情報鮮度", "")) or "過去保存値" in str(r.get("財務データ区分", "")):
             missing.append("財務基準日・鮮度")

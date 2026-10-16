@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.25
-# BUILD: VER17-24-25-GROWTH-FALLBACK-20261017
+# 日本株 AI投資アシスタント Ver.17.24.26
+# BUILD: VER17-24-26-MARKET-OPTIONAL-FIX-20261017
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,13 +39,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.25",
+    page_title="日本株 AI投資アシスタント Ver.17.24.26",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.25 大化け候補・成長実績の国内補完"
-BUILD = "VER17-24-25-GROWTH-FALLBACK-20261017"
+VERSION = "17.24.26 大化け候補・市場別URLと補助指標修正"
+BUILD = "VER17-24-26-MARKET-OPTIONAL-FIX-20261017"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -5349,7 +5349,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.25")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.26")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -6627,6 +6627,53 @@ def _parse_traders_growth(html, today):
     return values
 
 
+
+def fetch_traders_growth_page(c):
+    """市場別URLを404の場合だけ切り替える。アクセス制限時は追加要求しない。"""
+    state = _finance_transport_state()
+    with state["lock"]:
+        preferred = state.setdefault("traders_markets", {}).get(c, "61")
+    markets = list(dict.fromkeys([preferred, "61", "62", "63"]))
+    errors = []
+    for market in markets:
+        url = f"https://www.traders.co.jp/stocks/{market}_{c}/achievement"
+        try:
+            html = _fetch_free_finance_html(url)
+            title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+            if not title or not re.search(r"(?<![0-9A-Z])" + re.escape(c) + r"(?![0-9A-Z])", _finance_plain(title.group(1)), re.I):
+                raise ValueError("銘柄コードを確認できず")
+            with state["lock"]: state["traders_markets"][c] = market
+            return html, url
+        except requests.HTTPError as exc:
+            if getattr(getattr(exc, "response", None), "status_code", None) != 404: raise
+            errors.append(market + ":404")
+    raise ValueError("市場別ページなし " + "/".join(errors))
+
+
+def restore_multibagger_optional(finance, baseline, today):
+    """成長取得先で未提供の補助指標を、当日確認済みの元の財務から補完する。"""
+    if not isinstance(finance, pd.DataFrame) or finance.empty or not isinstance(baseline, pd.DataFrame) or baseline.empty:
+        return finance
+    base = {str(r["コード"]): r for r in baseline.to_dict("records")}
+    records = []
+    for r in finance.to_dict("records"):
+        b = base.get(str(r["コード"]), {})
+        if (str(b.get("財務取得日時", ""))[:10] == str(today) and
+                finance_freshness_usable(b.get("財務情報鮮度", "")) and
+                "過去保存値" not in str(b.get("財務データ区分", ""))):
+            restored = []
+            for k in ("ROE%", "時価総額", "FCF", "D/E", "営業利益率%"):
+                if not np.isfinite(safe_float(r.get(k))) and np.isfinite(safe_float(b.get(k))):
+                    r[k] = b[k]; restored.append(k)
+            if restored:
+                r["補助指標出典"] = b.get("財務情報源", "")
+                r["補助指標URL"] = b.get("財務参照URL", "")
+                r["補助指標基準日"] = b.get("参考指標基準日", "")
+                r["補完した指標"] = "／".join(restored)
+        records.append(r)
+    return pd.DataFrame(records)
+
+
 def fetch_multibagger_growth(c, today):
     """通常のアクセス制限・休止を維持し、別の国内取得先へフォールバック。"""
     attempts, partials = [], []
@@ -6634,7 +6681,10 @@ def fetch_multibagger_growth(c, today):
         ("トレーダーズ", f"https://www.traders.co.jp/stocks/61_{c}/achievement", _parse_traders_growth),
         ("株探", f"https://kabutan.jp/stock/?code={c}", _parse_kabutan_finance)):
         try:
-            html = _fetch_free_finance_html(url)
+            if label == "トレーダーズ":
+                html, url = fetch_traders_growth_page(c)
+            else:
+                html = _fetch_free_finance_html(url)
             title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
             if not title or not re.search(r"(?<![0-9A-Z])" + re.escape(c) + r"(?![0-9A-Z])", _finance_plain(title.group(1)), re.I):
                 raise ValueError("銘柄コードを確認できず")
@@ -6733,7 +6783,8 @@ def build_multibagger_research(finance, price_data, freshness, valuations, buy, 
         if not np.isfinite(close) or close <= 0:
             if status != "条件外": status = "評価保留"
             missing.append("現在株価")
-        rows.append({"研究判定": status, "コード": c, "銘柄名": r.get("銘柄名", c), "研究点": score,
+        rows.append({**{k: r.get(k, "") for k in ("補助指標出典", "補助指標URL", "補助指標基準日", "補完した指標")},
+            "研究判定": status, "コード": c, "銘柄名": r.get("銘柄名", c), "研究点": score,
             "今日の買いと一致": "一致" if c in buys else "なし", "銘柄判定": label, "現在株価": close,
             "選定根拠": "／".join(reasons) or "成長実績未確認", "保留・条件外理由": "／".join(failed + missing),
             "確認するリスク": "／".join(risks), "売上成長率%": rev, "利益成長率%": earn,
@@ -6763,6 +6814,9 @@ mb_scope = set(mb_finance["コード"].astype(str)) if "コード" in mb_finance
 if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
     mb_extra = mb_extra[mb_extra["コード"].astype(str).isin(mb_scope)]
     mb_finance = pd.concat([mb_finance, mb_extra], ignore_index=True).drop_duplicates("コード", keep="last")
+mb_finance = restore_multibagger_optional(mb_finance, finance_acquisition_df, tokyo_now().date())
+if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
+    mb_extra = restore_multibagger_optional(mb_extra, finance_acquisition_df, tokyo_now().date())
 multibagger_audit = build_multibagger_research(mb_finance, data, daily_bar_status_df, valuation_master_df, buy_view)
 multibagger_candidates = multibagger_audit[multibagger_audit["研究判定"].eq("大化け候補")].copy() if not multibagger_audit.empty else pd.DataFrame()
 
@@ -6864,7 +6918,8 @@ with multibagger_tab:
                         original["成長追加確認"] = "取得失敗・再確認対象"
                         original["成長取得経路"] = type(exc).__name__ + ": " + str(exc)[:1000]
                     additions.append(original)
-            st.session_state["v172423_growth_extra"] = pd.concat([mb_extra, pd.DataFrame(additions)], ignore_index=True).drop_duplicates("コード", keep="last")
+            combined_growth = pd.concat([mb_extra, pd.DataFrame(additions)], ignore_index=True).drop_duplicates("コード", keep="last")
+            st.session_state["v172423_growth_extra"] = restore_multibagger_optional(combined_growth, finance_acquisition_df, tokyo_now().date())
             st.rerun()
     if st.button("成長実績の追加確認をリセット", key="v172423_growth_reset"):
         st.session_state.pop("v172423_growth_extra", None)

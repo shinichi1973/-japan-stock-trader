@@ -1,5 +1,5 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.21
+# 日本株 AI投資アシスタント Ver.17.24.22
 # BUILD: VER17-24-21-DOMESTIC-PROVIDERS-INCREMENTAL-20261017
 #
 # 目的:
@@ -39,7 +39,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.21",
+    page_title="日本株 AI投資アシスタント Ver.17.24.22",
     page_icon="📈",
     layout="wide",
 )
@@ -3821,6 +3821,44 @@ def signal_first_candidates(data, held_codes, min_turnover=0, filter_downtrend=F
     return pd.DataFrame(rows, columns=["ticker", "コード", "銘柄名", "抽出除外理由", "20日平均売買代金", "値幅区分", "ATR比率%", "安値切上げ"])
 
 
+def valuation_label(upside, split_status, guard_status, acquisition, freshness):
+    """全画面で共用する企業価値判定。閾値と取得状態の優先順を統一。"""
+    if "⚠️" in str(split_status):
+        return "⚠️ 分割補正確認"
+    unavailable = financial_unavailable_label(acquisition, freshness)
+    if unavailable:
+        return unavailable
+    upside = safe_float(upside)
+    if "⚠️" in str(guard_status) and not np.isfinite(upside):
+        return "⚠️ 異常値ガード・算定不能"
+    if not np.isfinite(upside):
+        return "算定不能"
+    return ("🟢 割安" if upside >= 20 else "🟡 やや割安" if upside >= 5
+            else "⚪ 適正圏" if upside > -10 else "🔴 割高")
+
+
+def build_valuation_master(frames, holdings, price_data, display_frames):
+    """同一実行内の共通判定。TOP50外の保有・表示対象も一度だけ算定する。"""
+    records = {}
+    for frame in frames:
+        if isinstance(frame, pd.DataFrame) and "コード" in frame.columns:
+            for row in frame.to_dict("records"):
+                records[str(code(str(row["コード"]).removesuffix(".0")))] = row
+    targets = {str(code(str(t))) for t in holdings}
+    for frame in display_frames:
+        if isinstance(frame, pd.DataFrame) and "コード" in frame.columns:
+            targets.update(str(code(str(t).removesuffix(".0"))) for t in frame["コード"])
+    for c in sorted(targets - records.keys()):
+        symbol = c + ".T"
+        history = price_data.get(symbol, pd.DataFrame())
+        hint = safe_float(history["Close"].iloc[-1]) if not history.empty else np.nan
+        f = fundamental_snapshot(symbol, market_price_hint=hint) if np.isfinite(hint) and hint > 0 else {}
+        records[c] = {"コード": c, "割安判定": valuation_label(
+            f.get("参考価値上昇余地"), f.get("株式分割補正", ""),
+            f.get("適正株価異常値ガード", ""), f.get("取得状態"), f.get("財務情報鮮度"))}
+    return pd.DataFrame(records.values())
+
+
 def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filter=True):
     """数百銘柄の母集団から一次選抜→企業価値AIで最終TOP50。
 
@@ -3954,16 +3992,10 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
         out["トレンドスコア"] * .13 +
         out["値動き安定スコア"] * .10
     ).clip(0, 100)
-    out["割安判定"] = out.apply(
-        lambda rr: "⚠️ 分割補正確認" if "⚠️" in str(rr.get("株式分割補正", "")) else
-        financial_unavailable_label(rr.get("ファンダ取得状態"), rr.get("財務情報鮮度")) if financial_unavailable_label(rr.get("ファンダ取得状態"), rr.get("財務情報鮮度")) else
-        ("⚠️ 異常値ガード・算定不能" if "⚠️" in str(rr.get("適正株価異常値ガード", "")) and not np.isfinite(safe_float(rr.get("参考価値上昇余地%"))) else
-         "算定不能" if not np.isfinite(safe_float(rr.get("参考価値上昇余地%"))) else
-         "🟢 割安" if safe_float(rr.get("参考価値上昇余地%")) >= 20 else
-         "🟡 やや割安" if safe_float(rr.get("参考価値上昇余地%")) >= 5 else
-         "⚪ 適正圏" if safe_float(rr.get("参考価値上昇余地%")) > -10 else "🔴 割高"),
-        axis=1
-    )
+    out["割安判定"] = out.apply(lambda rr: valuation_label(
+        rr.get("参考価値上昇余地%"), rr.get("株式分割補正", ""),
+        rr.get("適正株価異常値ガード", ""), rr.get("ファンダ取得状態"),
+        rr.get("財務情報鮮度")), axis=1)
     # 取得不可の中立点を企業価値スコアとして競わせない。
     # 有効な評価を持つ銘柄を先に並べ、欠損は監査用に残す。
     out["企業価値算定済"] = (
@@ -5103,32 +5135,6 @@ def current_holdings_rows(holdings, sell_candidates, signal_audit, value_df, pri
         ticker = str(ticker)
         verdict = "売り" if ticker in sell_codes else "保有継続" if ticker in checked_codes else ""
         value_label = value_map.get(ticker, "")
-        # TOP50外の保有銘柄も、現在情報を取得できる場合は企業価値を個別算定する。
-        if not str(value_label).strip():
-            symbol = ticker if ticker.endswith(".T") else ticker + ".T"
-            history = price_data.get(symbol, pd.DataFrame()) if isinstance(price_data, dict) else pd.DataFrame()
-            price_hint = safe_float(history["Close"].iloc[-1]) if isinstance(history, pd.DataFrame) and not history.empty else np.nan
-            f = (fundamental_snapshot(symbol, market_price_hint=price_hint)
-                 if np.isfinite(price_hint) and price_hint > 0 else {})
-            upside = safe_float(f.get("参考価値上昇余地"))
-            split_status = str(f.get("株式分割補正", ""))
-            guard_status = str(f.get("適正株価異常値ガード", ""))
-            if not finance_freshness_usable(f.get("財務情報鮮度")) or f.get("取得状態") != "OK":
-                value_label = financial_unavailable_label(f.get("取得状態"), f.get("財務情報鮮度"))
-            elif "⚠️" in split_status:
-                value_label = "⚠️ 分割補正確認"
-            elif "⚠️" in guard_status and not np.isfinite(upside):
-                value_label = "⚠️ 異常値ガード・算定不能"
-            elif not np.isfinite(upside):
-                value_label = "算定不能"
-            elif upside >= 20:
-                value_label = "🟢 割安"
-            elif upside >= 5:
-                value_label = "🟡 やや割安"
-            elif upside > -10:
-                value_label = "⚪ 適正圏"
-            else:
-                value_label = "🔴 割高"
         rows.append({"銘柄コード": ticker, "銘柄名": holding.get("name") or name(ticker),
                      "保有株数": int(holding["shares"]), "判定": verdict,
                      "銘柄判定": _short_value_label(value_label),
@@ -5328,7 +5334,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.21")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.22")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5739,11 +5745,18 @@ surge_top50_df = build_top50_surge_radar(data, value_top50_df) if data and true_
 if not isinstance(surge_top50_df, pd.DataFrame):
     surge_top50_df = pd.DataFrame()
 
+valuation_master_df = build_valuation_master(
+    [value_top50_df, signal_value_df], short_confirmed, data,
+    [buy_view, sell_view, indicator_compare_df])
+# 算定はマスター作成時だけ行い、描画時には取得し直さない。
+value_top50_df = add_research_judgements_first(value_top50_df, surge_top50_df, valuation_master_df)
+signal_value_df = add_research_judgements_first(signal_value_df, surge_top50_df, valuation_master_df)
+
 # 画面に出るすべての銘柄表で、研究判定を左端に統一表示する。
 # 表示専用の付加情報であり、正式な売買ロジックには接続しない。
-buy_view = add_research_judgements_first(buy_view, surge_top50_df, value_top50_df)
-sell_view = add_research_judgements_first(sell_view, surge_top50_df, value_top50_df)
-indicator_compare_df = add_research_judgements_first(indicator_compare_df, surge_top50_df, value_top50_df)
+buy_view = add_research_judgements_first(buy_view, surge_top50_df, valuation_master_df)
+sell_view = add_research_judgements_first(sell_view, surge_top50_df, valuation_master_df)
+indicator_compare_df = add_research_judgements_first(indicator_compare_df, surge_top50_df, valuation_master_df)
 
 # ------------------------------------------------------------
 # 独立研究: 公表日時時点の財務情報だけを用いる2年バックテスト
@@ -6584,7 +6597,7 @@ with main_tab:
         else:
             st.warning("最新日足は取引中または更新待ちです。確定後にもう一度『今日の判定を更新』を押してください。")
     render_current_holdings(current_holdings_rows(
-        short_confirmed, sell_view, signal_audit_rows, value_top50_df, data
+        short_confirmed, sell_view, signal_audit_rows, valuation_master_df, data
     ))
     if run_error:
         st.error(run_error)
@@ -6686,7 +6699,7 @@ with admin_tab:
         if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
             st.info("先に『今日の判定を更新』で監視対象のデータを取得してください。")
         else:
-            value_show = add_research_judgements_first(value_top50_df, surge_top50_df, value_top50_df)
+            value_show = add_research_judgements_first(value_top50_df, surge_top50_df, valuation_master_df)
             show_cols=[
                 "急騰予兆判定","割安判定","順位","コード","銘柄名","一次選抜順位",
                 "現在株価_価格","AI参考価値","参考価値上昇余地%","企業価値スコア",
@@ -6923,7 +6936,7 @@ with admin_tab:
                 {"コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"]}
                 for c,v in confirmed.items()
             ])
-            held_show = add_research_judgements_first(held_show, surge_top50_df, value_top50_df)
+            held_show = add_research_judgements_first(held_show, surge_top50_df, valuation_master_df)
             held_full = prepare_admin_display(held_show)
             held_compact_cols = ["急騰予兆判定","割安判定","コード","銘柄名","株数","取得単価"]
             held_compact = held_full[[c for c in held_compact_cols if c in held_full.columns]].rename(columns={

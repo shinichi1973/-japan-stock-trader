@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.16
-# BUILD: VER17-24-16-TOPIX-RANGE-20261016
+# 日本株 AI投資アシスタント Ver.17.24.17
+# BUILD: VER17-24-17-TOPIX100-RANGE-20261016
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.16",
+    page_title="日本株 AI投資アシスタント Ver.17.24.17",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.16 TOPIX売買代金TOP50・国内データ"
-BUILD = "VER17-24-16-TOPIX-RANGE-20261016"
+VERSION = "17.24.17 TOPIX売買代金TOP100・国内データ"
+BUILD = "VER17-24-17-TOPIX100-RANGE-20261016"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3275,8 +3275,8 @@ def selection_range_metrics(df):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def discover_domestic_topix_turnover50():
-    """JPX構成一覧と日本版Yahoo売買代金ランキングの積集合を順位順に50件。"""
+def discover_domestic_topix_turnover100():
+    """JPX構成一覧と日本版Yahoo売買代金ランキングの積集合を順位順に100件。"""
     topix = discover_topix_stock_universe()
     allowed = set(topix["コード"].astype(str))
     selected = []
@@ -3293,16 +3293,16 @@ def discover_domestic_topix_turnover50():
             if c in allowed and c not in selected:
                 selected.append(c)
                 added += 1
-            if len(selected) == 50:
+            if len(selected) == 100:
                 out = topix.set_index("コード").loc[selected].reset_index()
-                out["売買代金順位"] = np.arange(1, 51)
+                out["売買代金順位"] = np.arange(1, 101)
                 out["対象指数"] = "TOPIX"
                 out["選定情報源"] = "JPX構成一覧＋Yahoo!ファイナンス日本版売買代金順位"
-                out.attrs["universe_notice"] = "TOPIX内の売買代金上位50。ランキングは取得時点（日中は進行中）、買いサインは最新確定日足。"
+                out.attrs["universe_notice"] = "TOPIX内の売買代金上位100。ランキングは取得時点（日中は進行中）、買いサインは最新確定日足。"
                 return out
         if not found or not added:
             break
-    raise ValueError("国内売買代金ランキングからTOPIX50件を確認できません。新規買いを停止します。")
+    raise ValueError("国内売買代金ランキングからTOPIX100件を確認できません。新規買いを停止します。")
 
 
 def signal_first_candidates(data, held_codes, min_turnover=0, filter_downtrend=False, filter_churn=False, replacement=False):
@@ -4844,7 +4844,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.16")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.17")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -4914,8 +4914,8 @@ for _key, _fixed in {
 }.items():
     st.session_state[_key] = _fixed
 with st.expander("⚙ 購入額・注文方式", expanded=False):
-    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX売買代金TOP50・値幅大＋買いサイン", "TOPIX＋日経225からAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], key="v172416_universe")
-    signal_first = live_universe_mode == "TOPIX売買代金TOP50・値幅大＋買いサイン"
+    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX売買代金TOP100・値幅大＋買いサイン", "TOPIX＋日経225からAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], key="v172417_universe")
+    signal_first = live_universe_mode == "TOPIX売買代金TOP100・値幅大＋買いサイン"
     live_trade_method = st.selectbox("売買ロジック", ["現行Stoch GC/DC", "55日高値更新＋MA200（試験採用）"], key="v17247_method")
     replacement_live = live_trade_method == "55日高値更新＋MA200（試験採用）"
     st.caption("試験採用：買い＝前日までの55日高値を終値で更新＋終値>MA200、売り＝前日までの20日安値を終値で割る、または取得単価から終値7%損切り。候補は63日騰落率順。Stochは売買・順位に使いません。")
@@ -4950,8 +4950,8 @@ with st.expander("⚙ 管理者設定", expanded=False):
     price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
     c1, c2 = st.columns(2)
     universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n", disabled=True)
-    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP50・値幅大＋買いサイン"))
-    st.caption("標準選定：TOPIX→国内売買代金上位50→値幅大＋買いサイン→流動性→安値切上げ→国内財務で割安／やや割安。構成一覧には基準日の差があります。")
+    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値幅大＋買いサイン"))
+    st.caption("標準選定：TOPIX→国内売買代金上位100→値幅大＋買いサイン→流動性→安値切上げ→国内財務で割安／やや割安。構成一覧には基準日の差があります。")
     st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
     churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
     st.caption("今回の主ロジックでは短期反転除外を使用しません。")
@@ -4982,7 +4982,7 @@ if run_clicked:
     st.session_state.pop("v172412_history_refresh_required", None)
     universe_error = ""
     try:
-        universe_df = (discover_domestic_topix_turnover50() if live_universe_mode == "TOPIX売買代金TOP50・値幅大＋買いサイン" else discover_topix_nikkei225_stock_universe() if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP50・値幅大＋買いサイン")
+        universe_df = (discover_domestic_topix_turnover100() if live_universe_mode == "TOPIX売買代金TOP100・値幅大＋買いサイン" else discover_topix_nikkei225_stock_universe() if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値幅大＋買いサイン")
                        else pd.DataFrame([
                            {"コード": c, "銘柄名": STOCK_NAMES[c], "ticker": c + ".T"}
                            for c in VERIFIED_45_CODES
@@ -5021,8 +5021,8 @@ if run_clicked:
         eligible_count = sum(isinstance(d, pd.DataFrame) and len(d) >= 60
                              for d in mother_data.values())
         value_top50_df, _ = (build_value_ai_top50(
-            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP50・値幅大＋買いサイン") else eligible_count,
-            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP50・値幅大＋買いサイン") else eligible_count,
+            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値幅大＋買いサイン") else eligible_count,
+            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP100・値幅大＋買いサイン") else eligible_count,
             churn_filter=False,
         ) if eligible_count else (pd.DataFrame(), pd.DataFrame()))
         st.session_state["v177_value_top50"] = value_top50_df

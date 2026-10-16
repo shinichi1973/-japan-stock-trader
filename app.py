@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.22
-# BUILD: VER17-24-21-DOMESTIC-PROVIDERS-INCREMENTAL-20261017
+# 日本株 AI投資アシスタント Ver.17.24.23
+# BUILD: VER17-24-23-GROWTH-RESEARCH-20261017
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,13 +39,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.22",
+    page_title="日本株 AI投資アシスタント Ver.17.24.23",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.21 検証版 TOPIX売買代金TOP100・国内データ"
-BUILD = "VER17-24-21-DOMESTIC-PROVIDERS-INCREMENTAL-20261017"
+VERSION = "17.24.23 大化け候補研究・国内データ"
+BUILD = "VER17-24-23-GROWTH-RESEARCH-20261017"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1673,6 +1673,8 @@ def _parse_kabutan_finance(html, today):
         # 同一企業・連続する年度の実績同士だけを比較。予想を実績へ混ぜない。
         latest, previous = actuals[-1], actuals[-2]
         if (pd.Period(latest["period"], freq="M") - pd.Period(previous["period"], freq="M")).n == 12:
+            values["_growth_period"] = latest["period"]
+            values["_growth_previous_period"] = previous["period"]
             for col, key in (("売上高", "revenueGrowth"), ("最終益", "earningsGrowth")):
                 now, old = _finance_number(latest[col]), _finance_number(previous[col])
                 if np.isfinite(now) and np.isfinite(old) and old > 0: values[key] = now / old - 1
@@ -3705,6 +3707,18 @@ def batch_domestic_stock_data(tickers_tuple, refresh_token="", history_bars=150)
     return {t:f for t,f,a in results if f is not None}, pd.DataFrame([a for t,f,a in results])
 
 
+
+def multibagger_finance_fields(f):
+    """追加通信せず、取得済み国内財務の生値と比較期間を研究へ引き継ぐ。"""
+    return {**{label: safe_float(f.get(key)) * scale for label, key, scale in (
+        ("時価総額", "marketCap", 1), ("売上成長率%", "revenueGrowth", 100),
+        ("利益成長率%", "earningsGrowth", 100), ("ROE%", "returnOnEquity", 100),
+        ("営業利益率%", "operatingMargins", 100), ("D/E", "debtToEquity", 1),
+        ("FCF", "freeCashflow", 1))},
+        "成長比較期": str(f.get("_growth_period", "")),
+        "成長比較前期": str(f.get("_growth_previous_period", ""))}
+
+
 def _finance_acquisition_state(f):
     if f.get("_cache_mode") == "過去保存値・表示のみ": return "取得不可（過去保存値のみ）"
     if finance_freshness_usable(f.get("_freshness")): return "取得済"
@@ -3724,6 +3738,7 @@ def batch_domestic_finance_audit(tickers_tuple):
                "今回確認日時": tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST"), "新規買い評価": "不可（通信失敗）"}
         try:
             f = _domestic_finance_snapshot(t)
+            row.update(multibagger_finance_fields(f))
             row.update({"財務取得状態": _finance_acquisition_state(f),
                 "財務情報源": f.get("_source", ""), "財務情報鮮度": f.get("_freshness", ""),
                 "参考指標基準日": f.get("_reference_date", ""), "予想EPS対象期": f.get("_forecast_period", ""),
@@ -5334,7 +5349,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.22")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.23")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -6570,10 +6585,117 @@ def render_gfs_research(price_data, freshness, holdings, value_frames, live_audi
     return buy, sell, audit, params
 
 
+
+# 大化け候補は独立した研究スクリーニング。既存売買・配分・損切りへ接続しない。
+MULTIBAGGER_RULES = pd.DataFrame([
+    {"項目": "候補の必須条件", "条件": "実績売上成長率15%以上・実績利益成長率20%以上・実績EPSと予想EPSが正・予想PER0超35以下"},
+    {"項目": "鮮度", "条件": "当日の財務確認、参考指標基準日10日以内、成長比較期の期末から550日以内、連続12か月の実績比較、当日確定日足"},
+    {"項目": "除外", "条件": "共通判定が割高、D/Eが200超、FCFが負、営業利益率が0以下（取得できた場合）"},
+    {"項目": "研究点の内訳", "条件": "売上成長最大30・利益成長最大25・ROE最大15・予想PER最大15・時価総額最大10・FCF最大5。欠損は0点"},
+    {"項目": "候補採用", "条件": "必須条件を全て満たし研究点60以上。点数は上昇確率や予想倍率ではない。閾値は未検証"},
+    {"項目": "対象範囲", "条件": "現在選択した監視対象の国内財務取得対象。全上場銘柄の網羅ではない"},
+    {"項目": "想定・限界", "条件": "数年の成長を調べる入口。単年実績で成長継続・競争優位・受注・希薄化は確認できない。GFS非公開動画は未使用"},
+])
+
+
+def build_multibagger_research(finance, price_data, freshness, valuations, buy, today=None):
+    """純粋な表計算。欠損・古いデータ・赤字からの見かけの成長を候補へ昇格させない。"""
+    if not isinstance(finance, pd.DataFrame) or finance.empty:
+        return pd.DataFrame()
+    today = pd.Timestamp(today if today is not None else tokyo_now().date()).normalize()
+    labels = {str(code(str(r["コード"]))): str(r.get("割安判定", "算定不能"))
+              for r in valuations.to_dict("records")} if isinstance(valuations, pd.DataFrame) and "コード" in valuations else {}
+    buys = {str(code(str(c))) for c in buy["コード"]} if isinstance(buy, pd.DataFrame) and "コード" in buy else set()
+    daily = {str(code(str(r["コード"]))): str(r.get("状態", "")) for r in freshness.to_dict("records")} if isinstance(freshness, pd.DataFrame) and "コード" in freshness else {}
+    rows = []
+    for r in finance.drop_duplicates("コード", keep="last").to_dict("records"):
+        c = str(code(str(r["コード"])))
+        rev, earn, roe, pe, cap, fcf, debt, margin, eps, actual = [safe_float(r.get(k)) for k in (
+            "売上成長率%", "利益成長率%", "ROE%", "予想PER", "時価総額", "FCF", "D/E", "営業利益率%", "予想EPS", "実績EPS")]
+        missing, failed, reasons = [], [], []
+        for label, value, threshold in (("売上成長率", rev, 15), ("利益成長率", earn, 20)):
+            if not np.isfinite(value): missing.append(label)
+            elif value < threshold: failed.append(label + "条件未達")
+            else: reasons.append(f"{label}{value:.1f}%")
+        for label, value in (("予想EPS", eps), ("実績EPS", actual)):
+            if not np.isfinite(value): missing.append(label)
+            elif value <= 0: failed.append(label + "が正でない")
+        if not np.isfinite(pe): missing.append("予想PER")
+        elif not 0 < pe <= 35: failed.append("予想PER条件外")
+        def age_ok(value, days):
+            try:
+                d = pd.Timestamp(str(value)).normalize()
+                return not pd.isna(d) and 0 <= (today-d).days <= days
+            except (ValueError, TypeError): return False
+        if not age_ok(str(r.get("財務取得日時", ""))[:10], 0): missing.append("当日の財務取得")
+        if not age_ok(r.get("参考指標基準日", ""), 10) or not finance_freshness_usable(r.get("財務情報鮮度", "")) or "過去保存値" in str(r.get("財務データ区分", "")):
+            missing.append("財務基準日・鮮度")
+        try:
+            end = pd.Period(r.get("成長比較期", ""), freq="M")
+            prev = pd.Period(r.get("成長比較前期", ""), freq="M")
+            if pd.isna(end) or pd.isna(prev) or (end-prev).n != 12 or not age_ok(end.end_time.date(), 550): missing.append("成長比較期間")
+        except (ValueError, TypeError, AttributeError): missing.append("成長比較期間")
+        if daily.get(c) != "🟢 当日確定": missing.append("最新確定日足")
+        label = labels.get(c, "算定不能")
+        if "割高" in label: failed.append("共通判定が割高")
+        for condition, text in ((np.isfinite(debt) and debt > 200, "D/Eが200超"),
+                                 (np.isfinite(fcf) and fcf < 0, "FCFが負"),
+                                 (np.isfinite(margin) and margin <= 0, "営業利益率が0以下")):
+            if condition: failed.append(text)
+        score = (min(max(rev, 0), 30) if np.isfinite(rev) else 0)
+        score += min(max(earn, 0), 40) / 40 * 25 if np.isfinite(earn) else 0
+        score += min(max(roe, 0), 20) / 20 * 15 if np.isfinite(roe) else 0
+        score += (15 if 0 < pe <= 20 else 10 if 20 < pe <= 30 else 5 if 30 < pe <= 35 else 0)
+        score += (10 if 0 < cap <= 100e9 else 5 if 100e9 < cap <= 300e9 else 0)
+        score += 5 if np.isfinite(fcf) and fcf > 0 else 0
+        score = round(float(score), 1)
+        status = "条件外" if failed else "評価保留" if missing else "大化け候補" if score >= 60 else "成長監視"
+        risks = [k + "未取得" for k, v in (("ROE", roe), ("時価総額", cap), ("FCF", fcf), ("D/E", debt), ("営業利益率", margin)) if not np.isfinite(v)]
+        if label == "算定不能" or "不能" in label or "未確認" in label: risks.append("企業価値評価未確認")
+        risks += ["競争優位・成長の持続性・増資予定はIRで確認"]
+        history = price_data.get(c + ".T", pd.DataFrame())
+        close = safe_float(history["Close"].iloc[-1]) if isinstance(history, pd.DataFrame) and not history.empty and "Close" in history else np.nan
+        if not np.isfinite(close) or close <= 0:
+            if status != "条件外": status = "評価保留"
+            missing.append("現在株価")
+        rows.append({"研究判定": status, "コード": c, "銘柄名": r.get("銘柄名", c), "研究点": score,
+            "今日の買いと一致": "一致" if c in buys else "なし", "銘柄判定": label, "現在株価": close,
+            "選定根拠": "／".join(reasons) or "成長実績未確認", "保留・条件外理由": "／".join(failed + missing),
+            "確認するリスク": "／".join(risks), "売上成長率%": rev, "利益成長率%": earn,
+            "予想PER": pe, "ROE%": roe, "時価総額": cap, "FCF": fcf, "D/E": debt,
+            "成長比較期": r.get("成長比較期", ""), "成長比較前期": r.get("成長比較前期", ""),
+            "財務情報源": r.get("財務情報源", ""), "財務参照URL": r.get("財務参照URL", ""),
+            "財務取得日時": r.get("財務取得日時", ""), "参考指標基準日": r.get("参考指標基準日", "")})
+    out = pd.DataFrame(rows)
+    order = {"大化け候補": 0, "成長監視": 1, "評価保留": 2, "条件外": 3}
+    return out.assign(_order=out["研究判定"].map(order)).sort_values(["_order", "研究点", "コード"], ascending=[True, False, True]).drop(columns="_order").reset_index(drop=True)
+
+
+def render_multibagger_cards(frame, limit=3):
+    if frame.empty:
+        st.info("大化け候補の条件を満たす銘柄はありません。評価保留の理由は大化け候補タブで確認できます。")
+    for r in frame.head(limit).to_dict("records"):
+        st.markdown(f"**{r['コード']} {r['銘柄名']}**　研究点 {r['研究点']:.1f} / 100")
+        st.write(f"今日の買いと一致：{r['今日の買いと一致']} ／ 銘柄判定：{r['銘柄判定']}")
+        st.caption("根拠：" + r["選定根拠"])
+        st.caption("確認：" + r["確認するリスク"])
+
+
+# 一回の通常判定で得た財務全件を利用。TOP50の順位では絞らない。
+mb_finance = finance_acquisition_df.copy()
+mb_extra = st.session_state.get("v172423_growth_extra", pd.DataFrame())
+mb_scope = set(mb_finance["コード"].astype(str)) if "コード" in mb_finance else set()
+if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
+    mb_extra = mb_extra[mb_extra["コード"].astype(str).isin(mb_scope)]
+    mb_finance = pd.concat([mb_finance, mb_extra], ignore_index=True).drop_duplicates("コード", keep="last")
+multibagger_audit = build_multibagger_research(mb_finance, data, daily_bar_status_df, valuation_master_df, buy_view)
+multibagger_candidates = multibagger_audit[multibagger_audit["研究判定"].eq("大化け候補")].copy() if not multibagger_audit.empty else pd.DataFrame()
+
+
 # ------------------------------------------------------------
 # 短期売買と管理者タブ
 # ------------------------------------------------------------
-main_tab, admin_tab = st.tabs(["今日の売買", "管理者"])
+main_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "大化け候補", "管理者"])
 with main_tab:
     news_pick_result, news_pick_exclusions, news_pick_signature = render_triple_news_pick(
         indicator_compare_df, daily_bar_status_df, data, held_codes,
@@ -6630,6 +6752,61 @@ with main_tab:
             else:
                 st.dataframe(ifd_table, use_container_width=True, hide_index=True)
                 st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
+
+    with st.expander("🌱 大化け候補 TOP3（研究）", expanded=False):
+        st.caption("数年の成長を調べる候補です。購入株数・売買指示には反映しません。")
+        render_multibagger_cards(multibagger_candidates)
+
+with multibagger_tab:
+    st.subheader("🌱 大化け候補（研究）")
+    st.caption("数年で大きく成長する企業を探す入口です。研究点は上昇確率・予想倍率ではありません。GFS非公開動画の再現ではなく、成績未検証の独立条件です。")
+    st.info("注文判断は『今日の売買』で確認してください。候補入りだけでは買い指示になりません。既存の利確・終値7%損切りは引き続き適用します。")
+    st.write(f"調査対象 {len(multibagger_audit)}銘柄 ／ 大化け候補 {len(multibagger_candidates)}銘柄")
+    render_multibagger_cards(multibagger_candidates)
+    st.caption("取得済み財務に成長率がない場合は、下のボタンで株探の無料公開業績表を追加確認できます。監視対象の一部を順番に確認します。")
+    growth_limit = st.number_input("1回に成長実績を追加確認する件数", 5, 100, 20, 5, key="v172423_growth_limit")
+    if st.button("成長実績を追加確認", key="v172423_growth_fetch", disabled=not mb_scope):
+        existing_codes = set(mb_extra["コード"].astype(str)) if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty else set()
+        targets = [c for c in sorted(mb_scope) if c not in existing_codes][:int(growth_limit)]
+        if not targets:
+            st.info("追加確認は一巡しました。再確認するときは下のリセットボタンを押してください。")
+        else:
+            additions = []
+            with st.spinner("国内無料公開の連続する年度実績を確認中…"):
+                for c in targets:
+                    original = mb_finance[mb_finance["コード"].astype(str).eq(c)].iloc[0].to_dict()
+                    try:
+                        url = f"https://kabutan.jp/stock/?code={c}"
+                        html = _fetch_free_finance_html(url)
+                        title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+                        if not title or not re.search(r"(?<![0-9A-Z])" + re.escape(c) + r"(?![0-9A-Z])", _finance_plain(title.group(1)), re.I):
+                            raise ValueError("銘柄コードを確認できず")
+                        f = _parse_kabutan_finance(html, tokyo_now().date())
+                        # 一つの追加取得元の数値・期間・出典をセットで利用する。
+                        original.update(multibagger_finance_fields(f))
+                        original.update({"予想PER": safe_float(f.get("forwardPE")), "予想EPS": safe_float(f.get("forwardEps")),
+                            "実績EPS": safe_float(f.get("trailingEps")), "財務情報源": f.get("_source", ""),
+                            "財務情報鮮度": f.get("_freshness", ""), "参考指標基準日": f.get("_reference_date", ""),
+                            "財務参照URL": url, "財務取得日時": tokyo_now().isoformat(), "財務データ区分": "研究用追加取得",
+                            "成長追加確認": "取得済"})
+                    except Exception as exc:
+                        original["成長追加確認"] = type(exc).__name__ + ": " + str(exc)[:200]
+                    additions.append(original)
+            st.session_state["v172423_growth_extra"] = pd.concat([mb_extra, pd.DataFrame(additions)], ignore_index=True).drop_duplicates("コード", keep="last")
+            st.rerun()
+    if st.button("成長実績の追加確認をリセット", key="v172423_growth_reset"):
+        st.session_state.pop("v172423_growth_extra", None)
+        st.rerun()
+    if not multibagger_audit.empty:
+        with st.expander("全件の判定・評価保留・条件外理由", expanded=False):
+            st.dataframe(multibagger_audit, use_container_width=True, hide_index=True)
+        st.download_button("大化け候補の全件CSV", multibagger_audit.to_csv(index=False).encode("utf-8-sig"), "multibagger_research_audit.csv", "text/csv", key="v172423_mb_csv")
+    if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
+        with st.expander("成長実績の追加取得結果", expanded=False):
+            st.dataframe(mb_extra[[c for c in ("コード", "銘柄名", "成長追加確認", "財務参照URL", "財務取得日時") if c in mb_extra]], use_container_width=True, hide_index=True)
+    with st.expander("選定条件と確認すべき点", expanded=False):
+        st.dataframe(MULTIBAGGER_RULES, use_container_width=True, hide_index=True)
+        st.write("決算説明資料で、売上・利益が伸びた理由、翌期も続く根拠、顧客集中、増資予定を確認してください。減収・減益や資金繰り悪化は成長シナリオの再確認が必要です。")
 
 with admin_tab:
     st.caption("比較・検証用。通常の朝はここを見る必要はありません。")
@@ -6973,6 +7150,11 @@ try:
         }])
         zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
         zf.writestr("finance_acquisition_status.csv",finance_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
+        for mb_filename, mb_frame in (("multibagger_candidates.csv", multibagger_candidates),
+                                     ("multibagger_research_audit.csv", multibagger_audit),
+                                     ("multibagger_rules.csv", MULTIBAGGER_RULES),
+                                     ("multibagger_growth_fetch.csv", mb_extra)):
+            zf.writestr(mb_filename, mb_frame.to_csv(index=False, encoding="utf-8-sig"))
         zf.writestr("daily_acquisition_diagnostics.csv",daily_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
         for gfs_name, gfs_frame in [("gfs_research_buy.csv", gfs_research_buy),
                                     ("gfs_research_sell.csv", gfs_research_sell),

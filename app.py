@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.17
-# BUILD: VER17-24-17-TOPIX100-RANGE-20261016
+# 日本株 AI投資アシスタント Ver.17.24.18
+# BUILD: VER17-24-18-FREE-DOMESTIC-FINANCE-20261016
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.17",
+    page_title="日本株 AI投資アシスタント Ver.17.24.18",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.17 TOPIX売買代金TOP100・国内データ"
-BUILD = "VER17-24-17-TOPIX100-RANGE-20261016"
+VERSION = "17.24.18 TOPIX売買代金TOP100・国内データ"
+BUILD = "VER17-24-18-FREE-DOMESTIC-FINANCE-20261016"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1575,7 +1575,7 @@ def _parse_domestic_finance(html, today):
                 continue
             value *= 1_000_000
         values[key] = value
-        if key == "forwardPE":
+        if key in ("forwardPE", "sharesOutstanding"):
             date_match = re.search(r'\((\d{1,2})/(\d{1,2})\)', value_text)
             if date_match:
                 month, day = map(int, date_match.groups())
@@ -1600,19 +1600,127 @@ def _parse_domestic_finance(html, today):
     values["_reference_date"] = str(reference_date or "")
     values["_forecast_period"] = forecast_period
     values["_freshness"] = DOMESTIC_FINANCE_FRESHNESS if usable else "国内参考指標の基準日・予想期を確認できず"
+    values["_source"] = "Yahoo!ファイナンス日本版・無料公開参考指標"
+    values["_url"] = "https://finance.yahoo.co.jp/"
     return values
+
+
+def _finance_plain(value):
+    return re.sub(r"\s+", "", html_unescape(re.sub(r"<[^>]+>", " ", value)))
+
+
+def _finance_number(value):
+    text = _finance_plain(value).replace(",", "").replace("−", "-").replace("▲", "-")
+    match = re.match(r"[-+]?[0-9]+(?:\.[0-9]+)?", text)
+    return safe_float(match.group(0)) if match else np.nan
+
+
+def _parse_kabutan_finance(html, today):
+    """無料の基本情報ページだけを解析。広告・有料会員欄・目標株価を利用しない。"""
+    values = {"_source": "株探・無料公開基本情報／業績推移", "_url": "https://kabutan.jp/"}
+    header = re.search(r'<div\b[^>]*id=["\']stockinfo_i1["\'](.*?)<!--stockinfo_i1-->', html, re.S)
+    if not header:
+        raise ValueError("株探の銘柄情報セクションなし")
+    dt = re.search(r'<time\b[^>]*datetime=["\'](\d{4}-\d{2}-\d{2})T', header.group(1))
+    reference = pd.Timestamp(dt.group(1)).date() if dt else None
+    quote = re.search(r'<span\b[^>]*class=["\']kabuka["\'][^>]*>(.*?)</span>', header.group(1), re.S)
+    price = _finance_number(quote.group(1)) if quote else np.nan
+    if np.isfinite(price) and price > 0: values["currentPrice"] = price
+    ratios = re.search(r'<div\b[^>]*id=["\']stockinfo_i3["\'](.*?)</table>', html, re.S)
+    if ratios:
+        body = re.search(r'<tbody[^>]*>(.*?)</tbody>', ratios.group(1), re.S)
+        first = re.search(r'<tr[^>]*>(.*?)</tr>', body.group(1), re.S) if body else None
+        cells = re.findall(r'<td\b[^>]*>(.*?)</td>', first.group(1), re.S) if first else []
+        for key, cell in zip(("forwardPE", "priceToBook"), cells):
+            value = _finance_number(cell)
+            if np.isfinite(value) and value > 0: values[key] = value
+    block = re.search(r'<div\b[^>]*class=["\']gyouseki_block["\'](.*?)</table>', html, re.S)
+    if not block:
+        raise ValueError("無料業績推移表なし")
+    table = block.group(1)
+    heads = [_finance_plain(x) for x in re.findall(r'<th\b[^>]*>(.*?)</th>', table.split('</thead>')[0], re.S)]
+    if not all(key in heads for key in ("決算期", "売上高", "最終益", "１株益", "発表日")):
+        raise ValueError("業績推移表の列を確認できず")
+    records = []
+    for row in re.findall(r'<tr\b[^>]*>(.*?)</tr>', table, re.S):
+        cells = [_finance_plain(x) for x in re.findall(r'<t[hd]\b[^>]*>(.*?)</t[hd]>', row, re.S)]
+        if len(cells) != len(heads): continue
+        record = dict(zip(heads, cells))
+        period = re.search(r'(20\d{2})\.(\d{2})', record["決算期"])
+        if not period: continue
+        record["period"] = "-".join(period.groups())
+        try: record["published"] = datetime.strptime(record["発表日"], "%y/%m/%d").date()
+        except ValueError: continue
+        if record["published"] > today: continue
+        records.append(record)
+    forecasts = [r for r in records if "予" in r["決算期"]]
+    actuals = sorted([r for r in records if "予" not in r["決算期"]], key=lambda r:r["period"])
+    forecast = max(forecasts, key=lambda r:r["published"]) if forecasts else None
+    if forecast:
+        values["forwardEps"] = _finance_number(forecast["１株益"])
+        values["_forecast_period"] = forecast["period"]
+        values["_disclosure_date"] = str(forecast["published"])
+    if actuals:
+        values["trailingEps"] = _finance_number(actuals[-1]["１株益"])
+        values["_actual_period"] = actuals[-1]["period"]
+    if len(actuals) >= 2:
+        # 同一企業・連続する年度の実績同士だけを比較。予想を実績へ混ぜない。
+        latest, previous = actuals[-1], actuals[-2]
+        if (pd.Period(latest["period"], freq="M") - pd.Period(previous["period"], freq="M")).n == 12:
+            for col, key in (("売上高", "revenueGrowth"), ("最終益", "earningsGrowth")):
+                now, old = _finance_number(latest[col]), _finance_number(previous[col])
+                if np.isfinite(now) and np.isfinite(old) and old > 0: values[key] = now / old - 1
+    values["_reference_date"] = str(reference or "")
+    values.setdefault("_forecast_period", "")
+    period_ok = False
+    if forecast:
+        period_end = (pd.Timestamp(forecast["period"] + "-01") + pd.offsets.MonthEnd(0)).date()
+        period_ok = -100 <= (period_end-today).days <= 550 and (today-forecast["published"]).days <= 200
+    usable = reference is not None and 0 <= (today-reference).days <= 10 and period_ok and values.get("forwardEps", 0) > 0
+    values["_freshness"] = DOMESTIC_FINANCE_FRESHNESS if usable else "株探の基準日・予想期・発表日を確認できず"
+    if not any(np.isfinite(safe_float(values.get(k))) for k in ("forwardEps", "priceToBook", "trailingEps")):
+        raise ValueError("無料公開財務に有効な数値なし")
+    return values
+
+
+def _fetch_free_finance_html(url):
+    for attempt in range(2):
+        response = requests.get(url, headers={"User-Agent":"Mozilla/5.0", "Accept":"text/html"}, timeout=12)
+        if response.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+            time.sleep(0.4)
+            continue
+        response.raise_for_status()
+        return response.text
+    raise ValueError("無料公開ページ取得失敗")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _domestic_finance_snapshot(t):
     if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)):
         raise ValueError("国内株コード形式が不正")
-    response = requests.get(
-        f"https://finance.yahoo.co.jp/quote/{t}",
-        headers={"User-Agent":"Mozilla/5.0", "Accept":"text/html"}, timeout=12,
-    )
-    response.raise_for_status()
-    return _parse_domestic_finance(response.text, tokyo_now().date())
+    today = tokyo_now().date()
+    sources = [
+        ("Yahoo!日本版", f"https://finance.yahoo.co.jp/quote/{t}", _parse_domestic_finance),
+        ("株探", f"https://kabutan.jp/stock/?code={code(t)}", _parse_kabutan_finance),
+    ]
+    attempts, partials = [], []
+    for label, url, parser in sources:
+        try:
+            values = parser(_fetch_free_finance_html(url), today)
+            values["_url"] = url
+            attempts.append(label + ": " + values.get("_freshness", "不明"))
+            partials.append(values)
+            if finance_freshness_usable(values.get("_freshness")):
+                values["_attempts"] = " / ".join(attempts)
+                return values
+        except Exception as exc:
+            attempts.append(label + ": " + type(exc).__name__ + " " + str(exc)[:160])
+    if partials:
+        # 期の違うEPS/PERを混ぜず、1社分のスナップショット単位で採用する。
+        values = max(partials, key=lambda v: sum(not k.startswith("_") for k in v))
+        values["_attempts"] = " / ".join(attempts)
+        return values
+    raise ValueError(" / ".join(attempts))
 
 
 def financial_unavailable_label(status, freshness):
@@ -1632,6 +1740,7 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
         domestic = None
         try:
             domestic = _domestic_finance_snapshot(t)
+            finance_source = domestic.get("_source", finance_source)
             info = {k: v for k, v in domestic.items() if not k.startswith("_")}
             if not info:
                 raise ValueError("日本版の有効な参考指標なし")
@@ -1919,6 +2028,10 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
             "財務情報源":finance_source if has_fundamentals else "取得不可",
             "参考指標基準日":domestic.get("_reference_date", "") if domestic else "",
             "予想EPS対象期":domestic.get("_forecast_period", "") if domestic else "",
+            "財務参照URL":domestic.get("_url", "") if domestic else "",
+            "財務取得経路":domestic.get("_attempts", "") if domestic else yahoo_status,
+            "業績発表日":domestic.get("_disclosure_date", "") if domestic else "",
+            "実績EPS対象期":domestic.get("_actual_period", "") if domestic else "",
             "財務情報鮮度":freshness,"Yahoo期末日":str(yahoo_quarter or ""),
             "Yahoo取得状態":yahoo_status,
             "財務取得日時":tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST"),
@@ -3458,6 +3571,7 @@ def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filt
             "財務取得日時": str(f.get("財務取得日時", "")),
             "参考指標基準日": str(f.get("参考指標基準日", "")),
             "予想EPS対象期": str(f.get("予想EPS対象期", "")),
+            **{k: str(f.get(k, "")) for k in ("財務参照URL", "財務取得経路", "業績発表日", "実績EPS対象期")},
         })
     out = pool.merge(pd.DataFrame(fund_rows), on="ticker", how="left")
     for c in ["企業価値スコア", "成長性スコア", "バリュエーションスコア"]:
@@ -4844,7 +4958,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.17")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.18")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -6146,8 +6260,16 @@ with admin_tab:
                 st.warning(f"財務指標を取得できない銘柄：{len(missing_finance)} / {len(signal_value_df)}。日足の鮮度とは別です。判定不能除外が有効なら新規買いを見送ります。")
                 with st.expander("財務取得不可の詳細", expanded=False):
                     st.dataframe(missing_finance[["コード", "銘柄名", "ファンダ取得状態", "Yahoo取得状態", "財務情報鮮度", "財務取得日時"]], use_container_width=True, hide_index=True)
+        with st.expander("無料財務データの取得状況・情報源", expanded=False):
+            _finance_frames = [f for f in (signal_value_df, value_top50_df) if isinstance(f, pd.DataFrame) and not f.empty]
+            if _finance_frames:
+                _finance_audit = pd.concat(_finance_frames, ignore_index=True).drop_duplicates("コード", keep="first")
+                _audit_cols = ["コード", "銘柄名", "割安判定", "ファンダ取得状態", "財務情報源", "財務情報鮮度", "参考指標基準日", "予想EPS対象期", "業績発表日", "実績EPS対象期", "財務取得日時", "財務参照URL", "財務取得経路"]
+                st.dataframe(_finance_audit[[c for c in _audit_cols if c in _finance_audit]], use_container_width=True, hide_index=True)
+            else:
+                st.info("判定更新後に財務の取得状況を表示します。")
         st.caption("シグナル先行では企業価値を割高除外・判定不能除外に使用します。他の監視対象設定では参考表示です。")
-        st.caption("朝の企業価値参考評価はYahoo Financeを取得し、財務材料不足時はYahoo日本版の公開参考指標を補完します。国内補完は指標基準日（10日以内）とEPS予想期を確認しますが、最新決算への反映は保証できません。売上・利益成長率や目標株価を推測で補いません。J-Quantsの遅延財務は使用しません。")
+        st.caption("財務は無料公開のYahoo!ファイナンス日本版を優先し、取得不可・基準日未確認時は株探の無料基本情報へ切り替えます。取得サイト・指標基準日・EPS対象期・株探業績発表日・取得経路を表示します。サイトをまたいでEPSとPERを混ぜません。欠損をゼロや推測値で補わず、最新性・算定不能は新規買い対象外です。J-Quants遅延財務・有料APIは使用しません。")
         if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
             st.info("先に『今日の判定を更新』で監視対象のデータを取得してください。")
         else:
@@ -6157,7 +6279,7 @@ with admin_tab:
                 "現在株価_価格","AI参考価値","参考価値上昇余地%","企業価値スコア",
                 "成長性スコア","流動性スコア","AI_TOP50スコア",
                 "財務情報源","財務情報鮮度","Yahoo期末日","Yahoo取得状態",
-                "財務取得日時","参考指標基準日","予想EPS対象期","ファンダ取得状態",
+                "財務取得日時","参考指標基準日","予想EPS対象期","業績発表日","実績EPS対象期","財務参照URL","財務取得経路","ファンダ取得状態",
                 "適正株価異常値ガード","株式分割補正"
             ]
             value_full = prepare_admin_display(value_show[[c for c in show_cols if c in value_show.columns]])

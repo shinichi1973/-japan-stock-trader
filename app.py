@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.15
-# BUILD: VER17-24-15-UNLIMITED-ALLOCATION-20261015
+# 日本株 AI投資アシスタント Ver.17.24.16
+# BUILD: VER17-24-16-TOPIX-RANGE-20261016
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.15",
+    page_title="日本株 AI投資アシスタント Ver.17.24.16",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.15 TOPIX＋日経225 シグナル先行"
-BUILD = "VER17-24-15-UNLIMITED-ALLOCATION-20261015"
+VERSION = "17.24.16 TOPIX売買代金TOP50・国内データ"
+BUILD = "VER17-24-16-TOPIX-RANGE-20261016"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1638,14 +1638,8 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
         except Exception as exc:
             domestic = None
             yahoo_status = "日本版取得失敗: " + type(exc).__name__ + ": " + str(exc)[:120]
-            finance_source = "Yahoo Finance（日本版取得失敗時の予備）"
-            try:
-                info = yf.Ticker(t).info or {}
-            except Exception as fallback_exc:
-                info = {}
-                yahoo_status += " / 予備取得失敗: " + type(fallback_exc).__name__
-            if not isinstance(info, dict):
-                info = {}
+            finance_source = "日本版取得不可（海外財務へ代替しない）"
+            info = {}
         if not info:
             yahoo_status += " / 有効な財務情報なし"
         yahoo_quarter_raw = safe_float(info.get("mostRecentQuarter"))
@@ -3195,6 +3189,122 @@ def stoch_churn_diagnostic(df):
             "新規買い除外理由": "／".join(reasons)}
 
 
+class DomesticHistoryParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.rows, self.row, self.cell = [], [], None
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr": self.row = []
+        if tag in ("td", "th"): self.cell = []
+    def handle_data(self, data):
+        if self.cell is not None: self.cell.append(data)
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.cell is not None:
+            self.row.append("".join(self.cell).strip()); self.cell = None
+        if tag == "tr" and self.row: self.rows.append(self.row)
+
+
+def parse_domestic_daily_history(text):
+    parser = DomesticHistoryParser(); parser.feed(text)
+    records = []
+    for row in parser.rows:
+        if len(row) < 6 or not re.fullmatch(r"\d{4}(?:年\d{1,2}月\d{1,2}日|/\d{1,2}/\d{1,2})", row[0]):
+            continue
+        try:
+            dt = pd.to_datetime(row[0], format="%Y/%m/%d" if "/" in row[0] else "%Y年%m月%d日")
+            nums = [float(v.replace(",", "").replace("株", "")) for v in row[1:6]]
+            if all(np.isfinite(v) for v in nums) and min(nums[:4]) > 0:
+                records.append([dt, *nums])
+        except (ValueError, TypeError):
+            continue
+    return pd.DataFrame(records, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def batch_domestic_stock_data(tickers_tuple):
+    """日本版Yahooの時系列表のみ。海外データへの自動代替をしない。"""
+    from concurrent.futures import ThreadPoolExecutor
+    today = tokyo_now()
+    # 朝は前営業日、日中は当日未確定を必ず除く。
+    cutoff = pd.Timestamp(today.date()) if today.hour >= 16 else pd.Timestamp(today.date()) - pd.Timedelta(days=1)
+    def fetch(t):
+        try:
+            parts, seen = [], set()
+            for page in range(1, 16):
+                response = requests.get(f"https://finance.yahoo.co.jp/quote/{t}/history",
+                    params={"page": page}, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                response.raise_for_status()
+                part = parse_domestic_daily_history(response.text)
+                if part.empty or not (set(part["Date"]) - seen): break
+                seen.update(part["Date"]); parts.append(part)
+            if not parts: return t, None
+            raw = pd.concat(parts).drop_duplicates("Date").set_index("Date").sort_index()
+            raw = raw.loc[raw.index <= cutoff]
+            # 時系列表には調整後終値もあるがOHLCの分割補正が保証されない。
+            # 異常な価格断絶があれば新規買いを止める（保有の確認は継続）。
+            frame = _prepare_light_history_frame(raw)
+            if frame.empty: return t, None
+            latest = pd.Timestamp(frame.index.max()).normalize()
+            weekdays = len(pd.bdate_range(latest, cutoff)) - 1
+            split_suspect = bool(raw["Close"].pct_change().tail(60).abs().gt(.40).any())
+            frame.attrs.update({"source": "Yahoo!ファイナンス日本版・時系列日足",
+                "latest_date": latest, "session_date": cutoff,
+                "daily_bar_status": "🟢 当日確定" if weekdays <= 0 and not split_suspect else "🔴 更新待ち・価格断絶確認",
+                "domestic_history": True})
+            return t, frame
+        except Exception:
+            return t, None
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return {t: frame for t, frame in pool.map(fetch, tickers_tuple) if frame is not None}
+
+
+def selection_range_metrics(df):
+    """直近確定足のATR14/終値と、連続する10営業日安値を比較。"""
+    if df is None or len(df) < 31:
+        return {"値幅区分": "値幅未確認", "ATR比率%": np.nan, "安値切上げ": False}
+    x = df.iloc[-31:]
+    close = pd.to_numeric(x["Close"], errors="coerce")
+    high = pd.to_numeric(x["High"], errors="coerce")
+    low = pd.to_numeric(x["Low"], errors="coerce")
+    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+    pct = safe_float(tr.tail(14).mean() / close.iloc[-1] * 100) if close.iloc[-1] > 0 else np.nan
+    lows = [safe_float(low.iloc[a:b].min()) for a,b in [(-30,-20),(-20,-10),(-10,None)]]
+    rising = all(np.isfinite(v) for v in lows) and lows[0] < lows[1] < lows[2] and close.iloc[-1] > close.tail(25).mean()
+    return {"値幅区分": "値幅未確認" if not np.isfinite(pct) else "値幅大" if pct >= 3 else "値幅中" if pct >= 1.5 else "値幅小",
+            "ATR比率%": pct, "安値切上げ": bool(rising)}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def discover_domestic_topix_turnover50():
+    """JPX構成一覧と日本版Yahoo売買代金ランキングの積集合を順位順に50件。"""
+    topix = discover_topix_stock_universe()
+    allowed = set(topix["コード"].astype(str))
+    selected = []
+    for page in range(1, 11):
+        response = requests.get(
+            "https://finance.yahoo.co.jp/stocks/ranking/tradingValueHigh",
+            params={"market": "all", "page": page},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        response.raise_for_status()
+        # SSRランキングの銘柄リンクを文書順に読み取る（JSON内の順不同コードは使わない）。
+        found = re.findall(r'href=["\'](?:https://finance.yahoo.co.jp)?/quote/([0-9A-Z]{4})\.T(?:[?/#][^"\']*)?["\']', response.text)
+        added = 0
+        for c in found:
+            if c in allowed and c not in selected:
+                selected.append(c)
+                added += 1
+            if len(selected) == 50:
+                out = topix.set_index("コード").loc[selected].reset_index()
+                out["売買代金順位"] = np.arange(1, 51)
+                out["対象指数"] = "TOPIX"
+                out["選定情報源"] = "JPX構成一覧＋Yahoo!ファイナンス日本版売買代金順位"
+                out.attrs["universe_notice"] = "TOPIX内の売買代金上位50。ランキングは取得時点（日中は進行中）、買いサインは最新確定日足。"
+                return out
+        if not found or not added:
+            break
+    raise ValueError("国内売買代金ランキングからTOPIX50件を確認できません。新規買いを停止します。")
+
+
 def signal_first_candidates(data, held_codes, min_turnover=0, filter_downtrend=False, filter_churn=False, replacement=False):
     """当日までの確定日足だけから候補を抽出。財務評価は呼出し側で行う。"""
     rows = []
@@ -3209,9 +3319,14 @@ def signal_first_candidates(data, held_codes, min_turnover=0, filter_downtrend=F
             continue
         turnover = safe_float((df["Close"] * df["Volume"]).tail(20).mean())
         reasons = []
+        metrics = selection_range_metrics(df)
+        if metrics["値幅区分"] != "値幅大":
+            reasons.append("値幅大条件未達（ATR14/終値3%未満または不明）")
+        if not metrics["安値切上げ"]:
+            reasons.append("安値切上げ未確認")
         if df.attrs.get("daily_bar_status") != "🟢 当日確定":
             reasons.append("最新確定日足を確認できず")
-        if not np.isfinite(turnover) or turnover < min_turnover:
+        if not np.isfinite(turnover) or turnover < max(min_turnover, 100000000):
             reasons.append("流動性不足")
         if filter_downtrend and bool(r.get("下降確認", False)):
             reasons.append("下降確認")
@@ -3219,8 +3334,8 @@ def signal_first_candidates(data, held_codes, min_turnover=0, filter_downtrend=F
         if filter_churn and not replacement and diagnostic["新規買い除外理由"]:
             reasons.append(diagnostic["新規買い除外理由"])
         rows.append({"ticker": t, "コード": code(t), "銘柄名": name(t),
-                     "抽出除外理由": "／".join(reasons), "20日平均売買代金": turnover})
-    return pd.DataFrame(rows, columns=["ticker", "コード", "銘柄名", "抽出除外理由", "20日平均売買代金"])
+                     "抽出除外理由": "／".join(reasons), "20日平均売買代金": turnover, **metrics})
+    return pd.DataFrame(rows, columns=["ticker", "コード", "銘柄名", "抽出除外理由", "20日平均売買代金", "値幅区分", "ATR比率%", "安値切上げ"])
 
 
 def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filter=True):
@@ -4427,6 +4542,11 @@ def render_mobile_trade_cards(df, side, trend_by_code=None):
                 f"<span class=\"trade-card-secondary\">{surge_text}</span>"
             )
 
+        range_df = next((v for t, v in globals().get("data", {}).items() if code(t) == str(row.get("コード"))), None)
+        rm = selection_range_metrics(range_df)
+        range_text = html_escape(rm["値幅区分"])
+        range_pct = _mobile_number(rm["ATR比率%"], 1, "%")
+        detail_text = f"<span>{range_text}（ATR14 {range_pct}）</span>" + detail_text
         st.markdown(
             f"""
             <div class="trade-card {card_class}">
@@ -4527,7 +4647,8 @@ def current_holdings_rows(holdings, sell_candidates, signal_audit, value_df, pri
                 value_label = "🔴 割高"
         rows.append({"銘柄コード": ticker, "銘柄名": holding.get("name") or name(ticker),
                      "保有株数": int(holding["shares"]), "判定": verdict,
-                     "銘柄判定": _short_value_label(value_label)})
+                     "銘柄判定": _short_value_label(value_label),
+                     **selection_range_metrics(price_data.get(ticker if ticker.endswith(".T") else ticker + ".T"))})
     return sorted(rows, key=lambda row: (row["判定"] != "売り", row["銘柄コード"]))
 
 
@@ -4556,7 +4677,7 @@ def render_current_holdings(rows):
         st.markdown(
             f'<div class="holding-grid holding-row {tone}">'
             f'<span>{html_escape(str(row["銘柄コード"]))}</span>'
-            f'<span class="holding-name">{html_escape(str(row["銘柄名"]))}</span>'
+            f'<span class="holding-name">{html_escape(str(row["銘柄名"]))}<br><small>{html_escape(str(row.get("値幅区分", "値幅未確認")))}</small></span>'
             f'<span class="holding-shares">{int(row["保有株数"]):,}</span>'
             f'<span class="holding-verdict">{html_escape(verdict or "—")}</span>'
             f'<span class="holding-value">{html_escape(str(row.get("銘柄判定") or "—"))}</span></div>',
@@ -4723,7 +4844,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.15")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.16")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -4793,18 +4914,19 @@ for _key, _fixed in {
 }.items():
     st.session_state[_key] = _fixed
 with st.expander("⚙ 購入額・注文方式", expanded=False):
-    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX＋日経225全体から買いシグナル先行", "TOPIX＋日経225からAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], key="v17245_universe")
-    signal_first = live_universe_mode == "TOPIX＋日経225全体から買いシグナル先行"
+    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX売買代金TOP50・値幅大＋買いサイン", "TOPIX＋日経225からAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], key="v172416_universe")
+    signal_first = live_universe_mode == "TOPIX売買代金TOP50・値幅大＋買いサイン"
     live_trade_method = st.selectbox("売買ロジック", ["現行Stoch GC/DC", "55日高値更新＋MA200（試験採用）"], key="v17247_method")
     replacement_live = live_trade_method == "55日高値更新＋MA200（試験採用）"
     st.caption("試験採用：買い＝前日までの55日高値を終値で更新＋終値>MA200、売り＝前日までの20日安値を終値で割る、または取得単価から終値7%損切り。候補は63日騰落率順。Stochは売買・順位に使いません。")
     if replacement_live:
         st.warning("拡大344銘柄の過去比較では有望ですが、TOPIX全体と財務除外込みの成績は未検証です。保有銘柄の売り条件もこの方式へ切り替わります。")
-    block_unrated = st.checkbox("企業価値の判定不能は新規買いを見送る", value=True, key="v17243_unrated", disabled=not signal_first)
-    min_turnover = st.number_input("買い候補の20日平均売買代金下限（円・0で無効）", 0, 10000000000, 0, 10000000, key="v17243_liquidity", disabled=not signal_first)
+    block_unrated = True
+    st.caption("国内財務の判定不能は新規買いを見送ります。")
+    min_turnover = st.number_input("買い候補の20日平均売買代金下限（円・最低1億円）", 100000000, 10000000000, 100000000, 10000000, key="v172416_liquidity", disabled=not signal_first)
     filter_downtrend = st.checkbox("下降確認の候補を除外（未検証）", value=False, key="v17243_down", disabled=not signal_first or replacement_live)
     filter_churn = st.checkbox("短期クロス多発の候補を除外（未検証）", value=False, key="v17243_churn", disabled=not signal_first or replacement_live)
-    st.caption("シグナル先行は全体の最新確定日足から選択方式の買い候補を抽出して評価します。割高は除外。追加フィルターは初期値OFF。")
+    st.caption("値幅：ATR14/終値が3%以上＝大、1.5%以上＝中、それ未満＝小。大のみ新規対象。安値切上げ：直近3つの10営業日安値が順に上昇し、終値が25日平均より上。20日平均売買代金は最低1億円。国内財務の判定不能は除外。")
     cap_mode = "上限なし（買付余力内・候補順に引当）"
     purchase_cap = None
     lot_cap = None
@@ -4828,8 +4950,8 @@ with st.expander("⚙ 管理者設定", expanded=False):
     price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
     c1, c2 = st.columns(2)
     universe_size = c1.number_input("日本株母集団（売買代金上位）", 200, 500, 350, 25, key="v177_universe_n", disabled=True)
-    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225からAI選定TOP50", "TOPIX＋日経225全体から買いシグナル先行"))
-    st.caption("TOPIX＋日経225シグナル先行は全銘柄のGC候補を抽出して評価。従来TOP50モードも選択できます。JPX・日経の公式構成一覧を結合し、重複を除外します。公開一覧には基準日との差がある場合があります。")
+    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP50・値幅大＋買いサイン"))
+    st.caption("標準選定：TOPIX→国内売買代金上位50→値幅大＋買いサイン→流動性→安値切上げ→国内財務で割安／やや割安。構成一覧には基準日の差があります。")
     st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
     churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
     st.caption("今回の主ロジックでは短期反転除外を使用しません。")
@@ -4860,7 +4982,7 @@ if run_clicked:
     st.session_state.pop("v172412_history_refresh_required", None)
     universe_error = ""
     try:
-        universe_df = (discover_topix_nikkei225_stock_universe() if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX＋日経225全体から買いシグナル先行")
+        universe_df = (discover_domestic_topix_turnover50() if live_universe_mode == "TOPIX売買代金TOP50・値幅大＋買いサイン" else discover_topix_nikkei225_stock_universe() if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP50・値幅大＋買いサイン")
                        else pd.DataFrame([
                            {"コード": c, "銘柄名": STOCK_NAMES[c], "ticker": c + ".T"}
                            for c in VERIFIED_45_CODES
@@ -4884,7 +5006,7 @@ if run_clicked:
     all_codes = list(dict.fromkeys(selected_codes + [str(c) for c in all_held_codes]))
     all_tickers = tuple(tickers(",".join(all_codes)))
     with st.spinner(f"{len(all_tickers)}銘柄の日足を一括取得中…"):
-        data = batch_stock_data_light(all_tickers, months=15)
+        data = (batch_domestic_stock_data(all_tickers) if signal_first else batch_stock_data_light(all_tickers, months=15))
     st.session_state["v177_data"] = data
     st.session_state["v177_daily_bar_status"] = build_daily_bar_status(data)
     mother_data = {t: d for t, d in data.items() if code(t) in selected_codes}
@@ -4899,8 +5021,8 @@ if run_clicked:
         eligible_count = sum(isinstance(d, pd.DataFrame) and len(d) >= 60
                              for d in mother_data.values())
         value_top50_df, _ = (build_value_ai_top50(
-            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX＋日経225全体から買いシグナル先行") else eligible_count,
-            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX＋日経225全体から買いシグナル先行") else eligible_count,
+            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP50・値幅大＋買いサイン") else eligible_count,
+            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIX＋日経225からAI選定TOP50", "TOPIX売買代金TOP50・値幅大＋買いサイン") else eligible_count,
             churn_filter=False,
         ) if eligible_count else (pd.DataFrame(), pd.DataFrame()))
         st.session_state["v177_value_top50"] = value_top50_df
@@ -4939,8 +5061,8 @@ if signal_first:
     candidate_data = {t: df for t, df in signal_data.items() if t in pass_tickers}
     if candidate_data:
         signal_value_df, _ = build_value_ai_top50(candidate_data, max_rows=len(candidate_data), fundamental_pool_size=len(candidate_data), churn_filter=False)
-        signal_value_df["候補スコア"] = signal_value_df["一次選抜スコア"]
-        if replacement_live:
+        signal_value_df["候補スコア"] = signal_value_df["コード"].map({code(t): selection_range_metrics(df)["ATR比率%"] for t, df in candidate_data.items()})
+        if replacement_live and not signal_first:
             priority = {code(t): -safe_float(public_replacement_frame(df, "高値更新55＋MA200・安値割れ20").iloc[-1].get("buy_priority"), 0) * 100 for t, df in candidate_data.items()}
             signal_value_df["候補スコア"] = signal_value_df["コード"].map(priority).fillna(0)
         signal_value_df = signal_value_df.sort_values(["候補スコア", "コード"], ascending=[False, True]).reset_index(drop=True)
@@ -4999,6 +5121,8 @@ if data and (true_top50_codes or held_code_set):
             if not buy_skip_reason and block_unrated and not bool(meta.get("企業価値算定済", False)):
                 buy_skip_reason = "企業価値判定不能のため新規買い見送り"
                 value_unrated_count += 1
+            if not buy_skip_reason and (not bool(meta.get("企業価値算定済", False)) or "割安" not in str(value_judgement)):
+                buy_skip_reason = "国内財務による割安・やや割安条件未達"
             final_buy_hit = final_buy_hit and not buy_skip_reason
         if c in true_top50_codes or c in held_code_set:
             signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else ("TOPIX＋日経225全体" if signal_first else "監視対象"),
@@ -5037,7 +5161,7 @@ if data and (true_top50_codes or held_code_set):
 signal_audit_df = pd.DataFrame(signal_audit_rows)
 if signal_first and not signal_first_audit_df.empty:
     with st.expander("TOPIX＋日経225買いシグナルの抽出・見送り理由", expanded=False):
-        st.caption(f"買いシグナル抽出 {len(signal_first_audit_df)}銘柄 / 財務判定不能による見送り {value_unrated_count}銘柄。" + ("順位は63日騰落率順。" if replacement_live else "候補スコアは流動性45%・トレンド30%・安定性25%（未検証）。"))
+        st.caption(f"買いシグナル抽出 {len(signal_first_audit_df)}銘柄 / 財務判定不能による見送り {value_unrated_count}銘柄。" + ("通過候補はATR比率の大きい順。" if replacement_live else "通過候補はATR比率の大きい順。入口変更後の収益性は未検証。"))
         st.dataframe(signal_audit_df[signal_audit_df["現行買い"].eq(True)], use_container_width=True, hide_index=True)
 
 if not signal_audit_df.empty and "買い見送り理由" in signal_audit_df.columns:
@@ -5085,6 +5209,12 @@ if sell_signal_rows:
         sell_view[c]=pd.to_numeric(sell_view[c],errors="coerce").round(2)
 else:
     sell_view=pd.DataFrame(columns=sell_cols)
+
+for _view in (buy_view, sell_view):
+    if not _view.empty:
+        _metrics = {code(t): selection_range_metrics(df) for t, df in data.items()}
+        for _col in ("値幅区分", "ATR比率%", "安値切上げ"):
+            _view[_col] = _view["コード"].astype(str).map(lambda c: _metrics.get(c, {}).get(_col))
 
 # 管理者研究用。実売買には一切使わない3方式比較。
 indicator_compare_df = build_indicator_compare(data, true_top50_codes, held_codes) if data and true_top50_codes else pd.DataFrame()

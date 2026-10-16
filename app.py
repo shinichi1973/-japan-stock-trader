@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.18
-# BUILD: VER17-24-18-FREE-DOMESTIC-FINANCE-20261016
+# 日本株 AI投資アシスタント Ver.17.24.19
+# BUILD: VER17-24-19-INDEPENDENT-FINANCE-DAILY-DIAGNOSTICS-20261016
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -36,13 +36,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.18",
+    page_title="日本株 AI投資アシスタント Ver.17.24.19",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.18 TOPIX売買代金TOP100・国内データ"
-BUILD = "VER17-24-18-FREE-DOMESTIC-FINANCE-20261016"
+VERSION = "17.24.19 TOPIX売買代金TOP100・国内データ"
+BUILD = "VER17-24-19-INDEPENDENT-FINANCE-DAILY-DIAGNOSTICS-20261016"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1690,7 +1690,7 @@ def _fetch_free_finance_html(url):
             time.sleep(0.4)
             continue
         response.raise_for_status()
-        return response.text
+        return response.content.decode("utf-8", errors="replace")
     raise ValueError("無料公開ページ取得失敗")
 
 
@@ -3333,42 +3333,98 @@ def parse_domestic_daily_history(text):
     return pd.DataFrame(records, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def batch_domestic_stock_data(tickers_tuple):
-    """日本版Yahooの時系列表のみ。海外データへの自動代替をしない。"""
+def _download_domestic_history(t, cutoff, target_bars=300):
+    """1ページの失敗で、それまでに取得済みの日足を捨てない。"""
+    parts, seen, errors = [], set(), []
+    pages = 0
+    for page in range(1, 16):
+        try:
+            # requestsの推測文字コードを使うと、日本語の日付が文字化けする場合がある。
+            for attempt in range(2):
+                try:
+                    response = requests.get(f"https://finance.yahoo.co.jp/quote/{t}/history",
+                        params={"page": page}, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+                    response.raise_for_status()
+                    break
+                except requests.RequestException as exc:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if attempt == 0 and (status is None or status in (429, 500, 502, 503, 504)):
+                        time.sleep(0.4)
+                        continue
+                    raise
+            part = parse_domestic_daily_history(response.content.decode("utf-8", errors="replace"))
+            if part.empty:
+                errors.append(f"page={page}: 日付・OHLCVを読み取れず（表示変更・提供範囲・アクセス制限を確認）")
+                break
+            if not (set(part["Date"]) - seen):
+                errors.append(f"page={page}: 前ページと同じ日付。公開範囲の取得を終了")
+                break
+            seen.update(part["Date"]); parts.append(part); pages += 1
+            if len(seen) >= target_bars: break
+        except Exception as exc:
+            errors.append(f"page={page}: {type(exc).__name__}: {str(exc)[:160]}")
+            break
+    raw = (pd.concat(parts).drop_duplicates("Date").set_index("Date").sort_index()
+           if parts else pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"]))
+    if not raw.empty: raw = raw.loc[raw.index <= cutoff]
+    return raw, pages, " / ".join(errors)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def batch_domestic_stock_data(tickers_tuple, refresh_token=""):
+    """国内日足と、失敗した銘柄も含む取得診断を返す。"""
     from concurrent.futures import ThreadPoolExecutor
     today = tokyo_now()
-    # 朝は前営業日、日中は当日未確定を必ず除く。
     cutoff = pd.Timestamp(today.date()) if today.hour >= 16 else pd.Timestamp(today.date()) - pd.Timedelta(days=1)
     def fetch(t):
+        audit = {"コード": code(t), "銘柄名": name(t), "情報源": "Yahoo!ファイナンス日本版・時系列日足",
+                 "取得行数": 0, "指標行数": 0, "取得ページ数": 0, "日足最終日": "", "状態": "取得不可", "詳細": ""}
         try:
-            parts, seen = [], set()
-            for page in range(1, 16):
-                response = requests.get(f"https://finance.yahoo.co.jp/quote/{t}/history",
-                    params={"page": page}, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-                response.raise_for_status()
-                part = parse_domestic_daily_history(response.text)
-                if part.empty or not (set(part["Date"]) - seen): break
-                seen.update(part["Date"]); parts.append(part)
-            if not parts: return t, None
-            raw = pd.concat(parts).drop_duplicates("Date").set_index("Date").sort_index()
-            raw = raw.loc[raw.index <= cutoff]
-            # 時系列表には調整後終値もあるがOHLCの分割補正が保証されない。
-            # 異常な価格断絶があれば新規買いを止める（保有の確認は継続）。
+            raw, pages, error = _download_domestic_history(t, cutoff)
+            audit.update({"取得行数": len(raw), "取得ページ数": pages, "詳細": error})
             frame = _prepare_light_history_frame(raw)
-            if frame.empty: return t, None
+            if frame.empty:
+                audit["状態"] = "日足不足" if len(raw) else "取得不可"
+                audit["詳細"] = (error + " / " if error else "") + f"移動平均計算に最低80行必要・取得{len(raw)}行"
+                return t, None, audit
             latest = pd.Timestamp(frame.index.max()).normalize()
             weekdays = len(pd.bdate_range(latest, cutoff)) - 1
             split_suspect = bool(raw["Close"].pct_change().tail(60).abs().gt(.40).any())
-            frame.attrs.update({"source": "Yahoo!ファイナンス日本版・時系列日足",
-                "latest_date": latest, "session_date": cutoff,
+            frame.attrs.update({"source": audit["情報源"], "latest_date": latest, "session_date": cutoff,
                 "daily_bar_status": "🟢 当日確定" if weekdays <= 0 and not split_suspect else "🔴 更新待ち・価格断絶確認",
                 "domestic_history": True})
-            return t, frame
-        except Exception:
-            return t, None
+            audit.update({"指標行数": len(frame), "日足最終日": latest.strftime("%Y-%m-%d"),
+                          "状態": "取得済（一部ページ未取得）" if error else "取得済"})
+            return t, frame, audit
+        except Exception as exc:
+            audit["詳細"] = type(exc).__name__ + ": " + str(exc)[:240]
+            return t, None, audit
     with ThreadPoolExecutor(max_workers=4) as pool:
-        return {t: frame for t, frame in pool.map(fetch, tickers_tuple) if frame is not None}
+        results = list(pool.map(fetch, tickers_tuple))
+    return ({t: f for t, f, a in results if f is not None}, pd.DataFrame([a for t, f, a in results]))
+
+
+def batch_domestic_finance_audit(tickers_tuple):
+    """日足・買いサインの成否に関わらず、財務の取得結果を残す。評価計算とは別。"""
+    from concurrent.futures import ThreadPoolExecutor
+    def fetch(t):
+        row = {"コード": code(t), "銘柄名": name(t), "財務取得状態": "取得不可",
+               "財務情報源": "", "財務情報鮮度": "", "参考指標基準日": "", "予想EPS対象期": "",
+               "業績発表日": "", "予想EPS": np.nan, "予想PER": np.nan, "PBR": np.nan,
+               "財務参照URL": "", "財務取得経路": "", "財務取得日時": tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")}
+        try:
+            f = _domestic_finance_snapshot(t)
+            row.update({"財務取得状態": "取得済" if finance_freshness_usable(f.get("_freshness")) else "一部取得・最新性未確認",
+                "財務情報源": f.get("_source", ""), "財務情報鮮度": f.get("_freshness", ""),
+                "参考指標基準日": f.get("_reference_date", ""), "予想EPS対象期": f.get("_forecast_period", ""),
+                "業績発表日": f.get("_disclosure_date", ""), "予想EPS": safe_float(f.get("forwardEps")),
+                "予想PER": safe_float(f.get("forwardPE")), "PBR": safe_float(f.get("priceToBook")),
+                "財務参照URL": f.get("_url", ""), "財務取得経路": f.get("_attempts", "")})
+        except Exception as exc:
+            row["財務取得経路"] = type(exc).__name__ + ": " + str(exc)[:500]
+        return row
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return pd.DataFrame(list(pool.map(fetch, tickers_tuple)))
 
 
 def selection_range_metrics(df):
@@ -4958,7 +5014,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.18")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.19")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5089,7 +5145,8 @@ if not run_clicked:
     if (st.session_state.get("v1724_loaded_mode") != live_universe_mode or
             (live_universe_mode == "固定45銘柄" and previous_codes != set(VERIFIED_45_CODES))):
         for key in ("v177_universe_df", "v177_data", "v177_daily_bar_status",
-                    "v177_value_top50", "v1716_churn_audit", "v177_run_error"):
+                    "v177_value_top50", "v1716_churn_audit", "v177_run_error",
+                    "v172419_finance_audit", "v172419_daily_diagnostics"):
             st.session_state.pop(key, None)
 
 if run_clicked:
@@ -5119,8 +5176,18 @@ if run_clicked:
     selected_codes = universe_df["コード"].astype(str).tolist() if not universe_df.empty else []
     all_codes = list(dict.fromkeys(selected_codes + [str(c) for c in all_held_codes]))
     all_tickers = tuple(tickers(",".join(all_codes)))
-    with st.spinner(f"{len(all_tickers)}銘柄の日足を一括取得中…"):
-        data = (batch_domestic_stock_data(all_tickers) if signal_first else batch_stock_data_light(all_tickers, months=15))
+    with st.spinner(f"{len(all_tickers)}銘柄の無料国内財務を取得・確認中…"):
+        st.session_state["v172419_finance_audit"] = batch_domestic_finance_audit(all_tickers)
+    _fa = st.session_state["v172419_finance_audit"]
+    if not _fa.empty:
+        st.caption(f"財務取得済 {int(_fa['財務取得状態'].eq('取得済').sum())} / {len(_fa)}銘柄。日足取得とは独立して確認しました。")
+    with st.spinner(f"{len(all_tickers)}銘柄の国内日足を取得中…"):
+        if signal_first:
+            data, _daily_diagnostics = batch_domestic_stock_data(all_tickers, tokyo_now().isoformat())
+        else:
+            data = batch_stock_data_light(all_tickers, months=15)
+            _daily_diagnostics = pd.DataFrame()
+        st.session_state["v172419_daily_diagnostics"] = _daily_diagnostics
     st.session_state["v177_data"] = data
     st.session_state["v177_daily_bar_status"] = build_daily_bar_status(data)
     mother_data = {t: d for t, d in data.items() if code(t) in selected_codes}
@@ -5128,7 +5195,7 @@ if run_clicked:
         # 固定45の取得失敗でも保有株の売り判定は止めない。
         st.session_state["v177_value_top50"] = pd.DataFrame()
         st.session_state["v1716_churn_audit"] = pd.DataFrame()
-        st.session_state["v177_run_error"] = ("選定対象と保有銘柄の日足を取得できませんでした。"
+        st.session_state["v177_run_error"] = ("日足を取得できないため売買判定を停止しています。財務取得結果と日足の失敗理由は管理者の企業価値タブで確認できます。"
                                                if not data else "")
     else:
         # 企業価値タブは参考表示として維持。売買対象は順位や評価で変えない。
@@ -5153,6 +5220,8 @@ value_top50_df = st.session_state.get("v177_value_top50", pd.DataFrame())
 churn_audit_df = st.session_state.get("v1716_churn_audit", pd.DataFrame())
 run_error = st.session_state.get("v177_run_error", "")
 daily_bar_status_df = st.session_state.get("v177_daily_bar_status", pd.DataFrame())
+finance_acquisition_df = st.session_state.get("v172419_finance_audit", pd.DataFrame())
+daily_acquisition_df = st.session_state.get("v172419_daily_diagnostics", pd.DataFrame())
 
 # ------------------------------------------------------------
 # 固定45銘柄の未保有株の新規BUYと、全保有銘柄のSELLを監視。
@@ -6252,6 +6321,18 @@ with admin_tab:
     ])
 
     with value_tab:
+        st.subheader("無料国内財務の取得結果（日足とは独立）")
+        if not finance_acquisition_df.empty:
+            _ok = int(finance_acquisition_df["財務取得状態"].eq("取得済").sum())
+            st.caption(f"財務取得済 {_ok} / {len(finance_acquisition_df)}銘柄。取得済でも日足不足・割安条件未達なら買い候補にはなりません。")
+            st.dataframe(finance_acquisition_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("『今日の判定を更新』で財務を直接取得します。空欄は財務取得失敗を意味しません。")
+        with st.expander("日足取得の診断（失敗銘柄を含む）", expanded=False):
+            if not daily_acquisition_df.empty:
+                st.dataframe(daily_acquisition_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("判定更新後に表示します。")
         render_allocation_research()
         render_public_research_logic()
         if isinstance(signal_value_df, pd.DataFrame) and not signal_value_df.empty:
@@ -6546,6 +6627,8 @@ try:
             "トレンド振れ幅フィルター実売買":bool(quality_mode),
         }])
         zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("finance_acquisition_status.csv",finance_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("daily_acquisition_diagnostics.csv",daily_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
         for gfs_name, gfs_frame in [("gfs_research_buy.csv", gfs_research_buy),
                                     ("gfs_research_sell.csv", gfs_research_sell),
                                     ("gfs_research_audit.csv", gfs_research_audit),
@@ -6626,6 +6709,10 @@ try:
             "OOS検証済み":False,"OOS_PF参考":np.nan,"5年通算PF参考":np.nan,
             "BUY候補件数":len(buy_export),"割高除外件数":len(overvalued_buy_exclusions_df),
             "企業価値未算定件数":value_unrated_count,
+            "財務直接取得対象件数":len(finance_acquisition_df),
+            "財務直接取得済件数":int(finance_acquisition_df["財務取得状態"].eq("取得済").sum()) if not finance_acquisition_df.empty else 0,
+            "財務直接取得不可件数":int(finance_acquisition_df["財務取得状態"].eq("取得不可").sum()) if not finance_acquisition_df.empty else 0,
+            "日足診断件数":len(daily_acquisition_df),
             "SELL候補件数":len(sell_view),"エラー":run_error,
             "生成日時":st.session_state.get("v177_generated_at","")
         }])

@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.17.24.27
-# BUILD: VER17-24-29-UPDATE-PERFORMANCE-20261018
+# BUILD: VER17-24-30-MULTIBAGGER-CHOICE-20261018
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -44,8 +44,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.29 更新高速化・重複通信削減"
-BUILD = "VER17-24-29-UPDATE-PERFORMANCE-20261018"
+VERSION = "17.24.30 大化け暫定候補・AI参考選択"
+BUILD = "VER17-24-30-MULTIBAGGER-CHOICE-20261018"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -6628,8 +6628,9 @@ MULTIBAGGER_RULES = pd.DataFrame([
     {"項目": "鮮度", "条件": "当日の財務確認、参考指標基準日10日以内、成長実績の取得7日以内、成長比較期の期末から550日以内、連続12か月の実績比較、当日確定日足"},
     {"項目": "除外", "条件": "共通判定が割高、D/Eが200超、FCFが負、営業利益率が0以下（取得できた場合）"},
     {"項目": "研究点の内訳", "条件": "売上成長最大30・利益成長最大25・ROE最大15・予想PER最大15・時価総額最大10・FCF最大5。欠損は0点"},
-    {"項目": "候補採用", "条件": "必須条件とFCF・D/E・営業利益率・共通企業価値の確認を満たし研究点60以上。点数は上昇確率や予想倍率ではない。閾値は未検証"},
+    {"項目": "候補採用", "条件": "主要必須条件と共通企業価値確認を満たし研究点60以上。FCF・D/E・営業利益率の欠損は暫定、3項目取得済みは財務確認済。点数は上昇確率や予想倍率ではない。閾値は未検証"},
     {"項目": "対象範囲", "条件": "現在選択した監視対象の国内財務取得対象。全上場銘柄の網羅ではない"},
+    {"項目": "AI参考選択", "条件": "候補内で財務確認済み優先→研究点降順→財務欠損数昇順→予想PER昇順→コード昇順。追加通信なし。第一候補でも買い指示ではない"},
     {"項目": "想定・限界", "条件": "数年の成長を調べる入口。単年実績で成長継続・競争優位・受注・希薄化は確認できない。GFS非公開動画は未使用"},
 ])
 
@@ -6853,8 +6854,9 @@ def multibagger_fetch_targets(scope, extra, limit, today):
             checked = pd.to_datetime(r.get("成長確認日時", ""), errors="coerce", utc=True)
             if not pd.isna(checked) and (pd.Timestamp.now(tz="UTC") - checked).total_seconds() < 900:
                 continue
-            fetched = str(r.get("成長取得日時", r.get("財務取得日時", "")))[:10]
-            if not multibagger_growth_complete(r) or fetched != str(today): retry.append(c)
+            fetched = pd.to_datetime(str(r.get("成長取得日時", r.get("財務取得日時", "")))[:10], errors="coerce")
+            recent = not pd.isna(fetched) and 0 <= (pd.Timestamp(today).normalize() - fetched.normalize()).days <= 7
+            if not multibagger_growth_complete(r) or not recent: retry.append(c)
     return (unseen + retry)[:int(limit)]
 
 
@@ -6873,6 +6875,7 @@ def build_multibagger_research(finance, price_data, freshness, valuations, buy, 
         rev, earn, roe, pe, cap, fcf, debt, margin, eps, actual = [safe_float(r.get(k)) for k in (
             "売上成長率%", "利益成長率%", "ROE%", "予想PER", "時価総額", "FCF", "D/E", "営業利益率%", "予想EPS", "実績EPS")]
         missing, failed, reasons = [], [], []
+        unconfirmed = [name + "未確認" for name, value in (("FCF", fcf), ("D/E", debt), ("営業利益率", margin)) if not np.isfinite(value)]
         for label, value, threshold in (("売上成長率", rev, 15), ("利益成長率", earn, 20)):
             if not np.isfinite(value): missing.append(label)
             elif value < threshold: failed.append(label + "条件未達")
@@ -6907,8 +6910,6 @@ def build_multibagger_research(finance, price_data, freshness, valuations, buy, 
         label = labels.get(c, "算定不能")
         if any(word in label for word in ("不能", "未確認", "未算定")):
             missing.append("企業価値評価未確認")
-        for name, value in (("FCF", fcf), ("D/E", debt), ("営業利益率", margin)):
-            if not np.isfinite(value): missing.append(name + "未確認（財務健全性）")
         if "割高" in label: failed.append("共通判定が割高")
         for condition, text in ((np.isfinite(debt) and debt > 200, "D/Eが200超"),
                                  (np.isfinite(fcf) and fcf < 0, "FCFが負"),
@@ -6921,7 +6922,7 @@ def build_multibagger_research(finance, price_data, freshness, valuations, buy, 
         score += (10 if 0 < cap <= 100e9 else 5 if 100e9 < cap <= 300e9 else 0)
         score += 5 if np.isfinite(fcf) and fcf > 0 else 0
         score = round(float(score), 1)
-        status = "条件外" if failed else "評価保留" if missing else "大化け候補" if score >= 60 else "成長監視"
+        status = "条件外" if failed else "評価保留" if missing else ("大化け候補〈暫定〉" if unconfirmed else "大化け候補〈財務確認済〉") if score >= 60 else "成長監視"
         risks = [k + "未取得" for k, v in (("ROE", roe), ("時価総額", cap), ("FCF", fcf), ("D/E", debt), ("営業利益率", margin)) if not np.isfinite(v)]
         if label == "算定不能" or "不能" in label or "未確認" in label: risks.append("企業価値評価未確認")
         risks += ["競争優位・成長の持続性・増資予定はIRで確認"]
@@ -6931,11 +6932,11 @@ def build_multibagger_research(finance, price_data, freshness, valuations, buy, 
             if status != "条件外": status = "評価保留"
             missing.append("現在株価")
         rows.append({**{k: r.get(k, "") for k in ("補助指標出典", "補助指標URL", "補助指標基準日", "補完した指標")},
-            "研究判定": status, "コード": c, "銘柄名": r.get("銘柄名", c), "研究点": score,
+            "研究判定": status, "財務健全性確認": "／".join(unconfirmed) or "3指標確認済", "未確認項目数": len(unconfirmed), "コード": c, "銘柄名": r.get("銘柄名", c), "研究点": score,
             "今日の買いと一致": "一致" if c in buys else "なし", "銘柄判定": label, "現在株価": close,
             "選定根拠": "／".join(reasons) or "成長実績未確認", "保留・条件外理由": "／".join(failed + missing),
             "確認するリスク": "／".join(risks), "売上成長率%": rev, "利益成長率%": earn,
-            "予想PER": pe, "ROE%": roe, "時価総額": cap, "FCF": fcf, "D/E": debt,
+            "予想PER": pe, "ROE%": roe, "時価総額": cap, "FCF": fcf, "D/E": debt, "営業利益率%": margin,
             "成長比較期": r.get("成長比較期", ""), "成長比較前期": r.get("成長比較前期", ""),
             "実績EPS": actual, "成長追加確認": r.get("成長追加確認", "未確認"),
             "成長取得経路": r.get("成長取得経路", ""),
@@ -6943,8 +6944,46 @@ def build_multibagger_research(finance, price_data, freshness, valuations, buy, 
             "財務情報源": r.get("財務情報源", ""), "財務参照URL": r.get("財務参照URL", ""),
             "財務取得日時": r.get("財務取得日時", ""), "参考指標基準日": r.get("参考指標基準日", "")})
     out = pd.DataFrame(rows)
-    order = {"大化け候補": 0, "成長監視": 1, "評価保留": 2, "条件外": 3}
+    order = {"大化け候補〈財務確認済〉": 0, "大化け候補〈暫定〉": 1, "成長監視": 2, "評価保留": 3, "条件外": 4}
     return out.assign(_order=out["研究判定"].map(order)).sort_values(["_order", "研究点", "コード"], ascending=[True, False, True]).drop(columns="_order").reset_index(drop=True)
+
+
+def annotate_multibagger_choice(audit):
+    """追加通信なし。確認済み→研究点→欠損数→PER→コードで安定比較する。"""
+    out = audit.copy()
+    out["AI参考順位"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out["AI参考選択"] = "対象外"
+    out["AI選定理由"] = ""
+    if out.empty: return out
+    mask = out["研究判定"].isin(["大化け候補〈財務確認済〉", "大化け候補〈暫定〉"])
+    eligible = out.loc[mask].copy()
+    if eligible.empty: return out
+    eligible["_confirmed"] = eligible["研究判定"].eq("大化け候補〈財務確認済〉").astype(int)
+    eligible["_missing"] = eligible[["ROE%", "時価総額", "FCF", "D/E", "営業利益率%"]].isna().sum(axis=1)
+    eligible = eligible.sort_values(["_confirmed", "研究点", "_missing", "予想PER", "コード"],
+                                    ascending=[False, False, True, True, True])
+    for rank, (index, row) in enumerate(eligible.iterrows(), 1):
+        provisional = row["研究判定"] == "大化け候補〈暫定〉"
+        out.at[index, "AI参考順位"] = rank
+        out.at[index, "AI参考選択"] = ("第一候補（暫定）" if provisional else "第一候補（財務確認済）") if rank == 1 else "比較候補"
+        out.at[index, "AI選定理由"] = (
+            f"財務確認済みを優先し、研究点・欠損数・PERの順で比較した第{rank}位。"
+            f"研究点{row['研究点']:.1f}、売上成長{row['売上成長率%']:.1f}%、"
+            f"利益成長{row['利益成長率%']:.1f}%、予想PER{row['予想PER']:.2f}倍。"
+            + ("財務健全性：" + str(row["財務健全性確認"]) + "。" if provisional else "財務3指標は取得済み。")
+            + "成長継続・競争優位・増資予定は別途確認。")
+    return out
+
+
+def render_multibagger_choice(frame):
+    if frame.empty:
+        st.info("AI参考選択：該当なし。主要条件を満たす候補がないため、選定を見送ります。")
+        return
+    row = frame.sort_values("AI参考順位").iloc[0]
+    st.markdown(f"**AIならこの候補：{row['コード']} {row['銘柄名']}**")
+    st.write(str(row["AI参考選択"]))
+    st.caption(str(row["AI選定理由"]))
+    st.caption("取得済み指標をルールで比較した研究用の参考選択です。将来の上昇予測や買い指示ではありません。未取得銘柄を含む全銘柄での最良を保証するものではありません。")
 
 
 def render_multibagger_cards(frame, limit=3):
@@ -6952,7 +6991,10 @@ def render_multibagger_cards(frame, limit=3):
         st.info("大化け候補の条件を満たす銘柄はありません。評価保留の理由は大化け候補タブで確認できます。")
     for r in frame.head(limit).to_dict("records"):
         st.markdown(f"**{r['コード']} {r['銘柄名']}**　研究点 {r['研究点']:.1f} / 100")
+        st.write(f"{r['研究判定']} ／ AI参考順位 {r['AI参考順位']}")
         st.write(f"今日の買いと一致：{r['今日の買いと一致']} ／ 銘柄判定：{r['銘柄判定']}")
+        if r["未確認項目数"]:
+            st.warning("未確認のリスク：" + r["財務健全性確認"])
         st.caption("根拠：" + r["選定根拠"])
         st.caption("確認：" + r["確認するリスク"])
 
@@ -6971,7 +7013,8 @@ mb_finance = restore_multibagger_optional(mb_finance, finance_acquisition_df, to
 if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
     mb_extra = restore_multibagger_optional(mb_extra, finance_acquisition_df, tokyo_now().date())
 multibagger_audit = build_multibagger_research(mb_finance, data, daily_bar_status_df, valuation_master_df, buy_view)
-multibagger_candidates = multibagger_audit[multibagger_audit["研究判定"].eq("大化け候補")].copy() if not multibagger_audit.empty else pd.DataFrame()
+multibagger_audit = annotate_multibagger_choice(multibagger_audit)
+multibagger_candidates = multibagger_audit[multibagger_audit["AI参考順位"].notna()].sort_values("AI参考順位").copy() if not multibagger_audit.empty else pd.DataFrame()
 
 
 # ------------------------------------------------------------
@@ -7049,7 +7092,8 @@ with multibagger_tab:
         st.caption(f"成長率2項目の取得 {complete_count}/{len(multibagger_audit)}銘柄。未取得は低成長と区別して保留します。")
     if multibagger_sources_paused():
         st.warning("業績取得先がアクセス制限中です。追加通信を停止しています。時間を空けて追加確認してください。未試行分は次回へ残します。")
-    st.caption("FCF・D/E・営業利益率の未取得、企業価値未確認は候補確定を保留します。無料公開表にない項目は自動補完できません。成長実績は7日以内に再確認します。")
+    st.caption("主要条件を満たし、FCF・D/E・営業利益率に欠損がある場合は暫定候補として表示します。企業価値・主要データ未確認は評価保留、取得済みの健全性指標が除外条件に該当すれば条件外です。")
+    render_multibagger_choice(multibagger_candidates)
     render_multibagger_cards(multibagger_candidates)
     st.caption("取得済み財務に成長率がない場合は、下のボタンでトレーダーズ・株探の無料公開業績表を追加確認できます。監視対象の一部を順番に確認します。")
     st.caption("通常の売買更新では研究用の追加通信を行いません。下の追加確認ボタンで取得し、結果を保存・復元します。サーバー再構築で保存が消えた場合は追加取得結果CSVを読み込めます。過去の取得日は書き換えず、鮮度条件を満たさないデータは保留します。")
@@ -7441,6 +7485,7 @@ try:
             "トレンド振れ幅フィルター実売買":bool(quality_mode),
         }])
         zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("update_processing_times.csv", pd.DataFrame([{"処理": k, "秒": v} for k, v in st.session_state.get("v172429_update_times", {}).items()]).to_csv(index=False, encoding="utf-8-sig"))
         zf.writestr("finance_acquisition_status.csv",finance_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
         for mb_filename, mb_frame in (("multibagger_candidates.csv", multibagger_candidates),
                                      ("multibagger_research_audit.csv", multibagger_audit),

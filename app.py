@@ -44,7 +44,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.27 大化け候補・成長取得と保存復元修正"
+VERSION = "17.24.28 大化け研究・取得制限と判定品質修正"
 BUILD = "VER17-24-26-MARKET-OPTIONAL-FIX-20261017"
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -6589,10 +6589,10 @@ def render_gfs_research(price_data, freshness, holdings, value_frames, live_audi
 # 大化け候補は独立した研究スクリーニング。既存売買・配分・損切りへ接続しない。
 MULTIBAGGER_RULES = pd.DataFrame([
     {"項目": "候補の必須条件", "条件": "実績売上成長率15%以上・実績利益成長率20%以上・実績EPSと予想EPSが正・予想PER0超35以下"},
-    {"項目": "鮮度", "条件": "当日の財務確認、参考指標基準日10日以内、成長比較期の期末から550日以内、連続12か月の実績比較、当日確定日足"},
+    {"項目": "鮮度", "条件": "当日の財務確認、参考指標基準日10日以内、成長実績の取得7日以内、成長比較期の期末から550日以内、連続12か月の実績比較、当日確定日足"},
     {"項目": "除外", "条件": "共通判定が割高、D/Eが200超、FCFが負、営業利益率が0以下（取得できた場合）"},
     {"項目": "研究点の内訳", "条件": "売上成長最大30・利益成長最大25・ROE最大15・予想PER最大15・時価総額最大10・FCF最大5。欠損は0点"},
-    {"項目": "候補採用", "条件": "必須条件を全て満たし研究点60以上。点数は上昇確率や予想倍率ではない。閾値は未検証"},
+    {"項目": "候補採用", "条件": "必須条件とFCF・D/E・営業利益率・共通企業価値の確認を満たし研究点60以上。点数は上昇確率や予想倍率ではない。閾値は未検証"},
     {"項目": "対象範囲", "条件": "現在選択した監視対象の国内財務取得対象。全上場銘柄の網羅ではない"},
     {"項目": "想定・限界", "条件": "数年の成長を調べる入口。単年実績で成長継続・競争優位・受注・希薄化は確認できない。GFS非公開動画は未使用"},
 ])
@@ -6601,7 +6601,10 @@ MULTIBAGGER_RULES = pd.DataFrame([
 
 def _parse_traders_growth(html, today):
     """通期実績同士の売上・純利益を比較。会社予想・中間決算を混ぜない。"""
-    values = _parse_traders_finance(html, today)
+    try:
+        values = _parse_traders_finance(html, today)
+    except ValueError:
+        values = {"_source": "トレーダーズ・ウェブ・無料公開業績表"}
     parser = DomesticHistoryParser(); parser.feed(html)
     rows = parser.rows
     start = next((i for i, r in enumerate(rows) if len(r) > 2 and re.fullmatch(r"20[0-9]{2}年[0-9]{2}月", r[1].strip())), None)
@@ -6618,7 +6621,10 @@ def _parse_traders_growth(html, today):
     (latest, ni), (previous, oi) = actuals[:2]
     if (pd.Period(latest, freq="M") - pd.Period(previous, freq="M")).n != 12:
         raise ValueError("通期実績の間隔が12か月でない")
-    values.update({"_growth_period": latest, "_growth_previous_period": previous})
+    values.update({"_growth_period": latest, "_growth_previous_period": previous,
+                   "_actual_period": latest})
+    epsrow = next((r for r in rows[start+2:start+10] if r and _finance_plain(r[0]) == "1株利益(円)"), None)
+    values["trailingEps"] = _finance_number(epsrow[ni]) if epsrow and ni < len(epsrow) else np.nan
     for label, key in (("売上高(百万円)", "revenueGrowth"), ("純利益(百万円)", "earningsGrowth")):
         row = next((r for r in rows[start+2:start+10] if r and _finance_plain(r[0]).replace("（", "(").replace("）", ")") == label), None)
         if row and max(ni, oi) < len(row):
@@ -6748,22 +6754,51 @@ def save_multibagger_growth(frame):
         if temp_path and os.path.exists(temp_path): os.unlink(temp_path)
 
 
+def merge_multibagger_growth(finance, extra):
+    """当日財務は維持し、実績とその出典だけを別系列として合流する。"""
+    if not isinstance(extra, pd.DataFrame) or extra.empty: return finance.copy()
+    cached = {str(r["コード"]): r for r in extra.to_dict("records")}
+    fields = ("売上成長率%", "利益成長率%", "実績EPS", "実績EPS対象期",
+              "成長比較期", "成長比較前期", "成長確認日時", "成長取得日時",
+              "成長追加確認", "成長取得経路", "成長出典URL", "成長情報源")
+    rows = []
+    for r in finance.to_dict("records"):
+        b = cached.get(str(r["コード"]), {})
+        for k in fields:
+            if k in b: r[k] = b[k]
+        if b:
+            r["成長取得日時"] = b.get("成長取得日時", b.get("財務取得日時", ""))
+            r["成長出典URL"] = b.get("成長出典URL", b.get("財務参照URL", ""))
+            r["成長情報源"] = b.get("成長情報源", b.get("財務情報源", ""))
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def multibagger_sources_paused():
+    state = _finance_transport_state()
+    with state["lock"]:
+        return all(state["hosts"].get(host, {}).get("blocked_until", 0) > time.monotonic()
+                   for host in ("www.traders.co.jp", "kabutan.jp"))
+
+
 def collect_multibagger_growth(finance, extra, scope, limit, today):
     additions = []
     for c in multibagger_fetch_targets(scope, extra, limit, today):
+        # 全取得先が休止中なら未試行分を失敗扱いにせず、次回へ残す。
+        if multibagger_sources_paused(): break
         original = finance[finance["コード"].astype(str).eq(c)].iloc[0].to_dict()
         original["成長確認日時"] = tokyo_now().isoformat()
         try:
             f = fetch_multibagger_growth(c, today)
-            original.update(multibagger_finance_fields(f))
-            original.update({"予想PER": safe_float(f.get("forwardPE")), "予想EPS": safe_float(f.get("forwardEps")),
-                "実績EPS": safe_float(f.get("trailingEps")), "実績EPS対象期": f.get("_actual_period", ""),
-                "財務情報源": f.get("_source", ""), "財務情報鮮度": f.get("_freshness", ""),
-                "参考指標基準日": f.get("_reference_date", ""), "財務参照URL": f.get("_url", ""),
-                "財務取得日時": tokyo_now().isoformat(), "財務データ区分": "研究用追加取得",
-                "成長追加確認": f.get("_growth_status", "一部取得・評価保留"), "成長取得経路": f.get("_growth_attempts", "")})
+            incoming = multibagger_finance_fields(f)
+            # 部分取得・失敗で既存の完全な比較実績を消さない。
+            complete = all(np.isfinite(safe_float(f.get(k))) for k in ("revenueGrowth", "earningsGrowth", "trailingEps"))
+            if complete or not multibagger_growth_complete(original):
+                original.update({k: incoming[k] for k in ("売上成長率%", "利益成長率%", "成長比較期", "成長比較前期")})
+                original.update({"実績EPS": safe_float(f.get("trailingEps")), "実績EPS対象期": f.get("_actual_period", ""),
+                    "成長取得日時": tokyo_now().isoformat(), "成長出典URL": f.get("_url", ""), "成長情報源": f.get("_source", "")})
+            original.update({"成長追加確認": f.get("_growth_status", "一部取得・評価保留"), "成長取得経路": f.get("_growth_attempts", "")})
         except Exception as exc:
-            # 失敗時は以前の数値と取得日を維持。確認日時だけを更新する。
             original["成長追加確認"] = "取得失敗・再確認対象"
             original["成長取得経路"] = type(exc).__name__ + ": " + str(exc)[:1000]
         additions.append(original)
@@ -6778,7 +6813,12 @@ def multibagger_fetch_targets(scope, extra, limit, today):
     for c in sorted(scope):
         r = records.get(c)
         if r is None: unseen.append(c)
-        elif not multibagger_growth_complete(r) or str(r.get("財務取得日時", ""))[:10] != str(today): retry.append(c)
+        else:
+            checked = pd.to_datetime(r.get("成長確認日時", ""), errors="coerce", utc=True)
+            if not pd.isna(checked) and (pd.Timestamp.now(tz="UTC") - checked).total_seconds() < 900:
+                continue
+            fetched = str(r.get("成長取得日時", r.get("財務取得日時", "")))[:10]
+            if not multibagger_growth_complete(r) or fetched != str(today): retry.append(c)
     return (unseen + retry)[:int(limit)]
 
 
@@ -6826,7 +6866,13 @@ def build_multibagger_research(finance, price_data, freshness, valuations, buy, 
             if pd.isna(end) or pd.isna(prev) or (end-prev).n != 12 or not age_ok(end.end_time.date(), 550): missing.append("成長比較期間")
         except (ValueError, TypeError, AttributeError): missing.append("成長比較期間")
         if daily.get(c) != "🟢 当日確定": missing.append("最新確定日足")
+        if not age_ok(str(r.get("成長取得日時", r.get("財務取得日時", "")))[:10], 7):
+            missing.append("成長実績の再確認（7日以内）")
         label = labels.get(c, "算定不能")
+        if any(word in label for word in ("不能", "未確認", "未算定")):
+            missing.append("企業価値評価未確認")
+        for name, value in (("FCF", fcf), ("D/E", debt), ("営業利益率", margin)):
+            if not np.isfinite(value): missing.append(name + "未確認（財務健全性）")
         if "割高" in label: failed.append("共通判定が割高")
         for condition, text in ((np.isfinite(debt) and debt > 200, "D/Eが200超"),
                                  (np.isfinite(fcf) and fcf < 0, "FCFが負"),
@@ -6857,6 +6903,7 @@ def build_multibagger_research(finance, price_data, freshness, valuations, buy, 
             "成長比較期": r.get("成長比較期", ""), "成長比較前期": r.get("成長比較前期", ""),
             "実績EPS": actual, "成長追加確認": r.get("成長追加確認", "未確認"),
             "成長取得経路": r.get("成長取得経路", ""),
+            "成長取得日時": r.get("成長取得日時", ""), "成長出典URL": r.get("成長出典URL", ""),
             "財務情報源": r.get("財務情報源", ""), "財務参照URL": r.get("財務参照URL", ""),
             "財務取得日時": r.get("財務取得日時", ""), "参考指標基準日": r.get("参考指標基準日", "")})
     out = pd.DataFrame(rows)
@@ -6882,17 +6929,17 @@ mb_extra = st.session_state["v172423_growth_extra"]
 mb_scope = set(mb_finance["コード"].astype(str)) if "コード" in mb_finance else set()
 if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
     mb_extra = mb_extra[mb_extra["コード"].astype(str).isin(mb_scope)]
-    mb_finance = pd.concat([mb_finance, mb_extra], ignore_index=True).drop_duplicates("コード", keep="last")
+    mb_finance = merge_multibagger_growth(mb_finance, mb_extra)
 # 通常更新でも不足分を20件ずつ追加確認。全件の一括通信を避ける。
 if run_clicked and mb_scope:
     needed = {str(r["コード"]) for r in mb_finance.to_dict("records")
-              if not multibagger_growth_complete(r) or str(r.get("財務取得日時", ""))[:10] != str(tokyo_now().date())}
+              if not multibagger_growth_complete(r) or str(r.get("成長取得日時", r.get("財務取得日時", "")))[:10] != str(tokyo_now().date())}
     if needed:
         with st.spinner("成長実績の不足分を追加確認中（最大20銘柄）…"):
             mb_extra = collect_multibagger_growth(mb_finance, mb_extra, needed, 20, tokyo_now().date())
         st.session_state["v172423_growth_extra"] = mb_extra
         st.session_state["v172427_growth_save"] = save_multibagger_growth(mb_extra)
-        mb_finance = pd.concat([mb_finance, mb_extra], ignore_index=True).drop_duplicates("コード", keep="last")
+        mb_finance = merge_multibagger_growth(mb_finance, mb_extra)
 mb_finance = restore_multibagger_optional(mb_finance, finance_acquisition_df, tokyo_now().date())
 if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
     mb_extra = restore_multibagger_optional(mb_extra, finance_acquisition_df, tokyo_now().date())
@@ -6970,6 +7017,12 @@ with multibagger_tab:
     st.caption("数年で大きく成長する企業を探す入口です。研究点は上昇確率・予想倍率ではありません。GFS非公開動画の再現ではなく、成績未検証の独立条件です。")
     st.info("注文判断は『今日の売買』で確認してください。候補入りだけでは買い指示になりません。既存の利確・終値7%損切りは引き続き適用します。")
     st.write(f"調査対象 {len(multibagger_audit)}銘柄 ／ 大化け候補 {len(multibagger_candidates)}銘柄")
+    if not multibagger_audit.empty:
+        complete_count = int(multibagger_audit[["売上成長率%", "利益成長率%"]].notna().all(axis=1).sum())
+        st.caption(f"成長率2項目の取得 {complete_count}/{len(multibagger_audit)}銘柄。未取得は低成長と区別して保留します。")
+    if multibagger_sources_paused():
+        st.warning("業績取得先がアクセス制限中です。追加通信を停止しています。時間を空けて追加確認してください。未試行分は次回へ残します。")
+    st.caption("FCF・D/E・営業利益率の未取得、企業価値未確認は候補確定を保留します。無料公開表にない項目は自動補完できません。成長実績は7日以内に再確認します。")
     render_multibagger_cards(multibagger_candidates)
     st.caption("取得済み財務に成長率がない場合は、下のボタンでトレーダーズ・株探の無料公開業績表を追加確認できます。監視対象の一部を順番に確認します。")
     st.caption("『今日の判定を更新』でも不足分を最大20銘柄ずつ確認し、取得結果を保存・復元します。サーバー再構築で保存が消えた場合は追加取得結果CSVを読み込めます。過去の取得日は書き換えず、鮮度条件を満たさないデータは保留します。")
@@ -6991,11 +7044,11 @@ with multibagger_tab:
             st.error("CSVを読み込めませんでした: " + str(exc))
         else:
             st.rerun()
-    growth_limit = st.number_input("1回に成長実績を追加確認する件数", 5, 100, 20, 5, key="v172423_growth_limit")
+    growth_limit = st.number_input("1回に成長実績を追加確認する件数", 5, 20, 10, 5, key="v172423_growth_limit")
     if st.button("成長実績を追加確認", key="v172423_growth_fetch", disabled=not mb_scope):
         targets = multibagger_fetch_targets(mb_scope, mb_extra, growth_limit, tokyo_now().date())
         if not targets:
-            st.info("追加確認は一巡しました。再確認するときは下のリセットボタンを押してください。")
+            st.info("追加確認の対象がないか、再試行の待機中です。失敗分は15分以上空けて再確認してください。")
         else:
             with st.spinner("国内無料公開の連続する年度実績を確認中…"):
                 combined_growth = collect_multibagger_growth(mb_finance, mb_extra, mb_scope, growth_limit, tokyo_now().date())

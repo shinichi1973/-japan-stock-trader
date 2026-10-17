@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.17.24.27
-# BUILD: VER17-24-26-MARKET-OPTIONAL-FIX-20261017
+# BUILD: VER17-24-29-UPDATE-PERFORMANCE-20261018
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -44,8 +44,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.28 大化け研究・取得制限と判定品質修正"
-BUILD = "VER17-24-26-MARKET-OPTIONAL-FIX-20261017"
+VERSION = "17.24.29 更新高速化・重複通信削減"
+BUILD = "VER17-24-29-UPDATE-PERFORMANCE-20261018"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1785,6 +1785,7 @@ def _finance_paced_get(url):
     return response
 
 
+@st.cache_data(ttl=300, max_entries=2000, show_spinner=False)
 def _fetch_free_finance_html(url):
     # タイムアウト・接続切断も再試行。403/405/429は連打しない。
     for attempt in range(3):
@@ -1913,7 +1914,7 @@ def _domestic_finance_refresh(t):
     raise ValueError(" / ".join(attempts))
 
 
-def _domestic_finance_snapshot(t):
+def _domestic_finance_snapshot_uncached(t):
     # Streamlitの短期メモリキャッシュより先に保存日時・使用区分を確認する。
     cached = _finance_cache_read(t)
     if _finance_cache_fresh(cached, tokyo_now()):
@@ -1922,6 +1923,23 @@ def _domestic_finance_snapshot(t):
         values["_attempts"] = "再アクセス抑制: " + values["_cache_mode"] + " / 前回: " + str(values.get("_attempts", ""))
         return values
     return _domestic_finance_refresh(t)
+
+
+@st.cache_data(ttl=900, max_entries=1500, show_spinner=False)
+def _domestic_finance_outcome(t, session_key):
+    # 失敗も結果として短期保存し、監査→参考評価→共通判定での再通信を防ぐ。
+    # 日付・16時の境界はキーで分ける。取得日時は書き換えない。
+    try:
+        return _domestic_finance_snapshot_uncached(t), ""
+    except Exception as exc:
+        return None, type(exc).__name__ + ": " + str(exc)[:1000]
+
+
+def _domestic_finance_snapshot(t):
+    now = tokyo_now()
+    values, error = _domestic_finance_outcome(t, (str(now.date()), now.hour >= 16))
+    if error: raise ValueError(error)
+    return values
 
 
 def financial_unavailable_label(status, freshness):
@@ -3474,6 +3492,7 @@ def _percentile_score(series, higher_better=True):
     return r.fillna(50.0).clip(0, 100)
 
 
+@st.cache_data(ttl=900, max_entries=1200, show_spinner=False)
 def stoch_churn_diagnostic(df):
     """判定日までの日足のみを用いた、新規買い対象の短期反転検査。"""
     empty = {"直近20日クロス回数": 0, "直近30日早期反転回数": 0,
@@ -3727,7 +3746,8 @@ def _finance_acquisition_state(f):
     return "取得済（基準日・対象期未確認）"
 
 
-def batch_domestic_finance_audit(tickers_tuple):
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False)
+def batch_domestic_finance_audit(tickers_tuple, session_key=""):
     """日足・買いサインの成否に関わらず、財務の取得結果を残す。評価計算とは別。"""
     from concurrent.futures import ThreadPoolExecutor
     def fetch(t):
@@ -4759,6 +4779,7 @@ def stoch_quality_frame(df, stop_pct=7.0, band_window=20):
     return x
 
 
+@st.cache_data(ttl=900, max_entries=1200, show_spinner=False)
 def stoch_signal_quality(df):
     """直近の買いクロスの事後成績。未成熟な直近5日は数えない。"""
     x = stoch_quality_frame(df)
@@ -5485,6 +5506,8 @@ if not run_clicked:
             st.session_state.pop(key, None)
 
 if run_clicked:
+    _update_started = time.perf_counter()
+    _update_times = {}
     st.session_state.pop("v172412_history_refresh_required", None)
     universe_error = ""
     try:
@@ -5511,18 +5534,23 @@ if run_clicked:
     selected_codes = universe_df["コード"].astype(str).tolist() if not universe_df.empty else []
     all_codes = list(dict.fromkeys(selected_codes + [str(c) for c in all_held_codes]))
     all_tickers = tuple(tickers(",".join(all_codes)))
+    _stage_started = time.perf_counter()
     with st.spinner(f"{len(all_tickers)}銘柄の無料国内財務を取得・確認中…"):
-        st.session_state["v172419_finance_audit"] = batch_domestic_finance_audit(all_tickers)
+        st.session_state["v172419_finance_audit"] = batch_domestic_finance_audit(all_tickers, (str(tokyo_now().date()), tokyo_now().hour >= 16))
+    _update_times["財務確認"] = round(time.perf_counter() - _stage_started, 2)
     _fa = st.session_state["v172419_finance_audit"]
     if not _fa.empty:
         st.caption(f"財務の必要指標確認済 {int(_fa['財務取得状態'].eq('取得済').sum())} / {len(_fa)}銘柄。日足取得とは独立して確認しました。")
+    _stage_started = time.perf_counter()
     with st.spinner(f"{len(all_tickers)}銘柄の国内日足を取得中…"):
         if signal_first:
-            data, _daily_diagnostics = batch_domestic_stock_data(all_tickers, tokyo_now().isoformat(), 300 if replacement_live else 150)
+            data, _daily_diagnostics = batch_domestic_stock_data(all_tickers, (str(tokyo_now().date()), tokyo_now().hour >= 16), 300 if replacement_live else 150)
         else:
             data = batch_stock_data_light(all_tickers, months=15)
             _daily_diagnostics = pd.DataFrame()
         st.session_state["v172419_daily_diagnostics"] = _daily_diagnostics
+    _update_times["日足確認"] = round(time.perf_counter() - _stage_started, 2)
+    _stage_started = time.perf_counter()
     st.session_state["v177_data"] = data
     st.session_state["v177_daily_bar_status"] = build_daily_bar_status(data)
     mother_data = {t: d for t, d in data.items() if code(t) in selected_codes}
@@ -5546,6 +5574,14 @@ if run_clicked:
         st.session_state["v177_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
         st.session_state["v177_run_error"] = ("TOPIX＋日経225から50銘柄を選定できませんでした。新規買いを停止し、保有銘柄の売り判定のみ行います。"
             if live_universe_mode == "TOPIX＋日経225からAI選定TOP50" and value_top50_df.empty else "")
+    _update_times["一次選抜・参考評価"] = round(time.perf_counter() - _stage_started, 2)
+    _update_times["取得〜参考評価合計"] = round(time.perf_counter() - _update_started, 2)
+    st.session_state["v172429_update_times"] = _update_times
+
+if st.session_state.get("v172429_update_times"):
+    with st.expander("更新処理の所要時間", expanded=False):
+        st.dataframe(pd.DataFrame([{"処理": k, "秒": v} for k, v in st.session_state["v172429_update_times"].items()]), hide_index=True)
+        st.caption("通信と一次選抜の実測値です。この後の売買表作成・画面描画時間は含みません。短時間の再更新は保存結果を再利用します。")
 
 universe_df = st.session_state.get("v177_universe_df", pd.DataFrame())
 if isinstance(universe_df, pd.DataFrame) and not universe_df.empty:
@@ -6359,7 +6395,7 @@ def triple_news_purchase_status(selected, buy_view, signal_audit, held_codes, bu
 def render_triple_news_pick(compare, freshness, price_data, held_codes, values, buy_view, signal_audit, buying_power, block_unrated, run_clicked):
     st.subheader("⭐ 今日の一推し（無料材料評価）")
     with st.expander("無料ニュース評価の設定", expanded=False):
-        auto = st.checkbox("今日の判定を更新と一緒に無料ニュースも更新", value=True, key="v172410_news_auto")
+        auto = st.checkbox("今日の判定を更新と一緒に無料ニュースも更新", value=False, key="v172429_news_auto")
         st.caption("3指標すべて点灯した銘柄を、直近7日間の無料公開RSSの見出しで比較します。有料API・APIキーは使いません。同じ結果は30分間再利用します。")
         st.caption("生成AIの読解ではなく、上方修正・自社株買い等の語で評価します。本文未確認のため、根拠リンクで材料を確認してください。")
     candidates, exclusions = triple_news_candidates(compare, freshness, price_data, held_codes, values)
@@ -6930,16 +6966,7 @@ mb_scope = set(mb_finance["コード"].astype(str)) if "コード" in mb_finance
 if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
     mb_extra = mb_extra[mb_extra["コード"].astype(str).isin(mb_scope)]
     mb_finance = merge_multibagger_growth(mb_finance, mb_extra)
-# 通常更新でも不足分を20件ずつ追加確認。全件の一括通信を避ける。
-if run_clicked and mb_scope:
-    needed = {str(r["コード"]) for r in mb_finance.to_dict("records")
-              if not multibagger_growth_complete(r) or str(r.get("成長取得日時", r.get("財務取得日時", "")))[:10] != str(tokyo_now().date())}
-    if needed:
-        with st.spinner("成長実績の不足分を追加確認中（最大20銘柄）…"):
-            mb_extra = collect_multibagger_growth(mb_finance, mb_extra, needed, 20, tokyo_now().date())
-        st.session_state["v172423_growth_extra"] = mb_extra
-        st.session_state["v172427_growth_save"] = save_multibagger_growth(mb_extra)
-        mb_finance = merge_multibagger_growth(mb_finance, mb_extra)
+# 通常の売買更新では研究用通信をしない。専用ボタンで明示更新する。
 mb_finance = restore_multibagger_optional(mb_finance, finance_acquisition_df, tokyo_now().date())
 if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
     mb_extra = restore_multibagger_optional(mb_extra, finance_acquisition_df, tokyo_now().date())
@@ -7025,7 +7052,7 @@ with multibagger_tab:
     st.caption("FCF・D/E・営業利益率の未取得、企業価値未確認は候補確定を保留します。無料公開表にない項目は自動補完できません。成長実績は7日以内に再確認します。")
     render_multibagger_cards(multibagger_candidates)
     st.caption("取得済み財務に成長率がない場合は、下のボタンでトレーダーズ・株探の無料公開業績表を追加確認できます。監視対象の一部を順番に確認します。")
-    st.caption("『今日の判定を更新』でも不足分を最大20銘柄ずつ確認し、取得結果を保存・復元します。サーバー再構築で保存が消えた場合は追加取得結果CSVを読み込めます。過去の取得日は書き換えず、鮮度条件を満たさないデータは保留します。")
+    st.caption("通常の売買更新では研究用の追加通信を行いません。下の追加確認ボタンで取得し、結果を保存・復元します。サーバー再構築で保存が消えた場合は追加取得結果CSVを読み込めます。過去の取得日は書き換えず、鮮度条件を満たさないデータは保留します。")
     save_status = st.session_state.get("v172427_growth_save", "")
     if str(save_status).startswith("保存失敗"):
         st.warning("成長実績を保存できませんでした。追加取得結果CSVをダウンロードしてください。" + save_status)

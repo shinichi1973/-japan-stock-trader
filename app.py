@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.17.24.27
-# BUILD: VER17-24-32-HOLDINGS-SYNC-20261018
+# BUILD: VER17-24-33-FINANCE-VALUATION-20261018
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -44,8 +44,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.32 後入力保有の財務・日足自動補完"
-BUILD = "VER17-24-32-HOLDINGS-SYNC-20261018"
+VERSION = "17.24.33 財務欠損理由・EPS整合性判定修正"
+BUILD = "VER17-24-33-FINANCE-VALUATION-20261018"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -1555,6 +1555,7 @@ def _parse_domestic_finance(html, today):
               "発行済株式数":"sharesOutstanding"}
     reference_date = None
     forecast_period = ""
+    forecast_eps_unavailable = False
     for block in re.findall(r'<dl\b[^>]*>(.*?)</dl>', section, re.S | re.I):
         dt = re.search(r'<dt\b[^>]*>(.*?)</dt>', block, re.S | re.I)
         dd = re.search(r'<dd\b[^>]*>(.*?)</dd>', block, re.S | re.I)
@@ -1566,6 +1567,7 @@ def _parse_domestic_finance(html, today):
             continue
         value_text = plain(dd.group(1)).replace("(連)", "").replace("(単)", "")
         if key == "forwardEps":
+            forecast_eps_unavailable = bool(re.match(r"[-－―—]{2,}", value_text))
             period = re.search(r'\((20\d{2})/(\d{2})\)', value_text)
             if period: forecast_period = "-".join(period.groups())
         number = re.match(r'([-+−]?[0-9][0-9,]*(?:\.[0-9]+)?)', value_text)
@@ -1604,6 +1606,7 @@ def _parse_domestic_finance(html, today):
         valid_period = -100 <= (period_end.date() - today).days <= 550
     usable = valid_date and valid_period and values.get("forwardPE", 0) > 0 and values.get("forwardEps", 0) > 0
     values["_reference_date"] = str(reference_date or "")
+    values["_forecast_eps_unavailable"] = forecast_eps_unavailable
     values["_forecast_period"] = forecast_period
     values["_freshness"] = DOMESTIC_FINANCE_FRESHNESS if usable else "国内参考指標の基準日・予想期を確認できず"
     values["_source"] = "Yahoo!ファイナンス日本版・無料公開参考指標"
@@ -1692,9 +1695,9 @@ def _parse_kabutan_finance(html, today):
 
 
 def _parse_traders_finance(html, today):
-    parser = DomesticHistoryParser(); parser.feed(html)
+    parser = DomesticHistoryParser(); parser.feed(re.sub(r"<br\s*/?>", "\n", html, flags=re.I))
     rows = parser.rows
-    plain = _finance_plain(html)
+    plain = _finance_plain(html).replace("：", ":")
     quoted = re.search(r"株価[：:]([0-9]{4}/[0-9]{2}/[0-9]{2})", plain)
     reference = pd.Timestamp(quoted.group(1)).date() if quoted else None
     values = {"_source": "トレーダーズ・ウェブ・無料公開業績表", "_reference_date": str(reference or ""),
@@ -1713,7 +1716,7 @@ def _parse_traders_finance(html, today):
             value = _finance_number(epsrow[i].splitlines()[0])
             if np.isfinite(value): values[key] = value
     # 同一ページの現在株価を読む。予想EPSは計算で捏造せず、表の通期会社予想だけを使う。
-    quote_block = re.search(r'<span[^>]*class=["\']close_price["\'][^>]*>(.*?)</span>', html, re.S)
+    quote_block = re.search(r'<span[^>]*class=["\'][^"\']*\bclose_price\b[^"\']*["\'][^>]*>(.*?)</span>', html, re.S)
     # 株価は日足側からも渡されるため、見つからなくても取得失敗にはしない。
     if quote_block:
         price = _finance_number(_finance_plain(quote_block.group(1)).lstrip("円"))
@@ -1857,6 +1860,7 @@ def _finance_cache_fresh(payload, today_now):
         values = payload["values"]
         age = (today_now - fetched).total_seconds()
         complete = finance_freshness_usable(values.get("_freshness"))
+        if not complete and values.get("_parser_version") != 33: return False
         if today_now.hour >= 16 and fetched.hour < 16: return False
         # 正常取得は当日6時間、数値不足は15分だけ再利用し無駄な再取得を防ぐ。
         ttl = 6 * 3600 if complete else 15 * 60
@@ -1890,7 +1894,7 @@ def _domestic_finance_refresh(t):
             if not title or not re.search(r"(?<![0-9A-Z])" + re.escape(code(t)) + r"(?:\.T)?(?![0-9A-Z])", _finance_plain(title.group(1)), re.I):
                 raise ValueError("取得ページの銘柄コードを確認できず（別ページ・アクセス制限の可能性）")
             values = parser(html, now.date())
-            values.update({"_url": url, "_fetched_at": tokyo_now().isoformat(), "_cache_mode": "今回取得"})
+            values.update({"_url": url, "_fetched_at": tokyo_now().isoformat(), "_cache_mode": "今回取得", "_parser_version": 33})
             attempts.append(label + ": " + values.get("_freshness", "不明"))
             partials.append(values)
             if finance_freshness_usable(values.get("_freshness")):
@@ -1937,12 +1941,39 @@ def _domestic_finance_outcome(t, session_key):
 
 def _domestic_finance_snapshot(t):
     now = tokyo_now()
-    values, error = _domestic_finance_outcome(t, (str(now.date()), now.hour >= 16))
+    values, error = _domestic_finance_outcome(t, (str(now.date()), now.hour >= 16, 33))
     if error: raise ValueError(error)
     return values
 
 
+def finance_evaluation_reason(values):
+    """データ不具合と会社予想未提供・赤字を区別。買い許可には転用しない。"""
+    if values.get("_cache_mode") == "過去保存値・表示のみ":
+        return "過去保存値・最新未確認"
+    eps = safe_float(values.get("forwardEps"))
+    if np.isfinite(eps) and eps <= 0:
+        return "赤字・ゼロ利益予想（PER評価対象外）"
+    if values.get("_forecast_eps_unavailable") and not np.isfinite(eps):
+        return "会社予想EPS未提供（予想PER算定不可）"
+    if not np.isfinite(eps):
+        return "予想EPS未取得・確認待ち"
+    if not np.isfinite(safe_float(values.get("forwardPE"))):
+        return "予想PER未取得・確認待ち"
+    if not finance_freshness_usable(values.get("_freshness")):
+        return "基準日・予想対象期を確認できず"
+    return ""
+
+
+def eps_price_consistent(price, eps, pe):
+    """独立取得したEPSとPERの株価基準が10%以内で整合するか。"""
+    vals = [safe_float(v) for v in (price, eps, pe)]
+    return bool(all(np.isfinite(v) and v > 0 for v in vals)
+                and abs(vals[1] * vals[2] / vals[0] - 1) <= .10)
+
+
 def financial_unavailable_label(status, freshness):
+    if str(status).startswith("評価保留:"):
+        return "⚠️ " + str(status).split(":", 1)[1]
     if str(status) != "OK":
         return "⚠️ 財務取得不可・算定不能"
     if not finance_freshness_usable(freshness):
@@ -2127,11 +2158,15 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
         if np.isfinite(eps_fair_used) and eps_fair_used > 0 and np.isfinite(price) and price > 0:
             eps_price_ratio = eps_fair_used / price
             if eps_price_ratio > 3.0 or eps_price_ratio < (1.0 / 3.0):
-                valuation_guard_notes.append(
-                    f"EPS理論株価が現在株価の{eps_price_ratio:.2f}倍で異常域→EPS評価除外"
-                )
-                eps_fair_used = np.nan
-                eps_guarded = True
+                if (domestic is not None and finance_freshness_usable(domestic.get("_freshness"))
+                        and not split_warning and eps_price_consistent(price, forward_eps_adj, forward_pe)):
+                    valuation_guard_notes.append(
+                        f"EPS理論株価は現在株価の{eps_price_ratio:.2f}倍。EPS×予想PERと株価は整合。業種PER仮定による参考値")
+                else:
+                    valuation_guard_notes.append(
+                        f"EPS理論株価が現在株価の{eps_price_ratio:.2f}倍で基準整合未確認→EPS評価除外")
+                    eps_fair_used = np.nan
+                    eps_guarded = True
 
         # 2) アナリスト目標株価も現在株価から極端なら除外。
         #    分割検出の有無にかかわらず、古い基準値・単位ズレの混入を防ぐ。
@@ -2236,6 +2271,9 @@ def fundamental_snapshot(t, market_price_hint=np.nan):
         ))
 
         source_status = "OK" if has_fundamentals else "取得不可: 企業価値指標が全て欠損"
+        evaluation_reason = finance_evaluation_reason(domestic) if domestic else "財務通信失敗・有効指標なし"
+        if has_fundamentals and evaluation_reason:
+            source_status = "評価保留:" + evaluation_reason
         freshness = (                     "Yahoo期末日が未来" if yahoo_quarter_age is not None and yahoo_quarter_age < 0 else
                      "Yahoo期末日が古い" if yahoo_quarter_age is not None and yahoo_quarter_age > 200 else
                      "Yahoo期末日を確認" if yahoo_quarter_age is not None else
@@ -3749,6 +3787,9 @@ def multibagger_finance_fields(f):
 def _finance_acquisition_state(f):
     if f.get("_cache_mode") == "過去保存値・表示のみ": return "取得不可（過去保存値のみ）"
     if finance_freshness_usable(f.get("_freshness")): return "取得済"
+    reason = finance_evaluation_reason(f)
+    if "未提供" in reason or "PER評価対象外" in reason:
+        return "取得済（" + reason + "）"
     if not all(np.isfinite(safe_float(f.get(k))) for k in ("forwardEps", "forwardPE")):
         return "取得済（予想指標不足・評価保留）"
     return "取得済（基準日・対象期未確認）"
@@ -3767,7 +3808,7 @@ def batch_domestic_finance_audit(tickers_tuple, session_key=""):
         try:
             f = _domestic_finance_snapshot(t)
             row.update(multibagger_finance_fields(f))
-            row.update({"財務取得状態": _finance_acquisition_state(f),
+            row.update({"財務取得状態": _finance_acquisition_state(f), "評価保留理由": finance_evaluation_reason(f),
                 "財務情報源": f.get("_source", ""), "財務情報鮮度": f.get("_freshness", ""),
                 "参考指標基準日": f.get("_reference_date", ""), "予想EPS対象期": f.get("_forecast_period", ""),
                 "業績発表日": f.get("_disclosure_date", ""), "予想EPS": safe_float(f.get("forwardEps")),
@@ -5379,7 +5420,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.32")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.33")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5492,10 +5533,10 @@ manual_run_clicked = st.button("▶ 今日の判定を更新", type="primary", u
 # ページ初回表示（または日本時間の日付変更）のみ自動実行。
 # 入力ウィジェットによる再実行では価格・財務を再取得しない。
 _auto_day = str(tokyo_now().date())
-auto_run_clicked = st.session_state.get("v172431_auto_run_day") != _auto_day
+auto_run_clicked = st.session_state.get("v172433_auto_run_day") != _auto_day
 run_clicked = bool(manual_run_clicked or auto_run_clicked)
 if run_clicked:
-    st.session_state["v172431_auto_run_day"] = _auto_day
+    st.session_state["v172433_auto_run_day"] = _auto_day
 
 if not run_clicked:
     previous_data = st.session_state.get("v177_data", {})
@@ -7310,6 +7351,7 @@ with admin_tab:
             else:
                 st.info("判定更新後に財務の取得状況を表示します。")
         st.caption("シグナル先行では企業価値を割高除外・判定不能除外に使用します。他の監視対象設定では参考表示です。")
+        st.caption("会社予想EPS未提供・赤字予想は通信失敗と区別します。EPS×予想PERが株価と整合する場合、参考理論株価との価格差だけでは異常値にしません。理論株価は業種PER仮定に依存します。")
         st.caption("財務はYahoo!ファイナンス日本版を優先し、トレーダーズ・ウェブ、株探の無料公開データへ順に切り替えます。取得サイト・指標基準日・EPS対象期・株探業績発表日・取得経路を表示します。サイトをまたいでEPSとPERを混ぜません。欠損をゼロや推測値で補わず、最新性・算定不能は新規買い対象外です。J-Quants遅延財務・有料APIは使用しません。")
         if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
             st.info("先に『今日の判定を更新』で監視対象のデータを取得してください。")
@@ -7317,7 +7359,7 @@ with admin_tab:
             value_show = add_research_judgements_first(value_top50_df, surge_top50_df, valuation_master_df)
             show_cols=[
                 "急騰予兆判定","割安判定","順位","コード","銘柄名","一次選抜順位",
-                "現在株価_価格","AI参考価値","参考価値上昇余地%","企業価値スコア",
+                "現在株価_価格","AI参考価値","参考価値上昇余地%","予想EPS_元値","予想PER","PBR","適正株価クロスチェック","企業価値スコア",
                 "成長性スコア","流動性スコア","AI_TOP50スコア",
                 "財務情報源","財務情報鮮度","Yahoo期末日","Yahoo取得状態",
                 "財務取得日時","参考指標基準日","予想EPS対象期","業績発表日","実績EPS対象期","財務参照URL","財務取得経路","ファンダ取得状態",
@@ -7674,7 +7716,7 @@ try:
             "一次選抜_流動性重み":np.nan,"一次選抜_トレンド重み":np.nan,"一次選抜_安定性重み":np.nan,
             "OOS検証済み":False,"OOS_PF参考":np.nan,"5年通算PF参考":np.nan,
             "BUY候補件数":len(buy_export),"割高除外件数":len(overvalued_buy_exclusions_df),
-            "企業価値未算定件数":value_unrated_count,
+            "企業価値未算定件数":int((~value_top50_df["企業価値算定済"].fillna(False)).sum()) if "企業価値算定済" in value_top50_df else 0,
             "財務直接取得対象件数":len(finance_acquisition_df),
             "財務直接取得済件数":int(finance_acquisition_df["財務取得状態"].eq("取得済").sum()) if not finance_acquisition_df.empty else 0,
             "財務直接取得不可件数":int(finance_acquisition_df["財務取得状態"].str.startswith("取得不可").sum()) if not finance_acquisition_df.empty else 0,

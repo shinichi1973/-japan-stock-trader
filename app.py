@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.17.24.27
-# BUILD: VER17-24-31-POST-INPUT-AUTORUN-20261018
+# BUILD: VER17-24-32-HOLDINGS-SYNC-20261018
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -44,8 +44,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.31 判定後入力・起動時自動判定"
-BUILD = "VER17-24-31-POST-INPUT-AUTORUN-20261018"
+VERSION = "17.24.32 後入力保有の財務・日足自動補完"
+BUILD = "VER17-24-32-HOLDINGS-SYNC-20261018"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -5379,7 +5379,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.31")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.32")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5584,6 +5584,82 @@ if run_clicked:
     _update_times["一次選抜・参考評価"] = round(time.perf_counter() - _stage_started, 2)
     _update_times["取得〜参考評価合計"] = round(time.perf_counter() - _update_started, 2)
     st.session_state["v172429_update_times"] = _update_times
+
+def sync_post_input_holdings(state, holdings, signal_first, replacement_live, now, clock):
+    """CSV後入力で不足した保有株だけ補完。成功済みデータは再取得しない。"""
+    if not holdings:
+        return []
+    day_key = (str(now.date()), now.hour >= 16)
+    attempted = dict(state.get("v172432_holding_attempts", {}))
+    finance = state.get("v172419_finance_audit", pd.DataFrame())
+    prices = dict(state.get("v177_data", {}))
+    finance_status = (finance.drop_duplicates("コード", keep="last").set_index("コード")["財務取得状態"].to_dict()
+                      if isinstance(finance, pd.DataFrame) and {"コード", "財務取得状態"}.issubset(finance.columns) else {})
+    finance_status = {str(c): status for c, status in finance_status.items()}
+    for c, holding in holdings.items():
+        if holding.get("name"):
+            STOCK_NAMES[str(c)] = str(holding["name"])
+    required_bars = 200 if replacement_live else 60
+    def due(stage, c):
+        return clock - attempted.get((day_key, stage, c), -float("inf")) >= 900
+    finance_codes = [str(c) for c in holdings
+                     if finance_status.get(str(c)) != "取得済" and due("finance", str(c))]
+    price_codes = [str(c) for c in holdings
+                   if (str(c) + ".T" not in prices or prices[str(c) + ".T"] is None
+                       or len(prices[str(c) + ".T"]) < required_bars)
+                   and due("price", str(c))]
+    errors = []
+    def merge_rows(old, extra):
+        if not isinstance(extra, pd.DataFrame) or extra.empty:
+            return old
+        combined = pd.concat([old, extra], ignore_index=True)
+        if "コード" in combined:
+            combined["コード"] = combined["コード"].astype(str)
+            combined = combined.drop_duplicates("コード", keep="last")
+        return combined.reset_index(drop=True)
+    if finance_codes:
+        for c in finance_codes:
+            attempted[(day_key, "finance", c)] = clock
+        try:
+            extra = batch_domestic_finance_audit(tuple(c + ".T" for c in finance_codes), day_key)
+            state["v172419_finance_audit"] = merge_rows(finance, extra)
+        except Exception as exc:
+            errors.append("保有銘柄の追加財務取得に失敗：" + str(exc)[:200])
+    if price_codes:
+        for c in price_codes:
+            attempted[(day_key, "price", c)] = clock
+        try:
+            symbols = tuple(c + ".T" for c in price_codes)
+            if signal_first:
+                extra_prices, extra_diagnostics = batch_domestic_stock_data(symbols, day_key, 300 if replacement_live else 150)
+                state["v172419_daily_diagnostics"] = merge_rows(
+                    state.get("v172419_daily_diagnostics", pd.DataFrame()), extra_diagnostics)
+            else:
+                extra_prices = batch_stock_data_light(symbols, months=15)
+            prices.update({t: frame for t, frame in extra_prices.items()
+                           if isinstance(frame, pd.DataFrame) and not frame.empty})
+            state["v177_data"] = prices
+            state["v177_daily_bar_status"] = build_daily_bar_status(prices)
+        except Exception as exc:
+            errors.append("保有銘柄の追加日足取得に失敗：" + str(exc)[:200])
+    state["v172432_holding_attempts"] = {k: v for k, v in attempted.items() if k[0] == day_key}
+    current_finance = state.get("v172419_finance_audit", pd.DataFrame())
+    checked = (set(current_finance.loc[current_finance["財務取得状態"].eq("取得済"), "コード"].astype(str))
+               if {"コード", "財務取得状態"}.issubset(current_finance.columns) else set())
+    unresolved = set(map(str, holdings)) - checked
+    if unresolved:
+        errors.append("保有銘柄の財務未確認：" + "、".join(sorted(unresolved)) +
+                      "。取得不足のまま割安・割高は断定しません。再試行は15分間隔です。")
+    return errors
+
+
+# 全体更新を繰り返さず、後入力で不足した保有銘柄を判定表の作成前に補完する。
+if not run_clicked and short_confirmed:
+    with st.spinner("後入力した保有銘柄の財務・日足を確認中…"):
+        for _message in sync_post_input_holdings(st.session_state, short_confirmed,
+                                                signal_first, replacement_live,
+                                                tokyo_now(), time.time()):
+            st.warning(_message)
 
 if st.session_state.get("v172429_update_times"):
     with st.expander("更新処理の所要時間", expanded=False):
@@ -7102,7 +7178,7 @@ with main_tab:
         st.info("CSV・余力の入力完了まで参考株数は未計算です。未入力は買い条件の不成立を意味しません。")
     loaded_codes = {code(t) for t in data}
     if set(held_codes) - loaded_codes:
-        st.warning("追加した保有銘柄の日足が未取得です。『今日の判定を更新』を押して売り判定を更新してください。")
+        st.warning("追加取得後も保有銘柄の日足を確認できません。該当銘柄の売り判定は未確認です。『今日の判定を更新』で再確認してください。")
 
     with st.expander("🌱 大化け候補 TOP3（研究）", expanded=False):
         st.caption("数年の成長を調べる候補です。購入株数・売買指示には反映しません。")

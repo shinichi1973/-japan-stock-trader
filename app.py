@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.17.24.27
-# BUILD: VER17-24-33-FINANCE-VALUATION-20261018
+# BUILD: VER17-24-34-EQUAL-BUDGET-20261018
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -44,8 +44,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.33 財務欠損理由・EPS整合性判定修正"
-BUILD = "VER17-24-33-FINANCE-VALUATION-20261018"
+VERSION = "17.24.34 余力入力のみで株数計算・均等配分"
+BUILD = "VER17-24-34-EQUAL-BUDGET-20261018"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3158,11 +3158,11 @@ def render_allocation_research():
 def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_codes,
                                 cap_yen=None, execution_mode="自動（通常注文優先・不足はS株）",
                                 lot_cap=None, order_inputs_ready=True):
-    """候補は余力と独立。入力完了後に参考株数を計算する。"""
+    """候補は余力と独立。未保有TOP3へ予算を均等配分し、余力入力後に株数を計算。"""
     cols = ["購入優先度", "コード", "銘柄名", "総合AIスコア", "現在株価", "計算用株価",
             "購入株数", "予定購入額", "余力引当額", "買付余力使用率", "注文想定",
             "買付可否", "見送り理由", "購入後推定余力", "注文区分",
-            "通常注文参考株数", "通常注文概算額"]
+            "通常注文参考株数", "通常注文概算額", "均等配分予算"]
     if candidates is None or candidates.empty:
         return pd.DataFrame(columns=cols)
     held = set(map(str, held_codes or []))
@@ -3170,24 +3170,27 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
     x = (x.sort_values(["候補スコア", "%K", "コード"], ascending=[False, True, True])
          if "候補スコア" in x else x.sort_values(["%K", "コード"], ascending=[True, True])).head(3)
     remaining = max(float(buying_power or 0), 0)
+    allocation_count = len(x)
+    equal_budget = remaining / allocation_count if allocation_count else 0
     rows = []
     for i, (_, r) in enumerate(x.iterrows(), 1):
         c = str(r["コード"])
         price = safe_float(r["現在株価"])
         calc_price = price * 1.05
         collateral_price = standard_limit_up_price(price)
+        allocated = min(equal_budget, remaining)
         reason = ""
-        if remaining <= 0:
-            reason = "買付余力が0円、または上位候補への引当後の余力なし"
+        if allocated <= 0:
+            reason = "買付余力が0円"
         elif not np.isfinite(calc_price) or calc_price <= 0:
             reason = "株価データ不正"
-        budget = (min(remaining, float(cap_yen)) if cap_yen is not None and cap_yen > 0 else remaining) if not reason else 0
+        budget = (min(allocated, float(cap_yen)) if cap_yen is not None and cap_yen > 0 else allocated) if not reason else 0
         lot_budget = min(budget, float(lot_cap)) if lot_cap is not None and lot_cap > 0 else budget
         lot_shares = (100 * (min(int(lot_budget // calc_price),
-                                int(remaining // collateral_price)) // 100)
+                                int(budget // collateral_price)) // 100)
                       if not reason and calc_price > 0 and np.isfinite(calc_price)
                       and collateral_price > 0 and np.isfinite(collateral_price) else 0)
-        shares = (min(int(budget // calc_price), int(remaining // collateral_price))
+        shares = (min(int(budget // calc_price), int(budget // collateral_price))
                   if calc_price > 0 and np.isfinite(calc_price) and
                   np.isfinite(collateral_price) and collateral_price > 0 else 0)
         if execution_mode == "100株単位（通常注文）":
@@ -3213,15 +3216,15 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
                      "通常注文参考株数": lot_shares,
                      "通常注文概算額": lot_shares * price,
                      "買付可否": ("🟡 買い候補・株数未計算" if not order_inputs_ready else "🟢 BUY" if shares else "🟠 予算不足・株数0"),
-                     "見送り理由": reason, "購入後推定余力": max(remaining, 0)})
+                     "見送り理由": reason, "購入後推定余力": max(remaining, 0), "均等配分予算": allocated})
     result = pd.DataFrame(rows, columns=cols)
     if not order_inputs_ready:
         for col in ("購入株数", "予定購入額", "余力引当額", "買付余力使用率",
-                    "購入後推定余力", "通常注文参考株数", "通常注文概算額"):
+                    "購入後推定余力", "通常注文参考株数", "通常注文概算額", "均等配分予算"):
             result[col] = np.nan
         result["注文想定"] = "入力待ち"
         result["注文区分"] = "入力待ち"
-        result["見送り理由"] = "CSV・余力の入力完了後に参考株数を計算"
+        result["見送り理由"] = "余力の入力後に参考株数を計算"
     return result
 
 
@@ -5420,7 +5423,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.33")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.34")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5465,8 +5468,9 @@ all_held_codes = list(confirmed.keys())
 short_confirmed = confirmed
 held_codes = all_held_codes
 short_buying_power = int(buying_power)
-order_inputs_ready = bool(not sbi_trades_df.empty and not parse_errors) if trade_files else False
-order_inputs_ready = bool(order_inputs_ready and sbi_warning_df.empty and buying_power_input is not None)
+# 余力入力のみで参考株数を算出。CSVの有無・警告は保有照合の注意として別表示。
+order_inputs_ready = buying_power_input is not None
+holdings_verified = bool(not sbi_trades_df.empty and not parse_errors and sbi_warning_df.empty) if trade_files else False
 if not sbi_warning_df.empty:
     st.error("履歴不足の可能性がある銘柄があります。警告対象は安全のため保有復元から除外しています。")
 
@@ -5494,13 +5498,13 @@ with st.expander("⚙ 購入額・注文方式", expanded=False):
     filter_downtrend = st.checkbox("下降確認の候補を除外（未検証）", value=False, key="v17243_down", disabled=not signal_first or replacement_live)
     filter_churn = st.checkbox("短期クロス多発の候補を除外（未検証）", value=False, key="v17243_churn", disabled=not signal_first or replacement_live)
     st.caption("値幅：ATR14/終値が3%以上＝大、1.5%以上＝中、それ未満＝小。大のみ新規対象。安値切上げ：直近3つの10営業日安値が順に上昇し、終値が25日平均より上。20日平均売買代金は最低1億円。国内財務の判定不能は除外。")
-    cap_mode = "上限なし（買付余力内・候補順に引当）"
+    cap_mode = "上限なし（買付余力を候補へ均等配分）"
     purchase_cap = None
     lot_cap = None
     st.caption("1銘柄の購入額・通常注文予算の固定上限は解除済みです。資産の3分の1による制限も適用しません。")
     execution_mode = st.selectbox("実行する注文方式", ["自動（通常注文優先・不足はS株）", "S株のみ（1〜99株）", "100株単位（通常注文）"], key="v1724_order")
     ifd_take_profit = st.slider("参考IFDOCOの利確率（%）", 3.0, 30.0, 15.0, 0.5, key="v1724_tp")
-    st.caption("保有数上限なし。買い候補TOP3へ順位順に余力を引き当てます。1位が余力の大半を使う場合があります。自動は余力内で100株買えれば通常注文、買えなければS株（最大99株）。参考IFDOCO表は代替案なので、買いカードと二重発注しないでください。")
+    st.caption("保有数上限なし。買い候補TOP3の件数で余力を均等配分します。注文単位・価格余裕・値幅上限による注文拘束額を考慮するため、未使用の余力が残る場合があります。自動は余力内で100株買えれば通常注文、買えなければS株（最大99株）。参考IFDOCO表は代替案なので、買いカードと二重発注しないでください。")
     st.caption("IFDOCOは参考案です。日中の逆指値と固定利確は、終値損切り・Stoch売りとは異なります。利確15%は検証結果ではなく初期値です。")
 with st.expander("⚙ 管理者設定", expanded=False):
     a1, a2, a3, a4 = st.columns(4)
@@ -5887,7 +5891,7 @@ if buy_signal_rows:
     if meta_cols:
         m=buy_meta_df[meta_cols].copy(); m["コード"]=m["コード"].astype(str); buy_view["コード"]=buy_view["コード"].astype(str)
         buy_view=buy_view.merge(m,on="コード",how="left")
-    cols=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","ロジック","63日騰落率%","%K","%D","候補スコア","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","見送り理由"]
+    cols=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","ロジック","63日騰落率%","%K","%D","候補スコア","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","均等配分予算","見送り理由"]
     buy_view=buy_view[[c for c in cols if c in buy_view.columns]].head(3).copy()
     for c in ["現在株価","概算購入額"]:
         if c in buy_view: buy_view[c]=pd.to_numeric(buy_view[c],errors="coerce").round(0)
@@ -6562,7 +6566,7 @@ def render_triple_news_pick(compare, freshness, price_data, held_codes, values, 
         reasons, plan = triple_news_purchase_status(selected, buy_view, signal_audit, held_codes, buying_power, block_unrated)
         if reasons:
             if "株数未計算" in str(plan.get("買付可否", "")):
-                st.info("買い候補・株数未計算：CSV・余力を下部で入力してください。" + " / ".join(reasons))
+                st.info("買い候補・株数未計算：余力を下部で入力してください。" + " / ".join(reasons))
             else:
                 st.warning("注文条件の確認：" + " / ".join(reasons))
         else:
@@ -7192,7 +7196,7 @@ with main_tab:
             st.info("監視対象に、現在の買い条件を満たす銘柄はありません。")
         else:
             render_mobile_trade_cards(buy_view, "buy", trend_by_code)
-            simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","参考購入株数","注文区分","通常注文参考株数","通常注文概算額","%K","%D","買付可否"] if c in buy_view.columns]
+            simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","均等配分予算","参考購入株数","注文区分","通常注文参考株数","通常注文概算額","%K","%D","買付可否"] if c in buy_view.columns]
             with st.expander("買い候補の詳細表", expanded=False):
                 buy_display = buy_view[simple_buy_cols].rename(columns={"割安判定": "銘柄判定"}).copy()
                 st.dataframe(buy_display, use_container_width=True, hide_index=True)
@@ -7200,13 +7204,13 @@ with main_tab:
         with st.expander("100株単位・参考IFDOCO", expanded=False):
             ifd_table = build_reference_ifdoco(buy_view, ifd_take_profit, 7.0)
             if ifd_table.empty:
-                st.info("CSV・余力の入力完了後に参考IFDOCOを計算します。" if not order_inputs_ready else "予算・注文余力内で100株買える正式買い候補はありません。")
+                st.info("余力入力後に参考IFDOCOを計算します。" if not order_inputs_ready else "予算・注文余力内で100株買える正式買い候補はありません。")
             else:
                 st.dataframe(ifd_table, use_container_width=True, hide_index=True)
                 st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
 
     st.subheader("参考株数の計算（候補確認後に入力）")
-    st.caption("CSVで保有を照合し、余力から参考株数を計算します。入力すると保存済みの判定データで再計算します。")
+    st.caption("余力を候補数で均等に分けて参考株数を計算します。入力確定後に自動再計算します。CSVは保有照合に使用します。")
     input_left, input_right = st.columns([1.35, 1.0], gap="large")
     with input_left:
         st.file_uploader("SBI 約定履歴CSV", type=["csv"], accept_multiple_files=True,
@@ -7215,8 +7219,12 @@ with main_tab:
         st.number_input("現物買付余力（円）", min_value=0, max_value=1_000_000_000,
                         value=None, step=1000, key="v172431_buying_power",
                         placeholder="候補確認後に入力")
+    if st.button("参考株数を再計算", key="v172434_recalculate"):
+        st.rerun()
     if not order_inputs_ready:
-        st.info("CSV・余力の入力完了まで参考株数は未計算です。未入力は買い条件の不成立を意味しません。")
+        st.info("余力を入力すると参考株数を計算します。未入力は買い条件の不成立を意味しません。")
+    if order_inputs_ready and not holdings_verified:
+        st.warning("参考株数は保有照合前の暫定値です。CSV未入力・読込エラー・履歴不足の場合、保有株を新規候補から除外できない場合があります。注文前に確認してください。")
     loaded_codes = {code(t) for t in data}
     if set(held_codes) - loaded_codes:
         st.warning("追加取得後も保有銘柄の日足を確認できません。該当銘柄の売り判定は未確認です。『今日の判定を更新』で再確認してください。")
@@ -7664,7 +7672,7 @@ try:
             } for c,v in confirmed.items()]).to_csv(index=False,encoding="utf-8-sig"))
         if not sbi_warning_df.empty:
             zf.writestr("sbi_history_warnings.csv",sbi_warning_df.to_csv(index=False,encoding="utf-8-sig"))
-        buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","ロジック","63日騰落率%","%K","%D","候補スコア","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","見送り理由"]
+        buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","ロジック","63日騰落率%","%K","%D","候補スコア","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","均等配分予算","見送り理由"]
         if isinstance(buy_view, pd.DataFrame) and not buy_view.empty:
             buy_export = buy_view.copy()
         else:

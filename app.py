@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.17.24.27
-# BUILD: VER17-24-30-MULTIBAGGER-CHOICE-20261018
+# BUILD: VER17-24-31-POST-INPUT-AUTORUN-20261018
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -44,8 +44,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.30 大化け暫定候補・AI参考選択"
-BUILD = "VER17-24-30-MULTIBAGGER-CHOICE-20261018"
+VERSION = "17.24.31 判定後入力・起動時自動判定"
+BUILD = "VER17-24-31-POST-INPUT-AUTORUN-20261018"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3119,8 +3119,8 @@ def render_allocation_research():
 
 def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_codes,
                                 cap_yen=None, execution_mode="自動（通常注文優先・不足はS株）",
-                                lot_cap=None):
-    """保有数・購入額の固定上限なし。TOP3へ候補順に注文余力を引き当てる。"""
+                                lot_cap=None, order_inputs_ready=True):
+    """候補は余力と独立。入力完了後に参考株数を計算する。"""
     cols = ["購入優先度", "コード", "銘柄名", "総合AIスコア", "現在株価", "計算用株価",
             "購入株数", "予定購入額", "余力引当額", "買付余力使用率", "注文想定",
             "買付可否", "見送り理由", "購入後推定余力", "注文区分",
@@ -3140,7 +3140,7 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
         collateral_price = standard_limit_up_price(price)
         reason = ""
         if remaining <= 0:
-            reason = "買付余力が0円/未入力"
+            reason = "買付余力が0円、または上位候補への引当後の余力なし"
         elif not np.isfinite(calc_price) or calc_price <= 0:
             reason = "株価データ不正"
         budget = (min(remaining, float(cap_yen)) if cap_yen is not None and cap_yen > 0 else remaining) if not reason else 0
@@ -3174,9 +3174,17 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
                      "注文想定": order_kind, "注文区分": order_kind,
                      "通常注文参考株数": lot_shares,
                      "通常注文概算額": lot_shares * price,
-                     "買付可否": "🟢 BUY" if shares else "⛔ NO BUY",
+                     "買付可否": ("🟡 買い候補・株数未計算" if not order_inputs_ready else "🟢 BUY" if shares else "🟠 予算不足・株数0"),
                      "見送り理由": reason, "購入後推定余力": max(remaining, 0)})
-    return pd.DataFrame(rows, columns=cols)
+    result = pd.DataFrame(rows, columns=cols)
+    if not order_inputs_ready:
+        for col in ("購入株数", "予定購入額", "余力引当額", "買付余力使用率",
+                    "購入後推定余力", "通常注文参考株数", "通常注文概算額"):
+            result[col] = np.nan
+        result["注文想定"] = "入力待ち"
+        result["注文区分"] = "入力待ち"
+        result["見送り理由"] = "CSV・余力の入力完了後に参考株数を計算"
+    return result
 
 
 def holding_horizon_signal(frame, fundamentals, horizon, entry_price=np.nan):
@@ -5081,9 +5089,10 @@ def render_mobile_trade_cards(df, side, trend_by_code=None):
         else:
             shares = int(max(safe_float(row.get("参考購入株数", row.get("参考S株数")), 0), 0))
             can_buy = "BUY" in str(row.get("買付可否", "")) and shares > 0
-            action_text = "🟢 買い" if can_buy else "⛔ 見送り"
-            card_class = "skip-card" if is_overvalued else "buy-card" if can_buy else "skip-card"
-            quantity_text = "割高" if is_overvalued else f"参考 {shares:,}株" if can_buy else _mobile_text(row.get("買付可否"), "購入不可")
+            pending = "株数未計算" in str(row.get("買付可否", ""))
+            action_text = "🟡 買い候補" if pending else "🟢 買い" if can_buy else "🟠 買い候補"
+            card_class = "skip-card" if is_overvalued else "buy-card" if can_buy or pending else "skip-card"
+            quantity_text = "割高" if is_overvalued else "株数未計算" if pending else f"参考 {shares:,}株" if can_buy else _mobile_text(row.get("買付可否"), "株数0")
             order_text = _mobile_text(row.get("注文区分", "S株"))
             detail_text = (
                 f"<span class=\"trade-valuation\">{valuation_text}</span>"
@@ -5370,28 +5379,19 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.27")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.31")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
 st.caption("監視対象・購入予算・注文方式は設定欄で選択。株数上限解除・対象拡大の成績は比較検証で確認してください。")
 
 # ------------------------------------------------------------
-# 朝の入力：ここだけは常に見える
+# 下部の入力値はウィジェットの再実行時に取得する。
 # ------------------------------------------------------------
-st.header("朝の入力")
-input_left, input_right = st.columns([1.35, 1.0], gap="large")
-with input_left:
-    trade_files = st.file_uploader(
-        "SBI 約定履歴CSV", type=["csv"], accept_multiple_files=True, key="sbi_execution_csvs_v177"
-    )
-with input_right:
-    if "sbi_buying_power_yen_v177" not in st.session_state:
-        st.session_state["sbi_buying_power_yen_v177"] = 0
-    buying_power = st.number_input(
-        "現物買付余力（円）", min_value=0, max_value=1_000_000_000, step=1000,
-        key="sbi_buying_power_yen_v177"
-    )
+trade_files = st.session_state.get("sbi_execution_csvs_v177", [])
+buying_power_input = st.session_state.get("v172431_buying_power", None)
+buying_power = int(buying_power_input or 0)
+st.caption("① ページを開くと自動判定 → ② 買い候補を確認 → ③ 下部でCSV・余力を入力し参考株数を計算")
 # 約定履歴 → 保有復元
 confirmed = {}
 sbi_trades_df = pd.DataFrame()
@@ -5424,8 +5424,8 @@ all_held_codes = list(confirmed.keys())
 short_confirmed = confirmed
 held_codes = all_held_codes
 short_buying_power = int(buying_power)
-if int(buying_power) <= 0:
-    st.warning("買付余力を入力すると参考S株数を計算できます。")
+order_inputs_ready = bool(not sbi_trades_df.empty and not parse_errors) if trade_files else False
+order_inputs_ready = bool(order_inputs_ready and sbi_warning_df.empty and buying_power_input is not None)
 if not sbi_warning_df.empty:
     st.error("履歴不足の可能性がある銘柄があります。警告対象は安全のため保有復元から除外しています。")
 
@@ -5488,7 +5488,14 @@ with st.expander("⚙ 管理者設定", expanded=False):
 # 既存のStreamlitセッションに過去の設定が残っていても検証済み条件を固定する。
 sl, churn_filter, quality_mode = 7.0, False, False
 
-run_clicked = st.button("▶ 今日の判定を更新", type="primary", use_container_width=True, key="v177_run")
+manual_run_clicked = st.button("▶ 今日の判定を更新", type="primary", use_container_width=True, key="v177_run")
+# ページ初回表示（または日本時間の日付変更）のみ自動実行。
+# 入力ウィジェットによる再実行では価格・財務を再取得しない。
+_auto_day = str(tokyo_now().date())
+auto_run_clicked = st.session_state.get("v172431_auto_run_day") != _auto_day
+run_clicked = bool(manual_run_clicked or auto_run_clicked)
+if run_clicked:
+    st.session_state["v172431_auto_run_day"] = _auto_day
 
 if not run_clicked:
     previous_data = st.session_state.get("v177_data", {})
@@ -5751,7 +5758,7 @@ if buy_signal_rows:
     buy_signal_df = (buy_signal_df.sort_values(["候補スコア", "コード"], ascending=[False, True]) if signal_first else buy_signal_df.sort_values(["63日騰落率%", "コード"], ascending=[False, True]) if replacement_live else buy_signal_df.sort_values(["%K", "コード"])).reset_index(drop=True)
     plan = build_fixed45_purchase_plan(
         buy_signal_df, short_buying_power, current_assets, held_codes,
-        purchase_cap, execution_mode, lot_cap,
+        purchase_cap, execution_mode, lot_cap, order_inputs_ready=order_inputs_ready,
     )
     buy_view = plan.merge(buy_signal_df[["コード","%K","%D","条件","ロジック","63日騰落率%"]], on="コード", how="left")
     buy_view = buy_view.rename(columns={"購入株数":"参考S株数","予定購入額":"概算購入額"})
@@ -6376,7 +6383,7 @@ def triple_news_purchase_status(selected, buy_view, signal_audit, held_codes, bu
     c = selected["code"]
     reasons = []
     if buying_power <= 0:
-        reasons.append("買付余力なし")
+        reasons.append("買付余力が未入力または0円")
     if "割高" in selected["value_status"]:
         reasons.append("割高判定")
     # The current audit already enforces the actual financial setting and trading method.
@@ -6437,7 +6444,10 @@ def render_triple_news_pick(compare, freshness, price_data, held_codes, values, 
         st.caption(f"最新終値 ¥{selected['close']:,.1f}（{selected['bar_date']}） / 銘柄判定：{selected['value_status']}")
         reasons, plan = triple_news_purchase_status(selected, buy_view, signal_audit, held_codes, buying_power, block_unrated)
         if reasons:
-            st.warning("注目のみ・購入不可：" + " / ".join(reasons))
+            if "株数未計算" in str(plan.get("買付可否", "")):
+                st.info("買い候補・株数未計算：CSV・余力を下部で入力してください。" + " / ".join(reasons))
+            else:
+                st.warning("注文条件の確認：" + " / ".join(reasons))
         else:
             st.success(f"現行システムの買い条件・注文計画も一致：参考{int(plan.get('参考購入株数', 0))}株 / {plan.get('注文区分', '')}")
             st.caption("上の株数は既存の買いTOP3内の注文です。追加で重複注文しないでください。")
@@ -7029,7 +7039,7 @@ with main_tab:
     )
     m1, m2 = st.columns(2)
     m1.metric("保有", f"{len(held_codes)}銘柄")
-    m2.metric("買付余力", f"¥{int(short_buying_power):,}")
+    m2.metric("買付余力", "未入力" if buying_power_input is None else f"¥{int(short_buying_power):,}")
     if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
         current_count = int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum())
         total_count = len(daily_bar_status_df)
@@ -7073,10 +7083,26 @@ with main_tab:
         with st.expander("100株単位・参考IFDOCO", expanded=False):
             ifd_table = build_reference_ifdoco(buy_view, ifd_take_profit, 7.0)
             if ifd_table.empty:
-                st.info("予算・注文余力内で100株買える正式買い候補はありません。")
+                st.info("CSV・余力の入力完了後に参考IFDOCOを計算します。" if not order_inputs_ready else "予算・注文余力内で100株買える正式買い候補はありません。")
             else:
                 st.dataframe(ifd_table, use_container_width=True, hide_index=True)
                 st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
+
+    st.subheader("参考株数の計算（候補確認後に入力）")
+    st.caption("CSVで保有を照合し、余力から参考株数を計算します。入力すると保存済みの判定データで再計算します。")
+    input_left, input_right = st.columns([1.35, 1.0], gap="large")
+    with input_left:
+        st.file_uploader("SBI 約定履歴CSV", type=["csv"], accept_multiple_files=True,
+                         key="sbi_execution_csvs_v177")
+    with input_right:
+        st.number_input("現物買付余力（円）", min_value=0, max_value=1_000_000_000,
+                        value=None, step=1000, key="v172431_buying_power",
+                        placeholder="候補確認後に入力")
+    if not order_inputs_ready:
+        st.info("CSV・余力の入力完了まで参考株数は未計算です。未入力は買い条件の不成立を意味しません。")
+    loaded_codes = {code(t) for t in data}
+    if set(held_codes) - loaded_codes:
+        st.warning("追加した保有銘柄の日足が未取得です。『今日の判定を更新』を押して売り判定を更新してください。")
 
     with st.expander("🌱 大化け候補 TOP3（研究）", expanded=False):
         st.caption("数年の成長を調べる候補です。購入株数・売買指示には反映しません。")

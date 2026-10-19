@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.17.24.27
-# BUILD: VER17-24-34-EQUAL-BUDGET-20261018
+# BUILD: VER17-24-35-COMMON-BUY-GUARD-20261020
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -44,8 +44,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.34 余力入力のみで株数計算・均等配分"
-BUILD = "VER17-24-34-EQUAL-BUDGET-20261018"
+VERSION = "17.24.35 全監視モードの買い除外・判定統一"
+BUILD = "VER17-24-35-COMMON-BUY-GUARD-20261020"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3924,6 +3924,26 @@ def valuation_label(upside, split_status, guard_status, acquisition, freshness):
             else "⚪ 適正圏" if upside > -10 else "🔴 割高")
 
 
+def common_new_buy_reasons(label, daily_status, downtrend=False, churn_reason="", replacement=False):
+    """全監視モード共通。確定・評価可能な日足/財務のみ注文候補へ渡す。"""
+    reasons = []
+    if daily_status != "🟢 当日確定":
+        reasons.append("日足未確定のため新規買い見送り")
+    label = str(label)
+    if "割高" in label:
+        reasons.append("割高判定のため新規買い除外")
+    elif label not in {"🟢 割安", "🟡 やや割安", "⚪ 適正圏"}:
+        reasons.append("財務評価未確認・赤字予想等のため新規買い見送り")
+    if not replacement:
+        if pd.isna(downtrend):
+            reasons.append("下降判定未確認のため新規買い見送り")
+        elif bool(downtrend):
+            reasons.append("下降確認のため反転待ち")
+        if churn_reason:
+            reasons.append("短期クロス検査：" + str(churn_reason))
+    return reasons
+
+
 def build_valuation_master(frames, holdings, price_data, display_frames):
     """同一実行内の共通判定。TOP50外の保有・表示対象も一度だけ算定する。"""
     records = {}
@@ -5423,7 +5443,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.34")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.35")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5495,8 +5515,9 @@ with st.expander("⚙ 購入額・注文方式", expanded=False):
     block_unrated = True
     st.caption("国内財務の判定不能は新規買いを見送ります。")
     min_turnover = st.number_input("買い候補の20日平均売買代金下限（円・最低1億円）", 100000000, 10000000000, 100000000, 10000000, key="v172416_liquidity", disabled=not signal_first)
-    filter_downtrend = st.checkbox("下降確認の候補を除外（未検証）", value=False, key="v17243_down", disabled=not signal_first or replacement_live)
-    filter_churn = st.checkbox("短期クロス多発の候補を除外（未検証）", value=False, key="v17243_churn", disabled=not signal_first or replacement_live)
+    filter_downtrend = not replacement_live
+    filter_churn = not replacement_live
+    st.caption("全監視対象で割高・赤字予想・財務未確認・日足未確定を新規買いから除外します。Stochでは下降確認・短期クロス多発も除外します。成績改善は未検証です。")
     st.caption("値幅：ATR14/終値が3%以上＝大、1.5%以上＝中、それ未満＝小。大のみ新規対象。安値切上げ：直近3つの10営業日安値が順に上昇し、終値が25日平均より上。20日平均売買代金は最低1億円。国内財務の判定不能は除外。")
     cap_mode = "上限なし（買付余力を候補へ均等配分）"
     purchase_cap = None
@@ -5762,19 +5783,27 @@ if signal_first:
         signal_value_df = signal_value_df.sort_values(["候補スコア", "コード"], ascending=[False, True]).reset_index(drop=True)
         signal_value_df["順位"] = np.arange(1, len(signal_value_df) + 1)
     true_top50_codes = mother_codes
-value_judgement_by_code = {}
-if isinstance(value_top50_df, pd.DataFrame) and not value_top50_df.empty:
-    value_meta = value_top50_df.head(50).copy()
-    value_meta["コード"] = value_meta["コード"].astype(str).str.replace(r"\.0$", "", regex=True)
-    if "割安判定" in value_meta.columns:
-        value_judgement_by_code = (
-            value_meta.drop_duplicates("コード").set_index("コード")["割安判定"].astype(str).to_dict()
-        )
-if signal_first and not signal_value_df.empty:
-    value_judgement_by_code.update(signal_value_df.set_index("コード")["割安判定"].astype(str).to_dict())
+# BUYを確定する前に共通評価マスターを構築。TOP50外も同じ判定を使用。
+# 生の買いシグナルだけ追加評価し、描画時には再取得しない。
+_signal_frames = {}
+_raw_buy_targets = []
+for _t, _df in data.items():
+    _c = code(_t)
+    if _c not in true_top50_codes and _c not in set(all_held_codes):
+        continue
+    _sx = (public_replacement_frame(_df, "高値更新55＋MA200・安値割れ20")
+           if replacement_live else stoch_quality_frame(_df, sl))
+    _signal_frames[_t] = _sx
+    if not _sx.empty and bool(_sx.iloc[-1].get("BUY_研究" if replacement_live else "BUY_現行", False)):
+        _raw_buy_targets.append({"コード": _c})
+valuation_master_df = build_valuation_master(
+    [value_top50_df, signal_value_df], short_confirmed, data,
+    [pd.DataFrame(_raw_buy_targets)])
+value_judgement_by_code = (valuation_master_df.set_index("コード")["割安判定"].to_dict()
+                          if not valuation_master_df.empty else {})
 signal_meta_by_code = signal_value_df.set_index("コード").to_dict("index") if not signal_value_df.empty else {}
 extract_reason_by_code = signal_first_audit_df.set_index("コード")["抽出除外理由"].to_dict() if not signal_first_audit_df.empty else {}
-value_unrated_count = 0  # 企業価値の算定可否は固定45銘柄の売買判定を止めない。
+value_unrated_count = 0  # 全監視モードで未算定の新規買いを見送る。
 held_code_set = set(map(str, held_codes))
 
 if data and (true_top50_codes or held_code_set):
@@ -5785,8 +5814,7 @@ if data and (true_top50_codes or held_code_set):
         # 新規BUYは固定45の未保有株、保有銘柄は45銘柄外もSELLを判定する。
         if c not in true_top50_codes and c not in held_code_set:
             continue
-        sx = (public_replacement_frame(df0, "高値更新55＋MA200・安値割れ20")
-              if replacement_live else stoch_quality_frame(df0, sl))
+        sx = _signal_frames.get(t, pd.DataFrame())
         if sx.empty:
             continue
         r = sx.iloc[-1]
@@ -5809,7 +5837,15 @@ if data and (true_top50_codes or held_code_set):
         stop_hit = np.isfinite(pnl_pct) and pnl_pct <= -7.0
         final_buy_hit = bool(new_buy_target and buy_signal_hit)
         buy_skip_reason = ""
-        if signal_first and new_buy_target and buy_signal_hit:
+        if new_buy_target and buy_signal_hit:
+            _churn = stoch_churn_diagnostic(df0).get("新規買い除外理由", "") if filter_churn else ""
+            _reasons = common_new_buy_reasons(
+                value_judgement, df0.attrs.get("daily_bar_status"),
+                r.get("下降確認", np.nan), _churn, replacement_live)
+            if any("財務評価" in reason for reason in _reasons):
+                value_unrated_count += 1
+            buy_skip_reason = "／".join(_reasons)
+        if signal_first and new_buy_target and buy_signal_hit and not buy_skip_reason:
             buy_skip_reason = extract_reason_by_code.get(c, "日足不足または抽出対象外")
             meta = signal_meta_by_code.get(c, {})
             if not buy_skip_reason and overvalued:
@@ -5821,13 +5857,13 @@ if data and (true_top50_codes or held_code_set):
                 buy_skip_reason = "国内財務による割安・やや割安条件未達"
             if not buy_skip_reason and not _scan_complete_for_buy:
                 buy_skip_reason = "TOP100の日足確認が未完了のため新規買い停止"
-            final_buy_hit = final_buy_hit and not buy_skip_reason
+        final_buy_hit = final_buy_hit and not buy_skip_reason
         if c in true_top50_codes or c in held_code_set:
             signal_audit_rows.append({"コード": c, "銘柄名": name(t), "監視対象": "保有" if c in held_code_set else ("TOPIX＋日経225全体" if signal_first else "監視対象"),
                                       "現行買い": buy_old, "改善買い": buy_new,
                                       "採用方式の買いシグナル": bool(buy_signal_hit),
                                       "銘柄判定": value_judgement,
-                                      "割高除外": bool(signal_first and overvalued),
+                                      "割高除外": bool(new_buy_target and buy_signal_hit and overvalued),
                                       "最終買い": final_buy_hit,
                                       "買い見送り理由": buy_skip_reason,
                                       "現行売り": sell_old if c in held_code_set else False,
@@ -5857,6 +5893,14 @@ if data and (true_top50_codes or held_code_set):
                 })
 
 signal_audit_df = pd.DataFrame(signal_audit_rows)
+if not signal_audit_df.empty:
+    _skipped = signal_audit_df[signal_audit_df["採用方式の買いシグナル"].eq(True)
+                               & signal_audit_df["監視対象"].ne("保有")
+                               & signal_audit_df["最終買い"].eq(False)]
+    if not _skipped.empty:
+        st.info(f"買いサインが出ても共通条件で見送り：{len(_skipped)}銘柄。理由は以下で確認できます。")
+        with st.expander("買いサインの見送り理由", expanded=False):
+            st.dataframe(_skipped[["コード", "銘柄名", "銘柄判定", "買い見送り理由"]], use_container_width=True, hide_index=True)
 if signal_first and not signal_first_audit_df.empty:
     with st.expander("TOPIX＋日経225買いシグナルの抽出・見送り理由", expanded=False):
         st.caption(f"買いシグナル抽出 {len(signal_first_audit_df)}銘柄 / 財務判定不能による見送り {value_unrated_count}銘柄。" + ("通過候補はATR比率の大きい順。" if replacement_live else "通過候補はATR比率の大きい順。入口変更後の収益性は未検証。"))
@@ -5864,7 +5908,7 @@ if signal_first and not signal_first_audit_df.empty:
 
 if not signal_audit_df.empty and "買い見送り理由" in signal_audit_df.columns:
     overvalued_buy_exclusions_df = signal_audit_df[
-        signal_audit_df["買い見送り理由"].eq("割高判定のため新規買い除外")
+        signal_audit_df["買い見送り理由"].str.contains("割高判定のため新規買い除外", na=False)
     ].copy()
 else:
     overvalued_buy_exclusions_df = pd.DataFrame(columns=[
@@ -5925,14 +5969,14 @@ if not isinstance(surge_top50_df, pd.DataFrame):
     surge_top50_df = pd.DataFrame()
 
 valuation_master_df = build_valuation_master(
-    [value_top50_df, signal_value_df], short_confirmed, data,
+    [value_top50_df, signal_value_df, valuation_master_df], short_confirmed, data,
     [buy_view, sell_view, indicator_compare_df])
 # 算定はマスター作成時だけ行い、描画時には取得し直さない。
 value_top50_df = add_research_judgements_first(value_top50_df, surge_top50_df, valuation_master_df)
 signal_value_df = add_research_judgements_first(signal_value_df, surge_top50_df, valuation_master_df)
 
 # 画面に出るすべての銘柄表で、研究判定を左端に統一表示する。
-# 表示専用の付加情報であり、正式な売買ロジックには接続しない。
+# 急騰予兆は表示情報。企業価値判定は新規買いで使用した共通マスターを再利用。
 buy_view = add_research_judgements_first(buy_view, surge_top50_df, valuation_master_df)
 sell_view = add_research_judgements_first(sell_view, surge_top50_df, valuation_master_df)
 indicator_compare_df = add_research_judgements_first(indicator_compare_df, surge_top50_df, valuation_master_df)
@@ -7156,7 +7200,7 @@ with main_tab:
     news_pick_result, news_pick_exclusions, news_pick_signature = render_triple_news_pick(
         indicator_compare_df, daily_bar_status_df, data, held_codes,
         [value_top50_df, signal_value_df], buy_view, signal_audit_df,
-        short_buying_power, bool(signal_first and block_unrated), run_clicked,
+        short_buying_power, bool(block_unrated), run_clicked,
     )
     m1, m2 = st.columns(2)
     m1.metric("保有", f"{len(held_codes)}銘柄")
@@ -7358,7 +7402,7 @@ with admin_tab:
                 st.dataframe(_finance_audit[[c for c in _audit_cols if c in _finance_audit]], use_container_width=True, hide_index=True)
             else:
                 st.info("判定更新後に財務の取得状況を表示します。")
-        st.caption("シグナル先行では企業価値を割高除外・判定不能除外に使用します。他の監視対象設定では参考表示です。")
+        st.caption("全監視対象で共通マスターの企業価値判定を新規買いに使用します。割高・赤字予想・未算定・鮮度未確認は見送ります。保有銘柄は従来の売り条件で判定します。")
         st.caption("会社予想EPS未提供・赤字予想は通信失敗と区別します。EPS×予想PERが株価と整合する場合、参考理論株価との価格差だけでは異常値にしません。理論株価は業種PER仮定に依存します。")
         st.caption("財務はYahoo!ファイナンス日本版を優先し、トレーダーズ・ウェブ、株探の無料公開データへ順に切り替えます。取得サイト・指標基準日・EPS対象期・株探業績発表日・取得経路を表示します。サイトをまたいでEPSとPERを混ぜません。欠損をゼロや推測値で補わず、最新性・算定不能は新規買い対象外です。J-Quants遅延財務・有料APIは使用しません。")
         if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
@@ -7627,10 +7671,10 @@ try:
             "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225からAI選定TOP50" else 0,
             "固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "売買ロジック":live_trade_method, "Stoch不使用の試験採用":bool(replacement_live), "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(signal_first and block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(signal_first and filter_downtrend), "クロス多発除外":bool(signal_first and filter_churn), "購入予算方式":cap_mode,
+            "売買ロジック":live_trade_method, "Stoch不使用の試験採用":bool(replacement_live), "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(filter_downtrend), "クロス多発除外":bool(filter_churn), "購入予算方式":cap_mode,
             "最大保有銘柄数":"上限なし", "1銘柄購入予算":maxbuy, "通常注文予算":"上限なし（買付余力内）", "注文方式":execution_mode,
-            "IFDOCO参考利確率":ifd_take_profit,"BUY条件":live_trade_method,"管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
-            "割高の新規BUY除外":bool(signal_first),
+            "IFDOCO参考利確率":ifd_take_profit,"BUY条件":live_trade_method + "＋全モード共通財務・日足確認" + ("＋下降・クロス多発除外" if not replacement_live else ""),"管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
+            "割高の新規BUY除外":True,
             "SELL条件":("全保有銘柄 / 前日までの20日安値を終値で割る または終値で含み損 -7.0%" if replacement_live else "全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%"),
             "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":live_universe_mode == "固定45銘柄",
             "短期反転フィルター":bool(churn_filter),

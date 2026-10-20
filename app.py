@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.27
-# BUILD: VER17-24-35-COMMON-BUY-GUARD-20261020
+# 日本株 AI投資アシスタント Ver.17.24.36
+# BUILD: VER17-24-36-SBI-UPLOAD-FIX-20261020
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,13 +39,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.27",
+    page_title="日本株 AI投資アシスタント Ver.17.24.36",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.35 全監視モードの買い除外・判定統一"
-BUILD = "VER17-24-35-COMMON-BUY-GUARD-20261020"
+VERSION = "17.24.36 約定履歴CSVの入力形式・エラー処理修正"
+BUILD = "VER17-24-36-SBI-UPLOAD-FIX-20261020"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -2397,13 +2397,51 @@ def _decode_sbi_csv(raw_bytes):
     raise ValueError(f"CSV文字コードを判定できません: {last_error}")
 
 
+def normalize_sbi_uploads(value):
+    """単一ファイルを行・バイトの列として反復しない。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def sbi_upload_name(value):
+    return str(getattr(value, "name", None) or "約定履歴CSV")
+
+
+def read_sbi_upload_bytes(value):
+    """UploadedFile / BytesIO / バイト列を位置に依存せず読む。"""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+    elif callable(getattr(value, "getvalue", None)):
+        raw = value.getvalue()
+    elif callable(getattr(value, "read", None)):
+        position = None
+        try:
+            if callable(getattr(value, "seek", None)):
+                position = value.tell()
+                value.seek(0)
+            raw = value.read()
+        finally:
+            if position is not None:
+                value.seek(position)
+    else:
+        raise ValueError("CSVの入力形式を確認できません。CSVを選択し直してください。")
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise ValueError("CSVをバイト形式で読み込めません。CSVを選択し直してください。")
+    if not raw:
+        raise ValueError("CSVが空です。約定履歴CSVを選択し直してください。")
+    return bytes(raw)
+
+
 def parse_sbi_execution_csv(uploaded_file):
     """SBI『約定履歴照会』CSVを読み、明細部分だけDataFrame化する。
 
     ファイル先頭の検索条件・注記行を自動で飛ばし、
     『約定日,銘柄,銘柄コード,...』の見出し行から読み込む。
     """
-    raw = uploaded_file.getvalue()
+    raw = read_sbi_upload_bytes(uploaded_file)
     txt, enc = _decode_sbi_csv(raw)
     lines = txt.splitlines()
 
@@ -2445,7 +2483,7 @@ def parse_sbi_execution_csv(uploaded_file):
         "約定日","銘柄","銘柄コード","市場","取引","期限","預り","課税",
         "約定数量","約定単価","手数料/諸経費等","税額","受渡日","受渡金額/決済損益"
     ] if c in df.columns]
-    df["_source_file"] = getattr(uploaded_file, "name", "uploaded.csv")
+    df["_source_file"] = sbi_upload_name(uploaded_file)
     df["_source_order"] = np.arange(len(df))
     df["_dedupe_key"] = df[key_cols].astype(str).agg("|".join, axis=1)
     return df, enc
@@ -5443,7 +5481,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.35")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.36")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5452,7 +5490,7 @@ st.caption("監視対象・購入予算・注文方式は設定欄で選択。�
 # ------------------------------------------------------------
 # 下部の入力値はウィジェットの再実行時に取得する。
 # ------------------------------------------------------------
-trade_files = st.session_state.get("sbi_execution_csvs_v177", [])
+trade_files = normalize_sbi_uploads(st.session_state.get("sbi_execution_csvs_v177", []))
 buying_power_input = st.session_state.get("v172431_buying_power", None)
 buying_power = int(buying_power_input or 0)
 st.caption("① ページを開くと自動判定 → ② 買い候補を確認 → ③ 下部でCSV・余力を入力し参考株数を計算")
@@ -5460,15 +5498,15 @@ st.caption("① ページを開くと自動判定 → ② 買い候補を確認 
 confirmed = {}
 sbi_trades_df = pd.DataFrame()
 sbi_warning_df = pd.DataFrame()
+parsed_parts, parse_errors = [], []
 if trade_files:
-    parsed_parts, parse_errors = [], []
     for f in trade_files:
         try:
             part, _enc = parse_sbi_execution_csv(f)
             if not part.empty:
                 parsed_parts.append(part)
         except Exception as e:
-            parse_errors.append(f"{f.name}: {e}")
+            parse_errors.append(f"{sbi_upload_name(f)}: {e}")
     if parsed_parts:
         sbi_trades_df = pd.concat(parsed_parts, ignore_index=True)
         sbi_trades_df = sbi_trades_df.drop_duplicates("_dedupe_key", keep="first").copy()
@@ -5482,8 +5520,8 @@ if trade_files:
                 }
                 for _, r in holdings_auto_df.iterrows()
             }
-        if parse_errors:
-            st.warning("一部CSVを読めませんでした：\n- " + "\n- ".join(parse_errors))
+    if parse_errors:
+        st.warning("一部CSVを読めませんでした：\n- " + "\n- ".join(parse_errors))
 all_held_codes = list(confirmed.keys())
 short_confirmed = confirmed
 held_codes = all_held_codes

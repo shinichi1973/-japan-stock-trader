@@ -1,6 +1,6 @@
 # ============================================================
 # 日本株 AI投資アシスタント Ver.17.24.37
-# BUILD: VER17-24-37-BOTTOM-RESEARCH-20261021
+# BUILD: VER17-24-38-BOTTOM-COVERAGE-FIX-20261022
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -44,8 +44,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.37 買い候補優先表示・TOPIX底打ち研究"
-BUILD = "VER17-24-37-BOTTOM-RESEARCH-20261021"
+VERSION = "17.24.38 底打ち研究・欠損再取得と暫定TOP300"
+BUILD = "VER17-24-38-BOTTOM-COVERAGE-FIX-20261022"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -7250,7 +7250,7 @@ def build_buy_exclusions(audit, purchases, holdings, previous=None):
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def download_bottom_research(tickers_tuple, target_day):
+def download_bottom_research(tickers_tuple, target_day, retry_tag=0):
     """Explicit research request only; raw prices for turnover, adjusted for patterns."""
     result = {}
     for offset in range(0, len(tickers_tuple), 60):
@@ -7303,8 +7303,8 @@ def rank_bottom_research(universe, prices, target_day, valuations):
     cov = pd.DataFrame(coverage)
     complete = len(eligible) == len(universe) and len(eligible) >= 300
     eligible.sort(key=lambda r: (-r[0], r[1]))
-    # Incomplete coverage cannot identify the true TOP300. Do not substitute a subset.
-    if not complete:
+    # Missing stocks may change the true TOP300: publish explicitly provisional research.
+    if len(eligible) < 300:
         return pd.DataFrame(), pd.DataFrame(), cov, False
     benchmark = prices.get('1306.T', pd.DataFrame())
     if not benchmark.empty:
@@ -7356,7 +7356,10 @@ def rank_bottom_research(universe, prices, target_day, valuations):
     audit = pd.DataFrame(rows).sort_values(['研究点', '売買代金順位'], ascending=[False, True]).reset_index(drop=True)
     ranking = audit[audit['研究判定'].eq('上昇転換確認')].copy().reset_index(drop=True)
     ranking.insert(0, '順位', np.arange(1, len(ranking) + 1))
-    return ranking, audit, cov, True
+    scope = '確定TOP300' if complete else '暫定TOP300（未確認銘柄あり）'
+    audit['母集団確認'] = scope
+    ranking['母集団確認'] = scope
+    return ranking, audit, cov, complete
 
 
 def render_bottom_research(valuations):
@@ -7376,6 +7379,20 @@ def render_bottom_research(valuations):
                 ts = tuple(dict.fromkeys(universe['ticker'].astype(str).tolist() + ['1306.T']))
                 started = time.perf_counter()
                 frames = download_bottom_research(ts, target)
+                # Retry only missing/stale histories; bypass the initial cached failure.
+                retry_codes = []
+                for code in universe['コード'].astype(str):
+                    history = frames.get(code + '.T', pd.DataFrame())
+                    if history.empty or history.index.max() != pd.Timestamp(target) or len(history) < 60:
+                        retry_codes.append(code + '.T')
+                if retry_codes:
+                    for retry_no in (1, 2):
+                        recovered = download_bottom_research(tuple(retry_codes), target, retry_tag=retry_no)
+                        frames.update(recovered)
+                        retry_codes = [t for t in retry_codes if t not in frames or frames[t].empty
+                                       or frames[t].index.max() != pd.Timestamp(target) or len(frames[t]) < 60]
+                        if not retry_codes:
+                            break
                 ranking, audit, coverage, complete = rank_bottom_research(universe, frames, target, valuations)
                 st.session_state['v172437_bottom_result'] = {'ranking': ranking, 'audit': audit, 'coverage': coverage,
                     'complete': complete, 'target': target, 'created': tokyo_now().isoformat(),
@@ -7391,10 +7408,10 @@ def render_bottom_research(valuations):
         st.caption('保存された研究結果です。基準日を確認してください。朝は前営業日の日足が判定対象です。')
     if not result['complete']:
         good = int(result['coverage']['状態'].eq('確認済').sum())
-        st.warning(f"TOPIX {result['universe_count']}銘柄中、確認済みは{good}銘柄。上位300を確定できないためランキングは生成していません。")
-    elif result['ranking'].empty:
+        st.warning(f"TOPIX {result['universe_count']}銘柄中、確認済み{good}銘柄・未確認{result['universe_count'] - good}銘柄。暫定TOP300として表示します。未確認銘柄の復旧で順位・構成が変わる可能性があります。" if good >= 300 else f"確認済み{good}銘柄のためTOP300を作成できません。300銘柄以上の確認が必要です。")
+    if result['ranking'].empty and not result['audit'].empty:
         st.info('上昇転換と財務条件をすべて満たす研究候補は0件です。')
-    else:
+    elif not result['ranking'].empty:
         st.dataframe(result['ranking'], use_container_width=True, hide_index=True)
     if not result['audit'].empty and result['audit']['対TOPIX連動ETF20日超過率%'].isna().all():
         st.warning('比較用ETFの日足未確認のため、相対強さ10点は未算定です。')
@@ -7402,7 +7419,7 @@ def render_bottom_research(valuations):
         st.dataframe(result['audit'], use_container_width=True, hide_index=True)
     with st.expander('構成銘柄の日足取得状況', expanded=False):
         st.dataframe(result['coverage'], use_container_width=True, hide_index=True)
-    st.caption('財務は通常更新の取得済み評価を照合。研究対象にしかない銘柄は財務未確認として保留し、取得できた銘柄だけでTOP300を代替しません。')
+    st.caption('財務は通常更新の取得済み評価を照合。研究対象にしかない銘柄は財務未確認として保留します。全件確認時のみ確定TOP300、欠損時は確認済み銘柄内の暫定TOP300です。')
     for key in ['ranking', 'audit', 'coverage']:
         st.download_button('研究CSV：' + key, result[key].to_csv(index=False).encode('utf-8-sig'), 'bottom_research_' + key + '.csv', 'text/csv', key='bottom_dl_' + key)
     with st.expander('判定ルール・本番採用前の確認', expanded=False):

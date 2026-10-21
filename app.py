@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.36
-# BUILD: VER17-24-36-SBI-UPLOAD-FIX-20261020
+# 日本株 AI投資アシスタント Ver.17.24.37
+# BUILD: VER17-24-37-BOTTOM-RESEARCH-20261021
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,13 +39,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.36",
+    page_title="日本株 AI投資アシスタント Ver.17.24.37",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.36 約定履歴CSVの入力形式・エラー処理修正"
-BUILD = "VER17-24-36-SBI-UPLOAD-FIX-20261020"
+VERSION = "17.24.37 買い候補優先表示・TOPIX底打ち研究"
+BUILD = "VER17-24-37-BOTTOM-RESEARCH-20261021"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -5481,11 +5481,13 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.36")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.37")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
 st.caption("監視対象・購入予算・注文方式は設定欄で選択。株数上限解除・対象拡大の成績は比較検証で確認してください。")
+
+main_tab, bottom_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "底打ち・上昇転換研究", "大化け候補", "管理者"])
 
 # ------------------------------------------------------------
 # 下部の入力値はウィジェットの再実行時に取得する。
@@ -5931,14 +5933,7 @@ if data and (true_top50_codes or held_code_set):
                 })
 
 signal_audit_df = pd.DataFrame(signal_audit_rows)
-if not signal_audit_df.empty:
-    _skipped = signal_audit_df[signal_audit_df["採用方式の買いシグナル"].eq(True)
-                               & signal_audit_df["監視対象"].ne("保有")
-                               & signal_audit_df["最終買い"].eq(False)]
-    if not _skipped.empty:
-        st.info(f"買いサインが出ても共通条件で見送り：{len(_skipped)}銘柄。理由は以下で確認できます。")
-        with st.expander("買いサインの見送り理由", expanded=False):
-            st.dataframe(_skipped[["コード", "銘柄名", "銘柄判定", "買い見送り理由"]], use_container_width=True, hide_index=True)
+
 if signal_first and not signal_first_audit_df.empty:
     with st.expander("TOPIX＋日経225買いシグナルの抽出・見送り理由", expanded=False):
         st.caption(f"買いシグナル抽出 {len(signal_first_audit_df)}銘柄 / 財務判定不能による見送り {value_unrated_count}銘柄。" + ("通過候補はATR比率の大きい順。" if replacement_live else "通過候補はATR比率の大きい順。入口変更後の収益性は未検証。"))
@@ -6603,7 +6598,7 @@ def triple_news_purchase_status(selected, buy_view, signal_audit, held_codes, bu
 
 
 def render_triple_news_pick(compare, freshness, price_data, held_codes, values, buy_view, signal_audit, buying_power, block_unrated, run_clicked):
-    st.subheader("⭐ 今日の一推し（無料材料評価）")
+    st.subheader("⭐ AIイチオシ（無料材料評価）")
     with st.expander("無料ニュース評価の設定", expanded=False):
         auto = st.checkbox("今日の判定を更新と一緒に無料ニュースも更新", value=False, key="v172429_news_auto")
         st.caption("3指標すべて点灯した銘柄を、直近7日間の無料公開RSSの見出しで比較します。有料API・APIキーは使いません。同じ結果は30分間再利用します。")
@@ -7230,16 +7225,266 @@ multibagger_audit = annotate_multibagger_choice(multibagger_audit)
 multibagger_candidates = multibagger_audit[multibagger_audit["AI参考順位"].notna()].sort_values("AI参考順位").copy() if not multibagger_audit.empty else pd.DataFrame()
 
 
+# Independent research: no references from live BUY/SELL/allocation paths.
+def build_buy_exclusions(audit, purchases, holdings, previous=None):
+    rows, seen = [], set()
+    current = set(purchases['コード'].astype(str)) if 'コード' in purchases else set()
+    held = set(map(str, holdings))
+    if isinstance(audit, pd.DataFrame) and not audit.empty:
+        for _, r in audit.iterrows():
+            c = str(r['コード'])
+            if c in current or c in held or not bool(r.get('採用方式の買いシグナル', False)):
+                continue
+            reason = str(r.get('買い見送り理由', '') or '')
+            if not reason or reason == 'nan':
+                reason = '購入優先順位により今回のTOP3対象外' if bool(r.get('最終買い', False)) else '最終買い条件未達'
+            rows.append({'コード': c, '銘柄名': r.get('銘柄名', c), '銘柄判定': r.get('銘柄判定', ''), '理由': reason})
+            seen.add(c)
+    for r in previous or []:
+        c = str(r['コード'])
+        if c in current or c in seen:
+            continue
+        reason = '保有銘柄として確認済み' if c in held else '今回の買いサインが不成立、または監視対象・日足確認条件から外れたため'
+        rows.append({'コード': c, '銘柄名': r.get('銘柄名', c), '銘柄判定': r.get('割安判定', ''), '理由': reason})
+    return pd.DataFrame(rows, columns=['コード', '銘柄名', '銘柄判定', '理由'])
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def download_bottom_research(tickers_tuple, target_day):
+    """Explicit research request only; raw prices for turnover, adjusted for patterns."""
+    result = {}
+    for offset in range(0, len(tickers_tuple), 60):
+        chunk = list(tickers_tuple[offset:offset + 60])
+        try:
+            raw = yf.download(tickers=chunk, period='6mo', interval='1d', auto_adjust=False,
+                              actions=False, progress=False, threads=8, group_by='ticker', timeout=25)
+        except Exception:
+            continue
+        if raw is None or raw.empty:
+            continue
+        for t in chunk:
+            try:
+                one = raw[t] if isinstance(raw.columns, pd.MultiIndex) and t in raw.columns.get_level_values(0) else raw.xs(t, axis=1, level=1) if isinstance(raw.columns, pd.MultiIndex) else raw if len(chunk) == 1 else pd.DataFrame()
+                x = _normalize_ohlcv(one)
+                x = x.loc[x.index <= pd.Timestamp(target_day)].copy()
+                if x.empty:
+                    continue
+                x['Turnover'] = x['Close'] * x['Volume']
+                # Split/dividend adjusted OHLC for shape; turnover remains unadjusted.
+                if 'Adj Close' not in one:
+                    continue
+                adj = pd.to_numeric(one['Adj Close'], errors='coerce')
+                adj.index = pd.DatetimeIndex(pd.to_datetime(adj.index)).tz_localize(None).normalize()
+                ratio = adj[~adj.index.duplicated(keep='last')].reindex(x.index) / x['Close']
+                if ratio.isna().any() or (ratio <= 0).any():
+                    continue
+                x['RawClose'] = x['Close'].copy()
+                for col in ['Open', 'High', 'Low', 'Close']:
+                    x[col] = x[col] * ratio
+                result[t] = x
+            except (KeyError, ValueError, TypeError, IndexError):
+                continue
+    return result
+
+
+def rank_bottom_research(universe, prices, target_day, valuations):
+    """Only information observable at target_day; no centred pivots/future bars."""
+    coverage, eligible, rows = [], [], []
+    target = pd.Timestamp(target_day).normalize()
+    for _, u in universe.iterrows():
+        c = str(u['コード']); x = prices.get(c + '.T', pd.DataFrame())
+        status = '取得不可'
+        if not x.empty:
+            x = x.loc[x.index <= target]
+            status = '日足更新待ち' if x.empty or x.index.max() != target else '履歴不足' if len(x) < 60 else '確認済'
+        coverage.append({'コード': c, '銘柄名': u['銘柄名'], '状態': status})
+        if status == '確認済':
+            eligible.append((float(x['Turnover'].tail(20).mean()), c, u['銘柄名'], x))
+    cov = pd.DataFrame(coverage)
+    complete = len(eligible) == len(universe) and len(eligible) >= 300
+    eligible.sort(key=lambda r: (-r[0], r[1]))
+    # Incomplete coverage cannot identify the true TOP300. Do not substitute a subset.
+    if not complete:
+        return pd.DataFrame(), pd.DataFrame(), cov, False
+    benchmark = prices.get('1306.T', pd.DataFrame())
+    if not benchmark.empty:
+        benchmark = benchmark.loc[benchmark.index <= target]
+    bench_return = np.nan
+    if len(benchmark) >= 21 and benchmark.index.max() == target:
+        bench_return = (benchmark.Close.iloc[-1] / benchmark.Close.iloc[-21] - 1) * 100
+    labels = dict(zip(valuations['コード'].astype(str), valuations['割安判定'])) if not valuations.empty and {'コード', '割安判定'}.issubset(valuations.columns) else {}
+    for turnover_rank, (turnover, c, nm, x) in enumerate(eligible[:300], 1):
+        close, low, high = x.Close, x.Low, x.High
+        bottom_pos = len(x) - 20 + int(np.argmin(low.tail(20).to_numpy()))
+        elapsed = len(x) - 1 - bottom_pos
+        bottom = float(low.iloc[bottom_pos])
+        stopped = elapsed >= 3
+        # Two separated 3-session low zones AFTER the identified bottom.
+        higher_low = elapsed >= 6 and float(low.iloc[-3:].min()) > float(low.iloc[-6:-3].min())
+        ma5 = close.rolling(5).mean(); ma25 = close.rolling(25).mean()
+        break_high = close.iloc[-1] > high.iloc[-6:-1].max()
+        ma_up = ma5.iloc[-1] > ma5.iloc[-2] and close.iloc[-1] > ma5.iloc[-1]
+        delta = close.diff(); gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        rsi = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+        rsi = rsi.mask((loss == 0) & (gain > 0), 100).mask((gain == 0) & (loss == 0), 50)
+        rsi_up = rsi.iloc[-1] > rsi.iloc[-2] and rsi.iloc[-1] >= 40
+        volume_ratio = float(x.Volume.iloc[-1] / x.Volume.iloc[-21:-1].mean()) if x.Volume.iloc[-21:-1].mean() > 0 else 0
+        rebound = float((close.iloc[-1] / bottom - 1) * 100)
+        ret20 = float((close.iloc[-1] / close.iloc[-21] - 1) * 100)
+        rs = ret20 - bench_return
+        score = 20 * stopped + 20 * higher_low + 15 * break_high + 10 * ma_up + 5 * rsi_up + (20 if volume_ratio >= 1.5 else 10 if volume_ratio >= 1 else 0) + (10 if np.isfinite(rs) and rs > 0 else 0)
+        label = str(labels.get(c, '未確認（研究対象のみ取得）'))
+        reasons = []
+        if not stopped: reasons.append('底から3営業日未経過')
+        if not higher_low: reasons.append('安値切上げ未確認')
+        if not break_high: reasons.append('直前5日高値未突破')
+        if not ma_up: reasons.append('5日線の上向き・終値回復未確認')
+        if rebound > 12: reasons.append('底から12%超上昇・追いかけ見送り')
+        if '割高' in label: reasons.append('割高判定')
+        if not any(v in label for v in ['割安', '適正']): reasons.append('財務評価未確認・評価対象外')
+        confirmed = stopped and higher_low and break_high and ma_up
+        stage = '上昇転換確認' if confirmed else '底打ち監視' if stopped else '条件外'
+        if confirmed and reasons: stage = '上昇転換・購入検討保留'
+        rows.append({'コード': c, '銘柄名': nm, '研究判定': stage, '研究点': int(score), '売買代金順位': turnover_rank,
+                     '20日平均売買代金_概算': turnover, '現在株価': float(x.RawClose.iloc[-1]), '銘柄判定': label,
+                     '底から営業日数': elapsed, '底から上昇率%': round(rebound, 2), '出来高倍率': round(volume_ratio, 2),
+                     'RSI14': round(float(rsi.iloc[-1]), 2), '対TOPIX連動ETF20日超過率%': round(rs, 2),
+                     '底打ち否定ライン_参考': round(bottom * float(x.RawClose.iloc[-1] / close.iloc[-1]), 2),
+                     '選定根拠': '／'.join(v for b, v in [(stopped,'安値更新停止'), (higher_low,'安値切上げ'), (break_high,'5日高値突破'), (ma_up,'5日線上向き'), (rsi_up,'RSI改善'), (volume_ratio >= 1.5,'出来高増加')] if b),
+                     '保留・条件外理由': '／'.join(reasons), '日足基準日': str(target.date())})
+    audit = pd.DataFrame(rows).sort_values(['研究点', '売買代金順位'], ascending=[False, True]).reset_index(drop=True)
+    ranking = audit[audit['研究判定'].eq('上昇転換確認')].copy().reset_index(drop=True)
+    ranking.insert(0, '順位', np.arange(1, len(ranking) + 1))
+    return ranking, audit, cov, True
+
+
+def render_bottom_research(valuations):
+    st.subheader('底打ち・上昇転換ランキング〈研究〉')
+    st.caption('実売買・株数・売り条件への反映なし。研究点は勝率ではありません。前営業日までの確定日足だけで判定します。')
+    st.write('TOPIX全構成銘柄 → 直近20営業日の平均売買代金上位300 → 底打ち・上昇転換を採点。売買代金は終値×出来高の概算です。')
+    st.caption('相対評価はTOPIX連動ETF（1306）の調整後20日騰落率と比較。底打ち否定ラインは観測した安値の参考値です。')
+    if st.button('TOPIX全体から研究ランキングを更新', key='v172437_bottom_run'):
+        st.session_state.pop('v172437_bottom_result', None)
+        try:
+            with st.spinner('研究専用：TOPIX構成銘柄と6か月日足を確認中。通常更新とは別に数分かかる場合があります…'):
+                session = latest_tse_session_status()
+                if not session.get('confirmed') or pd.isna(session.get('session_date')):
+                    raise ValueError('直近東証日の確定を確認できません。朝または16時以降に再実行してください。')
+                target = str(pd.Timestamp(session['session_date']).date())
+                universe = discover_topix_stock_universe()
+                ts = tuple(dict.fromkeys(universe['ticker'].astype(str).tolist() + ['1306.T']))
+                started = time.perf_counter()
+                frames = download_bottom_research(ts, target)
+                ranking, audit, coverage, complete = rank_bottom_research(universe, frames, target, valuations)
+                st.session_state['v172437_bottom_result'] = {'ranking': ranking, 'audit': audit, 'coverage': coverage,
+                    'complete': complete, 'target': target, 'created': tokyo_now().isoformat(),
+                    'seconds': round(time.perf_counter() - started, 1), 'universe_count': len(universe)}
+        except Exception as exc:
+            st.error('研究ランキングを更新できませんでした：' + str(exc))
+    result = st.session_state.get('v172437_bottom_result')
+    if not result:
+        st.info('専用ボタンで研究を実行します。通常の判定更新・余力入力では追加取得しません。')
+        return
+    st.caption(f"日足基準日 {result['target']} ／ 実行日時 {result['created']} ／ 取得処理 {result['seconds']}秒")
+    if result['target'] != str(tokyo_now().date()):
+        st.caption('保存された研究結果です。基準日を確認してください。朝は前営業日の日足が判定対象です。')
+    if not result['complete']:
+        good = int(result['coverage']['状態'].eq('確認済').sum())
+        st.warning(f"TOPIX {result['universe_count']}銘柄中、確認済みは{good}銘柄。上位300を確定できないためランキングは生成していません。")
+    elif result['ranking'].empty:
+        st.info('上昇転換と財務条件をすべて満たす研究候補は0件です。')
+    else:
+        st.dataframe(result['ranking'], use_container_width=True, hide_index=True)
+    if not result['audit'].empty and result['audit']['対TOPIX連動ETF20日超過率%'].isna().all():
+        st.warning('比較用ETFの日足未確認のため、相対強さ10点は未算定です。')
+    with st.expander('TOP300全件・監視銘柄・見送り理由', expanded=False):
+        st.dataframe(result['audit'], use_container_width=True, hide_index=True)
+    with st.expander('構成銘柄の日足取得状況', expanded=False):
+        st.dataframe(result['coverage'], use_container_width=True, hide_index=True)
+    st.caption('財務は通常更新の取得済み評価を照合。研究対象にしかない銘柄は財務未確認として保留し、取得できた銘柄だけでTOP300を代替しません。')
+    for key in ['ranking', 'audit', 'coverage']:
+        st.download_button('研究CSV：' + key, result[key].to_csv(index=False).encode('utf-8-sig'), 'bottom_research_' + key + '.csv', 'text/csv', key='bottom_dl_' + key)
+    with st.expander('判定ルール・本番採用前の確認', expanded=False):
+        st.write('底の形40点（安値更新停止20・安値切上げ20）、上昇転換30点（高値突破15・5日線改善10・RSI改善5）、出来高20点、対ETF強さ10点。')
+        st.write('安値切上げは底から6営業日以上経過後、直近3日安値がその前3日安値を上回る条件。底から12%超上昇は購入検討保留。数値は未検証の初期設定です。')
+        st.write('本番採用前に、過去時点の構成銘柄・売買代金順位を使い、翌営業日約定・費用込みで現行Stochと比較してください。今回の研究ランキングだけでは優位性を確認できません。')
+
+
+
 # ------------------------------------------------------------
 # 短期売買と管理者タブ
 # ------------------------------------------------------------
-main_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "大化け候補", "管理者"])
 with main_tab:
+    st.subheader("🟢 今日の買い候補 TOP3")
+    if buy_view.empty:
+        st.info("監視対象に、現在の買い条件を満たす銘柄はありません。")
+    else:
+        render_mobile_trade_cards(buy_view, "buy", trend_by_code)
+        simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","均等配分予算","参考購入株数","注文区分","通常注文参考株数","通常注文概算額","%K","%D","買付可否"] if c in buy_view.columns]
+        with st.expander("買い候補の詳細表", expanded=False):
+            buy_display = buy_view[simple_buy_cols].rename(columns={"割安判定": "銘柄判定"}).copy()
+            st.dataframe(buy_display, use_container_width=True, hide_index=True)
+            st.caption("100株単位・参考IFDOCO")
+            ifd_table = build_reference_ifdoco(buy_view, ifd_take_profit, 7.0)
+            if ifd_table.empty:
+                st.info("余力入力後に参考IFDOCOを計算します。" if not order_inputs_ready else "予算・注文余力内で100株買える正式買い候補はありません。")
+            else:
+                st.dataframe(ifd_table, use_container_width=True, hide_index=True)
+                st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
+    st.caption(f"新規買い：{live_universe_mode}の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定：{'割高・判定不能を除外' if signal_first and block_unrated else '割高を除外・判定不能は許可' if signal_first else '参考表示'}")
+    st.subheader("買い候補から外れた銘柄・理由")
+    _snapshot = buy_view.to_dict('records') if not buy_view.empty else []
+    _signature = (st.session_state.get('v177_generated_at', ''), tuple(str(r['コード']) for r in _snapshot))
+    if st.session_state.get('v172437_buy_signature') != _signature:
+        st.session_state['v172437_previous_buys'] = st.session_state.get('v172437_last_buys', [])
+        st.session_state['v172437_last_buys'] = _snapshot
+        st.session_state['v172437_buy_signature'] = _signature
+    excluded_buy_df = build_buy_exclusions(signal_audit_df, buy_view, held_codes,
+                                           st.session_state.get('v172437_previous_buys', []))
+    if excluded_buy_df.empty:
+        st.info("今回の買いサインから見送った銘柄はありません。")
+    else:
+        st.dataframe(excluded_buy_df, use_container_width=True, hide_index=True)
+    st.caption("今回の買いサインの見送り、およびこの起動中に直前の買い候補から外れた銘柄です。再起動前の候補履歴は含みません。")
+    st.subheader("🔻 売り")
+    if sell_view.empty:
+        st.success("売り候補はありません。")
+    else:
+        render_mobile_trade_cards(sell_view, "sell", trend_by_code)
+        with st.expander("売り候補の詳細表", expanded=False):
+            sell_display = sell_view.rename(columns={"割安判定": "銘柄判定"})
+            st.dataframe(sell_display, use_container_width=True, hide_index=True)
+    render_current_holdings(current_holdings_rows(
+        short_confirmed, sell_view, signal_audit_rows, valuation_master_df, data
+    ))
+    st.subheader("参考株数の計算（候補確認後に入力）")
+    st.caption("余力を候補数で均等に分けて参考株数を計算します。入力確定後に自動再計算します。CSVは保有照合に使用します。")
+    st.subheader("約定履歴CSV")
+    st.file_uploader("SBI 約定履歴CSV", type=["csv"], accept_multiple_files=True,
+                     key="sbi_execution_csvs_v177")
+    st.subheader("余力入力")
+    st.number_input("現物買付余力（円）", min_value=0, max_value=1_000_000_000,
+                    value=None, step=1000, key="v172431_buying_power",
+                    placeholder="候補確認後に入力")
+    if st.button("参考株数を再計算", key="v172434_recalculate"):
+        st.rerun()
+    if not order_inputs_ready:
+        st.info("余力を入力すると参考株数を計算します。未入力は買い条件の不成立を意味しません。")
+    if order_inputs_ready and not holdings_verified:
+        st.warning("参考株数は保有照合前の暫定値です。CSV未入力・読込エラー・履歴不足の場合、保有株を新規候補から除外できない場合があります。注文前に確認してください。")
+    loaded_codes = {code(t) for t in data}
+    if set(held_codes) - loaded_codes:
+        st.warning("追加取得後も保有銘柄の日足を確認できません。該当銘柄の売り判定は未確認です。『今日の判定を更新』で再確認してください。")
+
     news_pick_result, news_pick_exclusions, news_pick_signature = render_triple_news_pick(
         indicator_compare_df, daily_bar_status_df, data, held_codes,
         [value_top50_df, signal_value_df], buy_view, signal_audit_df,
         short_buying_power, bool(block_unrated), run_clicked,
     )
+    with st.expander("🌱 大化け候補 TOP3（研究）", expanded=False):
+        st.caption("数年の成長を調べる候補です。購入株数・売買指示には反映しません。")
+        render_multibagger_cards(multibagger_candidates)
     m1, m2 = st.columns(2)
     m1.metric("保有", f"{len(held_codes)}銘柄")
     m2.metric("買付余力", "未入力" if buying_power_input is None else f"¥{int(short_buying_power):,}")
@@ -7256,64 +7501,13 @@ with main_tab:
             st.warning(f"日足データ：{target_label} 確定 {current_count}/{total_count}銘柄。更新待ち銘柄は判定に注意してください。")
         else:
             st.warning("最新日足は取引中または更新待ちです。確定後にもう一度『今日の判定を更新』を押してください。")
-    render_current_holdings(current_holdings_rows(
-        short_confirmed, sell_view, signal_audit_rows, valuation_master_df, data
-    ))
     if run_error:
         st.error(run_error)
     elif not data:
         st.info("「今日の判定を更新」を押してください。")
-    else:
-        st.subheader("🔻 売り")
-        if sell_view.empty:
-            st.success("売り候補はありません。")
-        else:
-            render_mobile_trade_cards(sell_view, "sell", trend_by_code)
-            with st.expander("売り候補の詳細表", expanded=False):
-                sell_display = sell_view.rename(columns={"割安判定": "銘柄判定"})
-                st.dataframe(sell_display, use_container_width=True, hide_index=True)
 
-        st.subheader("🟢 買い")
-        if buy_view.empty:
-            st.info("監視対象に、現在の買い条件を満たす銘柄はありません。")
-        else:
-            render_mobile_trade_cards(buy_view, "buy", trend_by_code)
-            simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","均等配分予算","参考購入株数","注文区分","通常注文参考株数","通常注文概算額","%K","%D","買付可否"] if c in buy_view.columns]
-            with st.expander("買い候補の詳細表", expanded=False):
-                buy_display = buy_view[simple_buy_cols].rename(columns={"割安判定": "銘柄判定"}).copy()
-                st.dataframe(buy_display, use_container_width=True, hide_index=True)
-        st.caption(f"新規買い：{live_universe_mode}の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定：{'割高・判定不能を除外' if signal_first and block_unrated else '割高を除外・判定不能は許可' if signal_first else '参考表示'}")
-        with st.expander("100株単位・参考IFDOCO", expanded=False):
-            ifd_table = build_reference_ifdoco(buy_view, ifd_take_profit, 7.0)
-            if ifd_table.empty:
-                st.info("余力入力後に参考IFDOCOを計算します。" if not order_inputs_ready else "予算・注文余力内で100株買える正式買い候補はありません。")
-            else:
-                st.dataframe(ifd_table, use_container_width=True, hide_index=True)
-                st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
-
-    st.subheader("参考株数の計算（候補確認後に入力）")
-    st.caption("余力を候補数で均等に分けて参考株数を計算します。入力確定後に自動再計算します。CSVは保有照合に使用します。")
-    input_left, input_right = st.columns([1.35, 1.0], gap="large")
-    with input_left:
-        st.file_uploader("SBI 約定履歴CSV", type=["csv"], accept_multiple_files=True,
-                         key="sbi_execution_csvs_v177")
-    with input_right:
-        st.number_input("現物買付余力（円）", min_value=0, max_value=1_000_000_000,
-                        value=None, step=1000, key="v172431_buying_power",
-                        placeholder="候補確認後に入力")
-    if st.button("参考株数を再計算", key="v172434_recalculate"):
-        st.rerun()
-    if not order_inputs_ready:
-        st.info("余力を入力すると参考株数を計算します。未入力は買い条件の不成立を意味しません。")
-    if order_inputs_ready and not holdings_verified:
-        st.warning("参考株数は保有照合前の暫定値です。CSV未入力・読込エラー・履歴不足の場合、保有株を新規候補から除外できない場合があります。注文前に確認してください。")
-    loaded_codes = {code(t) for t in data}
-    if set(held_codes) - loaded_codes:
-        st.warning("追加取得後も保有銘柄の日足を確認できません。該当銘柄の売り判定は未確認です。『今日の判定を更新』で再確認してください。")
-
-    with st.expander("🌱 大化け候補 TOP3（研究）", expanded=False):
-        st.caption("数年の成長を調べる候補です。購入株数・売買指示には反映しません。")
-        render_multibagger_cards(multibagger_candidates)
+with bottom_tab:
+    render_bottom_research(valuation_master_df)
 
 with multibagger_tab:
     st.subheader("🌱 大化け候補（研究）")
@@ -7760,6 +7954,12 @@ try:
         else:
             buy_export = pd.DataFrame(columns=buy_cols_default)
         zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("buy_candidate_exclusions.csv", excluded_buy_df.to_csv(index=False, encoding="utf-8-sig"))
+        _bottom_saved = st.session_state.get('v172437_bottom_result')
+        if _bottom_saved:
+            for _key in ['ranking', 'audit', 'coverage']:
+                zf.writestr('bottom_research_' + _key + '.csv', _bottom_saved[_key].to_csv(index=False, encoding='utf-8-sig'))
+            zf.writestr('bottom_research_metadata.csv', pd.DataFrame([{k: v for k, v in _bottom_saved.items() if k not in ['ranking', 'audit', 'coverage']}]).to_csv(index=False, encoding='utf-8-sig'))
         zf.writestr("reference_ifdoco.csv",build_reference_ifdoco(buy_view, ifd_take_profit, 7.0).to_csv(index=False,encoding="utf-8-sig"))
         zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
         compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()

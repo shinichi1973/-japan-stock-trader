@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.37
-# BUILD: VER17-24-38-BOTTOM-COVERAGE-FIX-20261022
+# 日本株 AI投資アシスタント Ver.17.24.39
+# BUILD: VER17-24-39-SINGLE-IFDOCO-20261022
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,13 +39,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.37",
+    page_title="日本株 AI投資アシスタント Ver.17.24.39",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.38 底打ち研究・欠損再取得と暫定TOP300"
-BUILD = "VER17-24-38-BOTTOM-COVERAGE-FIX-20261022"
+VERSION = "17.24.39 下降除外解除・1万円利益研究"
+BUILD = "VER17-24-39-SINGLE-IFDOCO-20261022"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3973,10 +3973,6 @@ def common_new_buy_reasons(label, daily_status, downtrend=False, churn_reason=""
     elif label not in {"🟢 割安", "🟡 やや割安", "⚪ 適正圏"}:
         reasons.append("財務評価未確認・赤字予想等のため新規買い見送り")
     if not replacement:
-        if pd.isna(downtrend):
-            reasons.append("下降判定未確認のため新規買い見送り")
-        elif bool(downtrend):
-            reasons.append("下降確認のため反転待ち")
         if churn_reason:
             reasons.append("短期クロス検査：" + str(churn_reason))
     return reasons
@@ -5481,13 +5477,13 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.37")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.39")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
 st.caption("監視対象・購入予算・注文方式は設定欄で選択。株数上限解除・対象拡大の成績は比較検証で確認してください。")
 
-main_tab, bottom_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "底打ち・上昇転換研究", "大化け候補", "管理者"])
+main_tab, single_tab, bottom_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "1銘柄・利益1万円研究", "底打ち・上昇転換研究", "大化け候補", "管理者"])
 
 # ------------------------------------------------------------
 # 下部の入力値はウィジェットの再実行時に取得する。
@@ -5555,9 +5551,9 @@ with st.expander("⚙ 購入額・注文方式", expanded=False):
     block_unrated = True
     st.caption("国内財務の判定不能は新規買いを見送ります。")
     min_turnover = st.number_input("買い候補の20日平均売買代金下限（円・最低1億円）", 100000000, 10000000000, 100000000, 10000000, key="v172416_liquidity", disabled=not signal_first)
-    filter_downtrend = not replacement_live
+    filter_downtrend = False  # 下降トレンドによる新規買い除外を解除
     filter_churn = not replacement_live
-    st.caption("全監視対象で割高・赤字予想・財務未確認・日足未確定を新規買いから除外します。Stochでは下降確認・短期クロス多発も除外します。成績改善は未検証です。")
+    st.caption("全監視対象で割高・赤字予想・財務未確認・日足未確定を新規買いから除外します。Stochでは短期クロス多発も除外します。下降トレンドは新規買い除外に使用しません。成績改善は未検証です。")
     st.caption("値幅：ATR14/終値が3%以上＝大、1.5%以上＝中、それ未満＝小。大のみ新規対象。安値切上げ：直近3つの10営業日安値が順に上昇し、終値が25日平均より上。20日平均売買代金は最低1億円。国内財務の判定不能は除外。")
     cap_mode = "上限なし（買付余力を候補へ均等配分）"
     purchase_cap = None
@@ -7523,6 +7519,93 @@ with main_tab:
     elif not data:
         st.info("「今日の判定を更新」を押してください。")
 
+
+def build_single_profit_research(price_data, live_audit, budget=500000, costs=0):
+    """正式買い通過銘柄のみ。取得済み確定足を使用し、追加通信しない。"""
+    rows = []
+    if live_audit is None or live_audit.empty:
+        return pd.DataFrame()
+    eligible = set(live_audit.loc[live_audit["最終買い"].eq(True), "コード"].astype(str))
+    for t, frame in (price_data or {}).items():
+        if code(t) not in eligible or frame is None or len(frame) < 21:
+            continue
+        if frame.attrs.get("daily_bar_status") != "🟢 当日確定":
+            continue
+        x = frame[["High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
+        if not np.isfinite(x.tail(21).to_numpy()).all():
+            continue
+        px = float(x["Close"].iloc[-1])
+        daily_range = float((x["High"] - x["Low"]).tail(20).mean())
+        if not 0 < px <= 5000 or daily_range < 100:
+            continue
+        entry = reference_tick_round(px, upward=False)
+        qty = int(max(0, budget - costs) // (entry * 100)) * 100
+        if qty < 100:
+            continue
+        tr = pd.concat([x["High"] - x["Low"], (x["High"] - x["Close"].shift()).abs(),
+                        (x["Low"] - x["Close"].shift()).abs()], axis=1).max(axis=1)
+        atr = float(tr.tail(14).mean())
+        if not np.isfinite(atr) or atr <= 0:
+            continue
+        target = reference_tick_round(entry + (10000 + costs) / qty, upward=True)
+        stop = reference_tick_round(max(1, entry - atr), upward=False)
+        if not stop < entry < target:
+            continue
+        reward = (target - entry) * qty
+        risk = (entry - stop) * qty
+        required_atr = (target - entry) / atr
+        rr = (reward - costs) / (risk + costs)
+        volume_ratio = float(x["Volume"].iloc[-1] / x["Volume"].tail(20).mean()) if x["Volume"].tail(20).mean() > 0 else 0
+        change5 = (px / float(x["Close"].iloc[-6]) - 1) * 100
+        # 到達距離、損益比、出来高、直近の勢いを明示的に採点。学習モデルや勝率ではない。
+        score = (40 * max(0, 1 - required_atr / 2) + 30 * min(rr / 2, 1)
+                 + 20 * min(volume_ratio / 2, 1) + 10 * min(max(change5, 0) / 5, 1))
+        rows.append({"コード": code(t), "銘柄名": name(t), "日足日": str(frame.index[-1])[:10],
+                     "終値": px, "20日平均日中値幅": round(daily_range, 2), "ATR14": round(atr, 2),
+                     "参考株数": qty, "IFD買い指値": entry, "OCO利確指値": target,
+                     "OCO逆指値発動": stop, "逆指値後": "成行売り", "買い概算額": entry * qty,
+                     "未使用予算": budget - entry * qty - costs, "目標粗利益": reward,
+                     "費用控除後利益（税引前）": reward - costs, "想定損失（費用込）": risk + costs,
+                     "損益比": round(rr, 2), "目標までATR倍率": round(required_atr, 2),
+                     "出来高倍率": round(volume_ratio, 2), "5日騰落率%": round(change5, 2),
+                     "AI参考スコア": round(score, 2), "到達距離条件": required_atr <= 2})
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["到達距離条件", "AI参考スコア", "コード"], ascending=[False, False, True]).reset_index(drop=True)
+
+
+def render_single_profit_research(price_data, live_audit):
+    st.subheader("1銘柄集中・利益1万円を目指す研究")
+    st.caption("予算50万円／100株単位／株価5,000円以下／直近20日平均の高値−安値が100円以上。通常の正式買い通過銘柄全件から選定（TOP3に限定しません）。")
+    costs = st.number_input("往復手数料・諸費用の想定合計（円）", min_value=0, max_value=100000,
+                            value=0, step=100, key="single_profit_costs")
+    table = build_single_profit_research(price_data, live_audit, 500000, int(costs))
+    st.caption("取得済み日足のみを使用。通常の『今日の判定を更新』で更新されます。50万円は研究用の固定予算で、実際の買付余力とは連動しません。")
+    if table.empty:
+        st.info("全条件を満たす銘柄はありません。通常の判定更新と日足・財務の取得状況を確認してください。")
+        return
+    picks = table[table["到達距離条件"]]
+    if picks.empty:
+        st.info("目標までの上昇幅がATR14の2倍以内となる候補がないため、今回の推奨IFDOCOは見送ります。")
+    else:
+        r = picks.iloc[0]
+        st.success(f"AI参考おすすめ：{r['コード']} {r['銘柄名']}（1銘柄のみ）")
+        st.write(f"IFD：買い指値 {r['IFD買い指値']:,.0f}円 × {int(r['参考株数']):,}株")
+        st.write(f"OCO：利確指値 {r['OCO利確指値']:,.0f}円 ／ 逆指値 {r['OCO逆指値発動']:,.0f}円以下で成行売り（全株）")
+        st.write(f"買い概算 {r['買い概算額']:,.0f}円 ／ 費用控除後の目標利益 {r['費用控除後利益（税引前）']:,.0f}円 ／ 想定損失 {r['想定損失（費用込）']:,.0f}円 ／ 損益比 {r['損益比']:.2f}")
+        st.caption(f"選定根拠：目標までATR {r['目標までATR倍率']:.2f}倍、出来高 {r['出来高倍率']:.2f}倍、5日騰落率 {r['5日騰落率%']:.2f}%。日足日 {r['日足日']}。損切りは買い指値からATR14約1本分。")
+        if r["損益比"] < 1:
+            st.warning("想定損失が目標利益を上回る案です。期待値・勝率は未検証です。")
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption("AI参考スコア＝目標への近さ40点・損益比30点・出来高20点・5日上昇率10点の規則式。勝率や利益保証ではありません。到達時期は予測しません。")
+    st.warning("利益1万円は税引前です。逆指値の成行売りは窓開けで想定損失を超える場合があります。呼値・制限値幅・実余力・注文期限はSBI画面で確認してください。通常タブの注文と重複させず、約定価格が変わった場合は決済価格を再計算してください。研究タブのATR損切りは本番の終値7%損切りとは別の参考案です。自動発注はしません。")
+    st.download_button("1銘柄研究CSV", table.to_csv(index=False).encode("utf-8-sig"),
+                       "single_profit_research.csv", "text/csv", key="single_profit_csv")
+
+
+with single_tab:
+    render_single_profit_research(data, signal_audit_df)
+
 with bottom_tab:
     render_bottom_research(valuation_master_df)
 
@@ -7922,7 +8005,7 @@ try:
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "売買ロジック":live_trade_method, "Stoch不使用の試験採用":bool(replacement_live), "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(filter_downtrend), "クロス多発除外":bool(filter_churn), "購入予算方式":cap_mode,
             "最大保有銘柄数":"上限なし", "1銘柄購入予算":maxbuy, "通常注文予算":"上限なし（買付余力内）", "注文方式":execution_mode,
-            "IFDOCO参考利確率":ifd_take_profit,"BUY条件":live_trade_method + "＋全モード共通財務・日足確認" + ("＋下降・クロス多発除外" if not replacement_live else ""),"管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
+            "IFDOCO参考利確率":ifd_take_profit,"BUY条件":live_trade_method + "＋全モード共通財務・日足確認" + ("＋クロス多発除外" if not replacement_live else ""),"管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
             "割高の新規BUY除外":True,
             "SELL条件":("全保有銘柄 / 前日までの20日安値を終値で割る または終値で含み損 -7.0%" if replacement_live else "全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%"),
             "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":live_universe_mode == "固定45銘柄",

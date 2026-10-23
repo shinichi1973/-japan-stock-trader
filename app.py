@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.40
-# BUILD: VER17-24-40-GROWTH-20261022
+# 日本株 AI投資アシスタント Ver.17.24.41
+# BUILD: VER17-24-41-BOTTOM-TRADE-20261023
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,13 +39,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.40",
+    page_title="日本株 AI投資アシスタント Ver.17.24.41",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.40 TOPIX＋グロース対応"
-BUILD = "VER17-24-40-GROWTH-20261022"
+VERSION = "17.24.41 底打ち独立売買判定"
+BUILD = "VER17-24-41-BOTTOM-TRADE-20261023"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -5547,7 +5547,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.40")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.41")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -7428,9 +7428,197 @@ def rank_bottom_research(universe, prices, target_day, valuations):
     return ranking, audit, cov, complete
 
 
-def render_bottom_research(valuations):
+def bottom_price_context(frame, target_day):
+    """Adjusted patterns converted to the latest raw-price scale; reject invalid bars."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    x = frame.copy()
+    x.index = pd.DatetimeIndex(pd.to_datetime(x.index)).tz_localize(None).normalize()
+    x = x[~x.index.duplicated(keep='last')].sort_index().loc[:pd.Timestamp(target_day)]
+    needed = ['Open', 'High', 'Low', 'Close', 'Volume', 'RawClose']
+    if not set(needed).issubset(x.columns) or len(x) < 60:
+        return pd.DataFrame()
+    x[needed] = x[needed].apply(pd.to_numeric, errors='coerce')
+    if (not np.isfinite(x[needed].tail(60).to_numpy()).all()
+            or (x[['Open', 'High', 'Low', 'Close', 'RawClose']].tail(60) <= 0).any().any()
+            or (x.Volume.tail(60) < 0).any()
+            or (x.High.tail(60) < x[['Open', 'Close', 'Low']].tail(60).max(axis=1)).any()
+            or (x.Low.tail(60) > x[['Open', 'Close', 'High']].tail(60).min(axis=1)).any()):
+        return pd.DataFrame()
+    scale = float(x.RawClose.iloc[-1] / x.Close.iloc[-1])
+    x[['Open', 'High', 'Low', 'Close']] *= scale
+    return x
+
+
+def bottom_trade_plan(history, entry):
+    """Frozen plan from bars known BEFORE entry; never lower a stop using later lows."""
+    if len(history) < 21 or not np.isfinite(entry) or entry <= 0:
+        return None
+    tr = pd.concat([history.High - history.Low,
+                    (history.High - history.Close.shift()).abs(),
+                    (history.Low - history.Close.shift()).abs()], axis=1).max(axis=1)
+    atr = float(tr.tail(14).mean())
+    if not np.isfinite(atr) or atr <= 0:
+        return None
+    bottom = float(history.Low.tail(20).min())
+    stop = reference_tick_round(max(entry * .93, bottom - atr * .25), upward=True)
+    if not 0 < stop < entry:
+        return None
+    risk = entry - stop
+    # Use observed overhead resistance, or at most three ATR of room when none exists.
+    overhead = history.High.tail(60)
+    overhead = overhead[overhead > entry]
+    ceiling = min(entry + atr * 3, float(overhead.max())) if not overhead.empty else entry + atr * 3
+    target = reference_tick_round(entry + risk * 2, upward=True)
+    rr = (target - entry) / risk
+    limit = reference_tick_round(min(entry * 1.02, (ceiling + 2 * stop) / 3), upward=False)
+    return {'買い指値_参考': entry, '買付上限_参考': limit,
+            '利確指値_参考': target, '損切り逆指値_参考': stop,
+            '損切り幅%': round(risk / entry * 100, 2), '損益比': round(rr, 2),
+            '上値余地_参考': round(ceiling, 2), 'ATR14': round(atr, 2),
+            '底打ち否定ライン_固定': bottom,
+            '注文条件適合': bool(risk / entry >= .01 and target <= ceiling and limit >= entry)}
+
+
+def build_bottom_trade_decisions(audit, prices, target_day, valuations, holdings=None, registrations=None):
+    """Independent deterministic analysis: no Stoch signals, live guards or priorities."""
+    holdings, registrations = holdings or {}, registrations or {}
+    target_day = pd.Timestamp(target_day).normalize()
+    rows = []
+    labels = dict(zip(valuations['コード'].astype(str), valuations['割安判定'])) if isinstance(valuations, pd.DataFrame) and {'コード', '割安判定'}.issubset(valuations.columns) else {}
+    records = {str(r['コード']): r for r in audit.to_dict('records')} if isinstance(audit, pd.DataFrame) and not audit.empty else {}
+    for c in registrations:
+        if c in holdings and c not in records:
+            records[c] = {'コード': c, '銘柄名': holdings[c].get('name', c), '研究点': np.nan}
+    for c, r in records.items():
+        held = c in holdings
+        row = {'コード': c, '銘柄名': r.get('銘柄名', c), '独立売買判定': '見送り',
+               '判定理由': '', '研究点': r.get('研究点', np.nan), '日足基準日': str(target_day.date()),
+               '銘柄判定': str(labels.get(c, r.get('銘柄判定', '未確認')))}
+        x = bottom_price_context(prices.get(c + '.T'), target_day)
+        if x.empty or x.index[-1] != target_day:
+            row.update(独立売買判定='判定保留', 判定理由='基準日の確定日足・60日履歴・価格整合性を確認できず')
+            rows.append(row)
+            continue
+        px = float(x.Close.iloc[-1])
+        row['現在株価'] = px
+        if held:
+            if c not in registrations:
+                row.update(独立売買判定='対象外', 判定理由='保有中。この独立方式の保有として未指定')
+            else:
+                h = holdings[c]
+                avg = safe_float(h.get('avg_price'))
+                qty = safe_float(h.get('shares'), 0)
+                day = pd.to_datetime(registrations[c], errors='coerce')
+                if pd.isna(day) or day.normalize() > target_day or qty <= 0:
+                    row.update(独立売買判定='判定保留', 判定理由='購入日・保有株数を確認してください')
+                else:
+                    plan = bottom_trade_plan(x.loc[x.index < day.normalize()], avg)
+                    if plan is None:
+                        row.update(独立売買判定='判定保留', 判定理由='購入前21日以上の日足・取得単価・損切り価格を確認できず')
+                    else:
+                        row.update(plan)
+                        row.update({'保有株数': int(qty), '取得単価': avg, '購入日': str(day.date()),
+                                    '損益率%': round((px / avg - 1) * 100, 2)})
+                        after = x.loc[x.index >= day.normalize()]
+                        ma10 = x.Close.rolling(10).mean()
+                        weakness = len(after) >= 2 and bool((x.Close < ma10).tail(2).all())
+                        reason = ('損切りライン以下の終値' if px <= plan['損切り逆指値_参考'] else
+                                  '固定利確目標以上の終値' if px >= plan['利確指値_参考'] else
+                                  '底打ち否定ライン割れ' if px < plan['底打ち否定ライン_固定'] else
+                                  '10日線を終値で2日連続下回る' if weakness else '')
+                        row.update(独立売買判定='売り' if reason else '保有継続',
+                                   判定理由=reason or '損切り・利確・上昇失速の売り条件に未該当')
+                        row['参考売却株数'] = int(qty) if reason else 0
+            rows.append(row)
+            continue
+        entry = reference_tick_round(px, upward=False)
+        plan = bottom_trade_plan(x, entry)
+        reasons = []
+        stage = str(r.get('研究判定', ''))
+        if not stage.startswith('上昇転換'):
+            reasons.append('底打ち・高値突破・5日線改善の確認待ち')
+        if safe_float(r.get('底から上昇率%'), 999) > 12:
+            reasons.append('底から12%超上昇')
+        if safe_float(r.get('出来高倍率'), 0) < 1.2:
+            reasons.append('出来高が前20日平均の1.2倍未満')
+        if safe_float(r.get('研究点'), 0) < 75:
+            reasons.append('研究点75点未満')
+        label = row['銘柄判定']
+        if '割高' in label:
+            reasons.append('割高判定')
+        elif not any(v in label for v in ['割安', '適正']):
+            reasons.append('財務評価未確認')
+        if plan:
+            row.update(plan)
+            if not plan['注文条件適合']:
+                reasons.append('損切り幅1%以上・7%以内／上値余地2Rの条件未達')
+        else:
+            reasons.append('有効な利確・損切り価格を計算できず')
+        ready = stage.startswith('上昇転換')
+        verdict = '買い' if not reasons else '買い待ち' if not ready and not any(v in '／'.join(reasons) for v in ['割高', '財務', '12%']) else '見送り'
+        row.update(独立売買判定=verdict, 判定理由='／'.join(reasons) or '上昇転換・出来高増加・財務・上値余地2Rを確認')
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def render_bottom_trade_decisions(result, valuations, holdings, verified):
+    st.subheader('底打ち・上昇転換 独立売買判定')
+    st.caption('AI設計の規則式による分析です。ストキャスティクスは使いません。学習済み予測モデル・勝率ではなく、成績未検証の研究判定です。通常タブの売買条件は維持します。')
+    registrations = {}
+    if holdings:
+        st.caption('この方式で購入した保有だけを指定し、実際の購入日を入力してください。再起動時は再指定が必要です。追加購入・分割で取得単価や株数が変わった場合は注文価格を再確認してください。')
+        selected = st.multiselect('独立方式で売り判定する保有銘柄', options=sorted(holdings),
+                                 format_func=lambda c: c + ' ' + str(holdings[c].get('name', '')),
+                                 key='bottom_independent_held')
+        for c in selected:
+            registrations[c] = st.date_input(c + ' の購入日', value=None, key='bottom_entry_day_' + c)
+        if not verified:
+            st.warning('保有CSVの照合が完了していません。売り判定は保留します。')
+    frames = result.get('prices', {})
+    if not frames:
+        st.info('独立判定用の日足を取得するため、研究ランキングを更新してください。')
+        return
+    table = build_bottom_trade_decisions(result['audit'], frames, result['target'], valuations,
+                                        holdings, registrations if verified else {})
+    if not verified and not table.empty:
+        table.loc[table['コード'].isin(holdings), ['独立売買判定', '判定理由']] = ['判定保留', '保有CSV照合未完了']
+    session = latest_tse_session_status()
+    fresh = bool(session.get('confirmed')) and str(pd.Timestamp(session['session_date']).date()) == result['target'] if session.get('session_date') is not None else False
+    if not fresh and not table.empty:
+        table['保存時判定'] = table['独立売買判定']
+        table['独立売買判定'] = '判定保留'
+        table['判定理由'] = '研究結果の基準日が最新確定日と一致しないか、営業日未確認。研究ランキングを更新してください'
+        st.warning('保存結果の鮮度を確認できないため、売買判定を保留しています。')
+    result['trades'] = table
+    if table.empty:
+        st.info('判定対象がありません。日足取得状況を確認してください。')
+        return
+    leading = ['コード', '銘柄名', '独立売買判定', '判定理由', '現在株価', '買い指値_参考',
+               '買付上限_参考', '利確指値_参考', '損切り逆指値_参考', '損切り幅%', '損益比', '銘柄判定']
+    columns = [c for c in leading if c in table]
+    for title, statuses in [('買い候補', ['買い']), ('売り・保有継続', ['売り', '保有継続', '判定保留'])]:
+        st.markdown('**' + title + '**')
+        part = table[table['独立売買判定'].isin(statuses)]
+        if part.empty:
+            st.info('該当なし')
+        else:
+            st.dataframe(part[[c for c in columns + ['保有株数', '取得単価', '損益率%', '参考売却株数'] if c in part]], use_container_width=True, hide_index=True)
+    with st.expander('全件の独立判定・買い待ち・見送り理由'):
+        st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption('翌営業日の参考指値です。買付上限を超える場合は見送り、買い指値で約定しなければ追いかけません。利確2R・損切り最大7%の価格を示します。購入後はCSVの取得単価と購入日前の日足で再計算します。上値余地条件と価格の丸め後に買い可否を再確認します。')
+    st.caption('売りは確定終値で判定します。場中に既存OCOが約定したかは日足では判別しません。逆指値後は成行の参考案で、窓開け時の損失は7%を超える場合があります。S株にはIFDOCOを使えません。自動発注は行いません。')
+    with st.expander('独立判定の初期ルール'):
+        st.write('買い：上昇転換確認＋研究点75以上＋出来高1.2倍以上＋底から12%以内＋割安/適正＋損切り幅1〜7%＋観測上値まで2R以上。研究点にはRSI改善を含みます。')
+        st.write('損切り：購入前20日安値−0.25ATRと取得単価×93%の高い方。利確：取得単価＋損切り幅の2倍。売り：終値が損切り/固定底値を割る、利確目標到達、または購入後に10日線を終値で2日連続下回る。購入前データだけで決済ラインを固定し、後日の安値更新では引き下げません。')
+        st.write('上値余地：直近60日の取得価格を上回る最高値と取得価格＋3ATRの低い方。閾値は初期案で、過去時点の構成銘柄・財務・翌日約定・費用を含む成績検証は未実施です。')
+    st.download_button('独立売買判定CSV', table.to_csv(index=False).encode('utf-8-sig'),
+                       'bottom_independent_trades.csv', 'text/csv', key='bottom_independent_csv')
+
+
+def render_bottom_research(valuations, holdings=None, verified=False):
     st.subheader('底打ち・上昇転換ランキング〈研究〉')
-    st.caption('実売買・株数・売り条件への反映なし。研究点は勝率ではありません。前営業日までの確定日足だけで判定します。')
+    st.caption('独立売買判定を追加。通常タブの売買・株数には反映しません。研究点は勝率ではありません。確定日足で判定します。')
     st.write('TOPIX全構成銘柄 → 直近20営業日の平均売買代金上位300 → 底打ち・上昇転換を採点。売買代金は終値×出来高の概算です。')
     st.caption('相対評価はTOPIX連動ETF（1306）の調整後20日騰落率と比較。底打ち否定ラインは観測した安値の参考値です。')
     if st.button('TOPIX全体から研究ランキングを更新', key='v172437_bottom_run'):
@@ -7442,12 +7630,12 @@ def render_bottom_research(valuations):
                     raise ValueError('直近東証日の確定を確認できません。朝または16時以降に再実行してください。')
                 target = str(pd.Timestamp(session['session_date']).date())
                 universe = discover_topix_stock_universe()
-                ts = tuple(dict.fromkeys(universe['ticker'].astype(str).tolist() + ['1306.T']))
+                ts = tuple(dict.fromkeys(universe['ticker'].astype(str).tolist() + ['1306.T'] + [str(c) + '.T' for c in (holdings or {})]))
                 started = time.perf_counter()
                 frames = download_bottom_research(ts, target)
                 # Retry only missing/stale histories; bypass the initial cached failure.
                 retry_codes = []
-                for code in universe['コード'].astype(str):
+                for code in dict.fromkeys(universe['コード'].astype(str).tolist() + list(holdings or {})):
                     history = frames.get(code + '.T', pd.DataFrame())
                     if history.empty or history.index.max() != pd.Timestamp(target) or len(history) < 60:
                         retry_codes.append(code + '.T')
@@ -7462,7 +7650,8 @@ def render_bottom_research(valuations):
                 ranking, audit, coverage, complete = rank_bottom_research(universe, frames, target, valuations)
                 st.session_state['v172437_bottom_result'] = {'ranking': ranking, 'audit': audit, 'coverage': coverage,
                     'complete': complete, 'target': target, 'created': tokyo_now().isoformat(),
-                    'seconds': round(time.perf_counter() - started, 1), 'universe_count': len(universe)}
+                    'seconds': round(time.perf_counter() - started, 1), 'universe_count': len(universe),
+                    'prices': {t: f for t, f in frames.items() if t == '1306.T' or t[:-2] in set(audit.get('コード', pd.Series(dtype=str)).astype(str)) | set(holdings or {})}}
         except Exception as exc:
             st.error('研究ランキングを更新できませんでした：' + str(exc))
     result = st.session_state.get('v172437_bottom_result')
@@ -7475,6 +7664,7 @@ def render_bottom_research(valuations):
     if not result['complete']:
         good = int(result['coverage']['状態'].eq('確認済').sum())
         st.warning(f"TOPIX {result['universe_count']}銘柄中、確認済み{good}銘柄・未確認{result['universe_count'] - good}銘柄。暫定TOP300として表示します。未確認銘柄の復旧で順位・構成が変わる可能性があります。" if good >= 300 else f"確認済み{good}銘柄のためTOP300を作成できません。300銘柄以上の確認が必要です。")
+    render_bottom_trade_decisions(result, valuations, holdings or {}, verified)
     if result['ranking'].empty and not result['audit'].empty:
         st.info('上昇転換と財務条件をすべて満たす研究候補は0件です。')
     elif not result['ranking'].empty:
@@ -7677,7 +7867,7 @@ with single_tab:
     render_single_profit_research(data, signal_audit_df)
 
 with bottom_tab:
-    render_bottom_research(valuation_master_df)
+    render_bottom_research(valuation_master_df, short_confirmed, holdings_verified)
 
 with multibagger_tab:
     st.subheader("🌱 大化け候補（研究）")
@@ -8127,9 +8317,11 @@ try:
         zf.writestr("buy_candidate_exclusions.csv", excluded_buy_df.to_csv(index=False, encoding="utf-8-sig"))
         _bottom_saved = st.session_state.get('v172437_bottom_result')
         if _bottom_saved:
+            if isinstance(_bottom_saved.get('trades'), pd.DataFrame):
+                zf.writestr('bottom_independent_trades.csv', _bottom_saved['trades'].to_csv(index=False, encoding='utf-8-sig'))
             for _key in ['ranking', 'audit', 'coverage']:
                 zf.writestr('bottom_research_' + _key + '.csv', _bottom_saved[_key].to_csv(index=False, encoding='utf-8-sig'))
-            zf.writestr('bottom_research_metadata.csv', pd.DataFrame([{k: v for k, v in _bottom_saved.items() if k not in ['ranking', 'audit', 'coverage']}]).to_csv(index=False, encoding='utf-8-sig'))
+            zf.writestr('bottom_research_metadata.csv', pd.DataFrame([{k: v for k, v in _bottom_saved.items() if k not in ['ranking', 'audit', 'coverage', 'prices', 'trades']}]).to_csv(index=False, encoding='utf-8-sig'))
         zf.writestr("reference_ifdoco.csv",build_reference_ifdoco(buy_view, ifd_take_profit, 7.0).to_csv(index=False,encoding="utf-8-sig"))
         zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
         compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()

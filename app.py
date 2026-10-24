@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.42
-# BUILD: VER17-24-42-TABLES-20261024
+# 日本株 AI投資アシスタント Ver.17.24.43
+# BUILD: VER17-24-43-AI-ROW-20261025
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -39,13 +39,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.42",
+    page_title="日本株 AI投資アシスタント Ver.17.24.43",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.42 銘柄判定順・底打ち条件一覧"
-BUILD = "VER17-24-42-TABLES-20261024"
+VERSION = "17.24.43 見送り表AI参考候補"
+BUILD = "VER17-24-43-AI-ROW-20261025"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -86,6 +86,61 @@ def prepare_stock_table(data):
     out = out[['銘柄判定'] + [c for c in out.columns if c != '銘柄判定']]
     order = out['銘柄判定'].map(valuation_display_rank).to_numpy().argsort(kind='stable')
     return out.iloc[order].reset_index(drop=True)
+
+
+def annotate_reference_choice(data, context=None, candidates=None):
+    """表示用の相対比較。注文・売買条件には使用しない。"""
+    out = prepare_stock_table(data)
+    if not isinstance(out, pd.DataFrame) or out.empty or 'コード' not in out:
+        return out
+    out['AI参考選択'] = ''
+    out['AI比較理由'] = ''
+    pool = out if candidates is None else out[out['コード'].astype(str).isin(set(map(str, candidates)))]
+    if pool.empty:
+        return out
+    metrics = pool.copy()
+    if isinstance(context, pd.DataFrame) and 'コード' in context:
+        lookup = context.assign(コード=context['コード'].astype(str)).drop_duplicates('コード').set_index('コード')
+        for col in lookup:
+            if col not in metrics:
+                metrics[col] = metrics['コード'].astype(str).map(lookup[col])
+    def numeric(col, default=0):
+        return pd.to_numeric(metrics.get(col, pd.Series(default, index=metrics.index)), errors='coerce').fillna(default)
+    # 財務評価、既存研究点、条件達成数、トレンドの順。同点はコードで固定。
+    metrics['_value'] = metrics['銘柄判定'].map(valuation_display_rank)
+    metrics['_score'] = numeric('研究点')
+    conditions = [c for c in metrics if c.startswith('条件_')]
+    metrics['_passed'] = metrics[conditions].eq('○').sum(axis=1) if conditions else 0
+    metrics['_trend'] = metrics.get('上昇トレンド', pd.Series(False, index=metrics.index)).eq(True).astype(int)
+    metrics['_code'] = metrics['コード'].astype(str)
+    selected = metrics.sort_values(['_value', '_score', '_passed', '_trend', '_code'],
+                                  ascending=[True, False, False, False, True], kind='stable').iloc[0]
+    reason = '銘柄判定を優先'
+    if '研究点' in metrics:
+        reason += f"／研究点{selected['_score']:g}／条件達成{selected['_passed']}個"
+    elif selected['_trend']:
+        reason += '／上昇トレンド確認'
+    reason += '（同点はコード順）'
+    idx = selected.name
+    out.loc[idx, 'AI参考選択'] = '★ AI参考候補'
+    out.loc[idx, 'AI比較理由'] = reason
+    return out
+
+
+def show_reference_choice_table(data, context=None, candidates=None, **kwargs):
+    table = annotate_reference_choice(data, context, candidates)
+    if isinstance(table, pd.DataFrame) and 'AI参考選択' in table:
+        chosen = table[table['AI参考選択'].ne('')]
+        if not chosen.empty:
+            row = chosen.iloc[0]
+            st.info(f"★ AI参考候補：{row['コード']} {row.get('銘柄名', '')} ｜ {row['AI比較理由']}")
+        else:
+            st.caption('AI参考候補：比較対象なし')
+        st.caption('黄色の1行は表内の相対比較です。取得済み指標による規則式で、買い条件の通過や上昇を保証しません。見送り理由・判定保留を優先して確認してください。')
+        styled = table.style.apply(lambda row: ['background-color: #fff2b3; color: #17202a; font-weight: 700'
+                                    if row['AI参考選択'] else '' for _ in row], axis=1)
+        return st.dataframe(styled, **kwargs)
+    return st.dataframe(table, **kwargs)
 
 
 def show_stock_table(data, *args, **kwargs):
@@ -5587,7 +5642,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.42")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.43")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -7670,7 +7725,7 @@ def render_bottom_trade_decisions(result, valuations, holdings, verified):
     detail_cols = ['銘柄判定', 'コード', '銘柄名', '独立売買判定', '買い待ち理由', '見送り理由', '判定理由']
     detail_cols += [c for c in table if c.startswith('条件_')]
     detail_cols += [c for c in table if c not in detail_cols]
-    show_stock_table(table[detail_cols], use_container_width=True, hide_index=True)
+    show_reference_choice_table(table[detail_cols], candidates=table.loc[table['独立売買判定'].isin(['買い待ち', '見送り']), 'コード'], use_container_width=True, hide_index=True)
     st.caption('翌営業日の参考指値です。買付上限を超える場合は見送り、買い指値で約定しなければ追いかけません。利確2R・損切り最大7%の価格を示します。購入後はCSVの取得単価と購入日前の日足で再計算します。上値余地条件と価格の丸め後に買い可否を再確認します。')
     st.caption('売りは確定終値で判定します。場中に既存OCOが約定したかは日足では判別しません。逆指値後は成行の参考案で、窓開け時の損失は7%を超える場合があります。S株にはIFDOCOを使えません。自動発注は行いません。')
     with st.expander('独立判定の初期ルール'):
@@ -7737,7 +7792,7 @@ def render_bottom_research(valuations, holdings=None, verified=False):
     if not result['audit'].empty and result['audit']['対TOPIX連動ETF20日超過率%'].isna().all():
         st.warning('比較用ETFの日足未確認のため、相対強さ10点は未算定です。')
     with st.expander('TOP300全件・監視銘柄・見送り理由', expanded=False):
-        show_stock_table(result['audit'], use_container_width=True, hide_index=True)
+        show_reference_choice_table(result['audit'], candidates=result['audit'].loc[~result['audit']['研究判定'].eq('上昇転換確認'), 'コード'], use_container_width=True, hide_index=True)
     with st.expander('構成銘柄の日足取得状況', expanded=False):
         show_stock_table(result['coverage'], use_container_width=True, hide_index=True)
     st.caption('財務は通常更新の取得済み評価を照合。研究対象にしかない銘柄は財務未確認として保留します。全件確認時のみ確定TOP300、欠損時は確認済み銘柄内の暫定TOP300です。')
@@ -7783,7 +7838,7 @@ with main_tab:
     if excluded_buy_df.empty:
         st.info("今回の買いサインから見送った銘柄はありません。")
     else:
-        show_stock_table(excluded_buy_df, use_container_width=True, hide_index=True)
+        show_reference_choice_table(excluded_buy_df, context=signal_audit_df, use_container_width=True, hide_index=True)
     st.caption("今回の買いサインの見送り、およびこの起動中に直前の買い候補から外れた銘柄です。再起動前の候補履歴は含みません。")
     st.subheader("🔻 売り")
     if sell_view.empty:

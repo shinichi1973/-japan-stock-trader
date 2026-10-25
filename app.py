@@ -45,7 +45,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.24.45 動画式AI投資研究"
+VERSION = "17.24.46 動画研究・有力銘柄表示"
 BUILD = "VER17-24-45-VIDEO-RESEARCH-20261025"
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -7990,6 +7990,45 @@ def build_video_research(prices, freshness, valuations, finance, market, holding
     return pd.DataFrame(rows),context
 
 
+def annotate_video_leaders(table):
+    """各手法の全条件通過銘柄だけを比較。表示・CSV専用で注文には使わない。"""
+    out = table.copy()
+    out["有力銘柄"] = ""
+    out["選定根拠"] = ""
+    if out.empty:
+        return out
+    for strategy, part in out.groupby("手法", sort=False):
+        pool = part[part["研究判定"].eq("研究候補（注文前IR確認）") & part["見送り理由"].fillna("").eq("")].copy()
+        if pool.empty:
+            continue
+        # 低い損切り幅だけでRRが過大になる銘柄を優先しない。
+        pool["_value"] = pool["銘柄判定"].map(valuation_display_rank)
+        pool["_rr"] = pd.to_numeric(pool["利益幅/損失幅"], errors="coerce").clip(upper=5).fillna(-1)
+        pool["_volume"] = pd.to_numeric(pool["出来高倍率"], errors="coerce").clip(upper=3).fillna(-1)
+        pool["_code"] = pool["コード"].astype(str)
+        row = pool.sort_values(["_value", "_rr", "_volume", "_code"], ascending=[True, False, False, True], kind="stable").iloc[0]
+        evidence = {
+            "うねり": "支持・抵抗の反復、支持帯付近で反発を確認",
+            "モメンタム": "市場上昇、上向きMA75への押し目反発、出来高増・確定週上昇を確認",
+            "暴落・高配当割安": "市場・個別15%以上下落、大型・配当3%以上・割安、入力済みIR確認条件を通過",
+        }[strategy]
+        reason = (f"{evidence}／条件{int(row['条件通過数'])}/{int(row['条件数'])}通過"
+                  f"／{row['銘柄判定']}／利益幅÷損失幅{float(row['利益幅/損失幅']):.2f}倍"
+                  f"／出来高{float(row['出来高倍率']):.2f}倍／基準日{row['基準日']}")
+        out.loc[row.name, "有力銘柄"] = "★ 最有力（研究用）"
+        out.loc[row.name, "選定根拠"] = reason
+    return out
+
+
+def show_video_leader_table(frame):
+    display = prepare_stock_table(frame)
+    cols = ["銘柄判定", "有力銘柄", "コード", "銘柄名", "選定根拠"]
+    display = display[[c for c in cols if c in display] + [c for c in display if c not in cols]]
+    styled = display.style.apply(
+        lambda row: ["background-color: #fff2b3; color: #17202a; font-weight: 700" if row.get("有力銘柄", "") else ""] * len(row), axis=1)
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+
 def video_position_plan(row, cash, risk):
     px=safe_float(row.get("終値"));stop=safe_float(row.get("新規参考損切り"));take=safe_float(row.get("新規参考利確"))
     if not all(np.isfinite(v) for v in (px,stop,take)) or not 0<stop<px<take or cash<=0 or risk<=0: return None
@@ -8047,21 +8086,30 @@ def render_video_research():
         st.info("NO DATA：先に今日の判定を更新してください。")
         return
     st.caption(f"調査範囲 {table['コード'].nunique()}銘柄。現在取得済みの範囲のみで、日本株全体を網羅した結果ではありません。")
+    table=annotate_video_leaders(table)
+    st.caption("★黄色の行は手法ごとの最有力研究候補。全条件通過銘柄から、銘柄判定→利益幅/損失幅（比較上限5倍）→出来高倍率（比較上限3倍）→同点はコード順で1銘柄を選びます。予測AIによる上昇確率ではありません。")
     tabs=st.tabs(["うねり","モメンタム","暴落・高配当割安","業績6項目・確認事項"])
     for panel,strategy in zip(tabs[:3],["うねり","モメンタム","暴落・高配当割安"]):
         with panel:
             part=table[table["手法"].eq(strategy)].copy()
             candidates=part[part["研究判定"].eq("研究候補（注文前IR確認）")]
             st.write(f"研究候補 {len(candidates)}銘柄")
-            if candidates.empty: st.info("条件を満たす候補なし。下の一覧で待ち条件を確認できます。")
-            else: show_stock_table(candidates,hide_index=True,use_container_width=True)
+            if candidates.empty: st.info("最有力：該当なし。条件を満たす候補がありません。下の一覧で待ち条件を確認できます。")
+            else:
+                leader=candidates[candidates["有力銘柄"].ne("")]
+                if not leader.empty:
+                    row=leader.iloc[0]
+                    st.info(f"★ 最有力：{row['銘柄名']}（{row['コード']}）")
+                    st.write("選定根拠："+row["選定根拠"])
+                show_video_leader_table(candidates)
             held=part[part["研究判定"].str.startswith("保有")]
             if not held.empty:
                 st.caption("現在保有をこの手法で比較した参考結果。購入時の採用手法を記録したものではありません。")
                 show_stock_table(held,hide_index=True,use_container_width=True)
             with st.expander("全銘柄の条件・見送り理由"):
-                show_stock_table(part,hide_index=True,use_container_width=True)
+                show_video_leader_table(part)
     with tabs[3]:
+        st.info("この欄の最有力選定は保留：四半期増収増益・進捗率が未確認で、動画の全12条件も公開されていません。3手法の最有力は各タブで確認できます。")
         cols=["銘柄判定","コード","銘柄名","年間増収増益","四半期増収増益","進捗率","予想PER","MA5/25当日GC","出来高倍率","財務基準日","財務情報鮮度","財務出典"]
         show_stock_table(table.drop_duplicates("コード")[cols],hide_index=True,use_container_width=True)
         st.caption("年間成長率は比較期が12か月差の場合だけ表示判定。財務取得の鮮度は別列で確認。PERの絶対値だけで割安とはせず共通銘柄判定を参照。四半期と進捗は現在のパイプラインに十分な情報がないため未確認。")

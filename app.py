@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.43
-# BUILD: VER17-24-43-AI-ROW-20261025
+# 日本株 AI投資アシスタント Ver.17.24.45
+# BUILD: VER17-24-45-VIDEO-RESEARCH-20261025
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -16,6 +16,7 @@
 # ============================================================
 
 import io
+import zipfile
 import hashlib
 import json
 import math
@@ -39,13 +40,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.43",
+    page_title="日本株 AI投資アシスタント Ver.17.24.45",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.43 見送り表AI参考候補"
-BUILD = "VER17-24-43-AI-ROW-20261025"
+VERSION = "17.24.45 動画式AI投資研究"
+BUILD = "VER17-24-45-VIDEO-RESEARCH-20261025"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -5642,13 +5643,13 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.43")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.45")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
 st.caption("監視対象・購入予算・注文方式は設定欄で選択。株数上限解除・対象拡大の成績は比較検証で確認してください。")
 
-main_tab, single_tab, bottom_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "1銘柄・利益1万円研究", "底打ち・上昇転換研究", "大化け候補", "管理者"])
+main_tab, single_tab, bottom_tab, video_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "1銘柄・利益1万円研究", "底打ち・上昇転換研究", "動画式AI投資研究", "大化け候補", "管理者"])
 
 # ------------------------------------------------------------
 # 下部の入力値はウィジェットの再実行時に取得する。
@@ -6828,169 +6829,6 @@ def render_triple_news_pick(compare, freshness, price_data, held_codes, values, 
     return result, exclusions, signature
 
 
-# GFSの公開講義概要を参考にした独立研究。動画本編の完全再現ではない。
-GFS_RESEARCH_SOURCES = [
-    {"資料": "新高値ブレイク投資・実践編", "確認できた考え方": "年初来高値・52週高値を起点に選別", "URL": "https://gfs.tokyo/video/6031"},
-    {"資料": "最も重要な損切りと資金管理", "確認できた考え方": "取得価格から8%損切り・資金管理", "URL": "https://gfs.tokyo/video/6032"},
-    {"資料": "売り方の極意", "確認できた考え方": "株価2倍で半分利確という例", "URL": "https://gfs.tokyo/video/6373"},
-]
-
-
-def build_gfs_research_signals(price_data, freshness, holdings, value_frames, live_audit,
-                               high_window=252, volume_min=0.0, ma_exit=False):
-    """終値で前日までの高値を更新。8%損切り/2倍半分利確は保有の取得単価基準。"""
-    buy_cols = ["コード", "銘柄名", "日足日", "現在株価", "前日までの高値", "高値超過率%", "出来高倍率", "銘柄判定", "研究買い理由", "現行の買い条件も一致", "扱い"]
-    sell_cols = ["コード", "銘柄名", "日足日", "現在株価", "保有株数", "取得単価", "損益率%", "研究売り理由", "参考売却株数", "現行の売り条件も一致", "扱い"]
-    buys, sells, audit = [], [], []
-    fresh_map = {str(r["コード"]): r.to_dict() for _, r in freshness.iterrows()} if isinstance(freshness, pd.DataFrame) and "コード" in freshness else {}
-    values, live = {}, {}
-    for frame in value_frames:
-        if isinstance(frame, pd.DataFrame) and "コード" in frame:
-            values.update({str(r["コード"]): str(r.get("割安判定", "— 未算定")) for _, r in frame.iterrows()})
-    if isinstance(live_audit, pd.DataFrame) and "コード" in live_audit:
-        live = {str(r["コード"]): r.to_dict() for _, r in live_audit.iterrows()}
-    held = {str(c): v for c, v in holdings.items()}
-    for ticker, df in (price_data or {}).items():
-        c = code(ticker)
-        company = name(ticker)
-        f = fresh_map.get(c, {})
-        status = ""
-        if not isinstance(df, pd.DataFrame) or df.empty or not {"Close", "High"}.issubset(df.columns):
-            status = "有効日足なし"
-        elif f.get("状態") != "🟢 当日確定":
-            status = "最新確定日足を確認できず"
-        if status:
-            audit.append({"コード": c, "銘柄名": company, "状態": status, "研究買い": False, "研究売り": False})
-            continue
-        x = df.sort_index().copy()
-        close = pd.to_numeric(x["Close"], errors="coerce")
-        high = pd.to_numeric(x["High"], errors="coerce")
-        px = safe_float(close.iloc[-1])
-        if not np.isfinite(px) or px <= 0:
-            audit.append({"コード": c, "銘柄名": company, "状態": "終値欠損", "研究買い": False, "研究売り": False})
-            continue
-        # Both series share the data source's split-adjusted price basis.
-        source_date = str(df.attrs.get("gfs_source_final_date", ""))
-        raw_high_ready = (high_window == 252 and df.attrs.get("gfs_history_version") == 2 and
-                          source_date == pd.Timestamp(x.index[-1]).isoformat())
-        previous_high = (safe_float(df.attrs.get("gfs_252_previous_high")) if raw_high_ready else
-                         safe_float(high.shift(1).rolling(high_window, min_periods=high_window).max().iloc[-1]))
-        prior_bars = int(df.attrs.get("gfs_prior_bars", 0)) if raw_high_ready else max(len(x) - 1, 0)
-        ma25 = safe_float(close.rolling(25, min_periods=25).mean().iloc[-1])
-        volume_ratio = np.nan
-        if "Volume" in x:
-            vol = pd.to_numeric(x["Volume"], errors="coerce")
-            previous_volume = safe_float(vol.shift(1).rolling(20, min_periods=20).mean().iloc[-1])
-            if np.isfinite(previous_volume) and previous_volume > 0:
-                volume_ratio = safe_float(vol.iloc[-1]) / previous_volume
-        verdict = values.get(c, "— 未算定")
-        raw_buy = bool(np.isfinite(previous_high) and px > previous_high)
-        reason = ""
-        if c in held:
-            reason = "既に保有中（買い増しなし）"
-        elif not np.isfinite(previous_high):
-            reason = f"前日までの{high_window}営業日日足不足"
-        elif "割高" in verdict:
-            reason = "割高の研究買い除外（独自補完）"
-        elif volume_min > 0 and (not np.isfinite(volume_ratio) or volume_ratio < volume_min):
-            reason = "独自の出来高条件を満たさない"
-        final_buy = raw_buy and not reason
-        bar_date = str(f.get("日足最終日", ""))
-        if final_buy:
-            buys.append({"コード": c, "銘柄名": company, "日足日": bar_date, "現在株価": px,
-                         "前日までの高値": previous_high, "高値超過率%": round((px/previous_high-1)*100, 2),
-                         "出来高倍率": round(volume_ratio, 2) if np.isfinite(volume_ratio) else np.nan,
-                         "銘柄判定": verdict, "研究買い理由": f"終値が前日までの{high_window}営業日高値を更新",
-                         "現行の買い条件も一致": bool(live.get(c, {}).get("最終買い", False)), "扱い": "研究候補・注文には使用しない"})
-        sell_reason = []
-        if c in held:
-            h = held[c]
-            qty = int(safe_float(h.get("shares"), 0))
-            avg = safe_float(h.get("avg_price"))
-            pnl = (px / avg - 1) * 100 if np.isfinite(avg) and avg > 0 else np.nan
-            sell_qty = 0
-            if qty > 0 and np.isfinite(pnl):
-                if px <= avg * 0.92:
-                    sell_reason.append("終値で8%損切り（研究）")
-                    sell_qty = qty
-                elif px >= avg * 2.0 and qty >= 2:
-                    sell_reason.append("株価2倍・半分利確候補（初回のみ／過去利確未確認）")
-                    sell_qty = qty // 2
-                if ma_exit and np.isfinite(ma25) and px < ma25:
-                    sell_reason.append("MA25割れ（独自補完）")
-                    sell_qty = qty
-            else:
-                reason = "保有株数または取得単価を確認できず"
-            if sell_reason:
-                live_sell = bool(live.get(c, {}).get("現行売り", False)) or bool(np.isfinite(pnl) and pnl <= -7.0)
-                sells.append({"コード": c, "銘柄名": company, "日足日": bar_date, "現在株価": px,
-                              "保有株数": qty, "取得単価": avg, "損益率%": round(pnl, 2),
-                              "研究売り理由": " / ".join(sell_reason), "参考売却株数": sell_qty,
-                              "現行の売り条件も一致": live_sell, "扱い": "研究候補・注文には使用しない"})
-        audit.append({"コード": c, "銘柄名": company, "状態": reason or "判定済み", "研究買い": final_buy,
-                      "研究売り": bool(sell_reason), "高値更新のみ": raw_buy, "銘柄判定": verdict,
-                      "前日までの高値": previous_high, "現在株価": px, "高値計算に使える前日日足本数": prior_bars,
-                      "高値取得元": "準備期間を削る前の日足" if raw_high_ready else "受取日足から計算"})
-    buy = pd.DataFrame(buys, columns=buy_cols)
-    if not buy.empty:
-        buy = buy.sort_values(["高値超過率%", "コード"], ascending=[False, True]).reset_index(drop=True)
-    return buy, pd.DataFrame(sells, columns=sell_cols), pd.DataFrame(audit)
-
-
-def render_gfs_research(price_data, freshness, holdings, value_frames, live_audit):
-    st.subheader("GFSロジック研究")
-    st.warning("GFSの公開講義概要を参考にした研究案です。動画本編の完全再現・GFS公認・収益検証済みのロジックではありません。")
-    st.caption("現在取得している監視対象＋保有銘柄を判定します。ここで点灯しても、今日の売買・購入株数・正式注文には反映しません。")
-    conditions = pd.DataFrame([
-        {"項目": "買いの着想", "内容": "年初来高値・52週高値の銘柄選別", "根拠": "公式講義概要で確認"},
-        {"項目": "研究買いの計算", "内容": "前日までの252営業日高値を当日の終値で上回る", "根拠": "52週の近似と終値判定は独自補完"},
-        {"項目": "研究売り", "内容": "取得単価から終値8%損切り／株価2倍で初回のみ半分利確", "根拠": "割合は公開概要、終値判定等は独自補完"},
-        {"項目": "補助条件", "内容": "既知の割高・未確定日足・保有中の新規買いを除外", "根拠": "独自補完。財務未算定は研究参考として残す"},
-        {"項目": "未再現", "内容": "カップ形状・事業の成長ストーリー・材料の持続性・地合い判断", "根拠": "詳細条件を確認できず自動判定しない"},
-    ])
-    with st.expander("研究条件・出典", expanded=False):
-        show_stock_table(conditions, use_container_width=True, hide_index=True)
-        for source in GFS_RESEARCH_SOURCES:
-            st.link_button(source["資料"], source["URL"])
-        st.caption("公開概要の確認日：2026-10-12。2倍利確は過去の利確実施を追跡していないため、繰り返し半分売る指示ではありません。")
-    volume_min = st.number_input("追加研究：出来高倍率の下限（0で無効）", 0.0, 10.0, 0.0, 0.1, key="v172411_gfs_vol")
-    ma_exit = st.checkbox("追加研究：MA25割れを売り条件にする（GFS原文の条件ではない）", value=False, key="v172411_gfs_maexit")
-    buy, sell, audit = build_gfs_research_signals(price_data, freshness, holdings, value_frames, live_audit, 252, volume_min, ma_exit)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("研究買い", len(buy)); c2.metric("研究売り", len(sell)); c3.metric("確認対象", len(audit))
-    st.write("**研究買いシグナル**")
-    if buy.empty:
-        st.info("研究条件に該当する新規買い銘柄はありません。")
-    else:
-        show_stock_table(buy, use_container_width=True, hide_index=True)
-    st.write("**保有銘柄の研究売りシグナル**")
-    if sell.empty:
-        st.info("現在保有している銘柄に研究売りシグナルはありません。")
-    else:
-        show_stock_table(sell, use_container_width=True, hide_index=True)
-    st.caption("研究用8%損切りは現行の7%損切りを変更しません。日中の逆指値条件とも異なります。")
-    with st.expander("判定不足・見送り理由", expanded=False):
-        if not audit.empty:
-            show_stock_table(audit[audit["状態"].ne("判定済み")], use_container_width=True, hide_index=True)
-    st.write("**新しい動画・ロジックの監視**")
-    st.caption("ChatGPTの監視タスクで公式サイト・公式YouTubeを確認します。新着は通知で確認し、本文や字幕から条件を検証してから研究案を更新します。このアプリのコードが自動で書き換わることはありません。")
-    st.link_button("GFS公式YouTube", "https://www.youtube.com/channel/UCpLNShj3M-bQVPDZ8lD66fw")
-    params = {"研究名": "GFS公開概要に基づく新高値研究", "高値期間_営業日": 252,
-              "研究損切り%": 8.0, "半分利確_上昇率%": 100.0, "追加出来高下限": volume_min,
-              "追加MA25売り": ma_exit, "正式売買に接続": False, "原文完全再現": False,
-              "資料確認日": "2026-10-12", "高値計算の履歴処理版": 2}
-    buf = io.BytesIO()
-    with ZipFile(buf, "w") as z:
-        for filename, frame in [("gfs_research_buy.csv", buy), ("gfs_research_sell.csv", sell),
-                                ("gfs_research_audit.csv", audit), ("gfs_research_conditions.csv", conditions),
-                                ("gfs_research_sources.csv", pd.DataFrame(GFS_RESEARCH_SOURCES)),
-                                ("gfs_research_settings.csv", pd.DataFrame([params]))]:
-            z.writestr(filename, frame.to_csv(index=False, encoding="utf-8-sig"))
-    st.download_button("GFS研究シグナルZIP", buf.getvalue(), "gfs_research_signals.zip", "application/zip", key="v172411_gfs_download")
-    return buy, sell, audit, params
-
-
-
 # 大化け候補は独立した研究スクリーニング。既存売買・配分・損切りへ接続しない。
 MULTIBAGGER_RULES = pd.DataFrame([
     {"項目": "候補の必須条件", "条件": "実績売上成長率15%以上・実績利益成長率20%以上・実績EPSと予想EPSが正・予想PER0超35以下"},
@@ -7000,7 +6838,7 @@ MULTIBAGGER_RULES = pd.DataFrame([
     {"項目": "候補採用", "条件": "主要必須条件と共通企業価値確認を満たし研究点60以上。FCF・D/E・営業利益率の欠損は暫定、3項目取得済みは財務確認済。点数は上昇確率や予想倍率ではない。閾値は未検証"},
     {"項目": "対象範囲", "条件": "現在選択した監視対象の国内財務取得対象。全上場銘柄の網羅ではない"},
     {"項目": "AI参考選択", "条件": "候補内で財務確認済み優先→研究点降順→財務欠損数昇順→予想PER昇順→コード昇順。追加通信なし。第一候補でも買い指示ではない"},
-    {"項目": "想定・限界", "条件": "数年の成長を調べる入口。単年実績で成長継続・競争優位・受注・希薄化は確認できない。GFS非公開動画は未使用"},
+    {"項目": "想定・限界", "条件": "数年の成長を調べる入口。単年実績で成長継続・競争優位・受注・希薄化は確認できない"},
 ])
 
 
@@ -7989,9 +7827,269 @@ with single_tab:
 with bottom_tab:
     render_bottom_research(valuation_master_df, short_confirmed, holdings_verified)
 
+# 動画2本の文字起こしに基づく独立研究。実売買へは接続しない。
+VIDEO_RESEARCH_RULES = pd.DataFrame([
+    {"区分":"原動画", "確認できた考え方":"支持帯付近で買い、抵抗帯手前で売る／上向きMA75への押し目と反発／暴落時の大型・高配当・割安株", "実装":"3手法を別々に判定。原文の銘柄例・価格は流用しない"},
+    {"区分":"原動画", "確認できた考え方":"市場全体・日足と週足・決算とニュースの影響を確認", "実装":"日経平均、確定週のみの週足、決算・個別悪材料の確認欄"},
+    {"区分":"追加動画", "確認できた考え方":"年間・四半期成長、進捗、PER、MA5/25 GC、出来高。全12条件のうち公開は6条件のみ", "実装":"取得済みの範囲を表示。四半期・進捗は未確認と明示。12条件の完全再現ではない"},
+    {"区分":"研究用補完", "確認できた考え方":"原動画は具体的な日数・許容幅を指定していない", "実装":"うねり60日・10/90%分位、上下各2回以上（5日間隔）・5～35%幅・端25%内・反発確認"},
+    {"区分":"研究用補完", "確認できた考え方":"モメンタムの数値化", "実装":"MA75の5日傾き>0、直近5日でMA75±3%に接触、終値>前日終値かつMA75超、出来高>前20日平均、確定週終値>13週線"},
+    {"区分":"研究用補完", "確認できた考え方":"暴落・高配当・大型の数値化", "実装":"日経と個別株の過去取得範囲最大252日高値から15%以上下落、時価総額1兆円以上、配当利回り3%以上、割安・やや割安、反発・IR確認"},
+    {"区分":"研究用補完", "確認できた考え方":"売りと資金管理", "実装":"新規参考損切りは支持帯×0.99と終値×0.93の高い方。利益幅/損失幅>=2。モメンタムの利確目安はMA75×1.10。呼値調整前"},
+    {"区分":"運用差", "確認できた考え方":"追加動画は引け直前の判断を提案", "実装":"このアプリでは直近確定日足を翌営業日朝に確認。引け直前運用と同じ成績とは扱わない。本番の終値7%損切りは変更しない"},
+])
+
+
+def video_price_frame(frame):
+    if not isinstance(frame, pd.DataFrame) or not {"Close", "High", "Low", "Volume"}.issubset(frame.columns):
+        return pd.DataFrame()
+    x = frame.copy()
+    x.index = pd.to_datetime(x.index, errors="coerce")
+    x = x.loc[~x.index.isna()]
+    if x.index.tz is not None:
+        x.index = x.index.tz_convert("Asia/Tokyo").tz_localize(None)
+    x.index = x.index.normalize()
+    x = x[~x.index.duplicated(keep="last")].sort_index()
+    for k in ("Close", "High", "Low", "Volume", "MA75"):
+        if k in x: x[k] = pd.to_numeric(x[k], errors="coerce")
+    x = x.dropna(subset=["Close", "High", "Low", "Volume"])
+    x = x[(x.Close > 0) & (x.Low > 0) & (x.High >= x.Low) & (x.Volume >= 0)]
+    if "MA75" not in x: x["MA75"] = x.Close.rolling(75).mean()
+    return x
+
+
+def video_reference_day(freshness):
+    if not isinstance(freshness, pd.DataFrame) or "直近東証取引日" not in freshness:
+        return pd.NaT
+    days = pd.to_datetime(freshness["直近東証取引日"], errors="coerce").dropna()
+    return pd.Timestamp(days.max()).normalize() if len(days) else pd.NaT
+
+
+def video_market_context(market, target):
+    base = {"状態":"未確認", "上昇":False, "暴落":False, "日付":"", "下落率%":np.nan, "確認日数":0}
+    if not isinstance(market, pd.DataFrame) or market.empty or pd.isna(target) or "Close" not in market:
+        return base
+    x = market.copy()
+    x.index = pd.to_datetime(x.index)
+    if x.index.tz is not None: x.index = x.index.tz_localize(None)
+    x = x.sort_index().loc[:target]
+    if x.empty or x.index[-1].normalize() != target or len(x) < 80: return base
+    c = pd.to_numeric(x.Close, errors="coerce")
+    ma = pd.to_numeric(x.MA75, errors="coerce") if "MA75" in x else c.rolling(75).mean()
+    if not np.isfinite(c.iloc[-1]) or not np.isfinite(ma.iloc[-6]): return base
+    draw = float((c.iloc[-1] / c.tail(252).max() - 1) * 100)
+    up = bool(c.iloc[-1] > ma.iloc[-1] > ma.iloc[-6])
+    return {"状態":"上昇" if up else "暴落圏" if draw <= -15 else "中立・下降", "上昇":up, "暴落":draw <= -15,
+            "日付":str(target.date()), "下落率%":round(draw, 2), "確認日数":min(len(x),252)}
+
+
+def video_evidence_map(frame, today):
+    """IR確認は自動推測せず、日付・URL付きの明示入力だけを扱う。"""
+    result = {}
+    if not isinstance(frame, pd.DataFrame) or "コード" not in frame: return result
+    for r in frame.to_dict("records"):
+        c = str(code(str(r.get("コード", ""))))
+        day = pd.to_datetime(r.get("確認日", ""), errors="coerce")
+        valid = pd.notna(day) and 0 <= (pd.Timestamp(today).normalize() - pd.Timestamp(day.date())).days <= 7
+        urls = str(r.get("根拠URL", "")).strip()
+        url_ok = urls.startswith("https://") or urls.startswith("http://")
+        result[c] = {**r, "有効":bool(valid and url_ok)}
+    return result
+
+
+def build_video_research(prices, freshness, valuations, finance, market, holdings, evidence, today):
+    target = video_reference_day(freshness)
+    context = video_market_context(market, target)
+    fresh = {str(code(str(r["コード"]))):r for r in freshness.to_dict("records")} if isinstance(freshness,pd.DataFrame) and "コード" in freshness else {}
+    values = {str(code(str(r["コード"]))):str(r.get("割安判定", "算定不能")) for r in valuations.to_dict("records")} if isinstance(valuations,pd.DataFrame) and "コード" in valuations else {}
+    fins = {str(code(str(r["コード"]))):r for r in finance.to_dict("records")} if isinstance(finance,pd.DataFrame) and "コード" in finance else {}
+    evs = video_evidence_map(evidence, today)
+    rows = []
+    for ticker, frame in prices.items():
+        c = str(code(str(ticker)))
+        x = video_price_frame(frame)
+        if x.empty: continue
+        if pd.notna(target): x = x.loc[:target]
+        if x.empty: continue
+        px = float(x.Close.iloc[-1]); prev = float(x.Close.iloc[-2]) if len(x)>1 else px
+        label = values.get(c, "算定不能"); f = fins.get(c, {}); ev = evs.get(c, {})
+        blockers = []
+        if pd.isna(target) or x.index[-1] != target or fresh.get(c,{}).get("状態") != "🟢 当日確定": blockers.append("最新確定日足未確認")
+        if (x.Close.pct_change().tail(60).abs() > .4).any(): blockers.append("価格断絶・分割等の確認待ち")
+        if "割高" in label: blockers.append("割高除外")
+        if len(x)<21 or x.Volume.iloc[-1]<=0 or x.Volume.iloc[-21:-1].mean()<=0: blockers.append("出来高・流動性未確認")
+        if label not in ("割安", "やや割安", "適正", "妥当") and not any(z in label for z in ("割安", "適正", "妥当")): blockers.append("企業価値未確認")
+        recent = x.iloc[-61:-1]
+        support = float(recent.Low.quantile(.10)) if len(recent)>=60 else np.nan
+        resist = float(recent.High.quantile(.90)) if len(recent)>=60 else np.nan
+        width = resist/support-1 if np.isfinite(support) and support>0 else np.nan
+        rebound = px > prev
+        ma = x.MA75; mav = safe_float(ma.iloc[-1]); slope = bool(len(x)>=6 and np.isfinite(ma.iloc[-6]) and mav>ma.iloc[-6])
+        volbase = x.Volume.iloc[-21:-1].mean() if len(x)>=21 else np.nan
+        vr = float(x.Volume.iloc[-1]/volbase) if volbase>0 else np.nan
+        weekly = x.Close.resample("W-FRI").last().dropna()
+        weekly = weekly.loc[weekly.index<=x.index[-1]]  # 未完の当週を除外
+        week_up = len(weekly)>=13 and weekly.iloc[-1]>weekly.tail(13).mean()
+        wlabel = "上向き" if week_up else "未確認" if len(weekly)<13 else "弱い"
+        def touches(series, level, tol):
+            indices = np.flatnonzero((series/level-1).abs().to_numpy()<=tol)
+            count=0; last=-100
+            for i in indices:
+                if i-last>=5: count+=1;last=i
+            return count
+        lo_hits = touches(recent.Low, support, .02) if np.isfinite(support) else 0
+        hi_hits = touches(recent.High, resist, .02) if np.isfinite(resist) else 0
+        visits=[]
+        if np.isfinite(support) and np.isfinite(resist):
+            for _,bar in recent.iterrows():
+                low_near=abs(bar.Low/support-1)<=.02
+                high_near=abs(bar.High/resist-1)<=.02
+                side="下" if low_near and not high_near else "上" if high_near and not low_near else ""
+                if side and (not visits or visits[-1]!=side): visits.append(side)
+        near = bool(np.isfinite(mav) and mav>0 and ((x.Low.tail(5)/ma.tail(5)-1).abs()<=.03).any())
+        cap=safe_float(f.get("時価総額")); dy=safe_float(ev.get("配当利回り%"))
+        annual_end=pd.to_datetime(str(f.get("成長比較期", "")),errors="coerce")
+        annual_prev=pd.to_datetime(str(f.get("成長比較前期", "")),errors="coerce")
+        annual_ok = (pd.notna(annual_end) and pd.notna(annual_prev) and (annual_end.year-annual_prev.year)*12+annual_end.month-annual_prev.month==12
+                     and 0 <= (pd.Timestamp(today)-annual_end).days <= 580
+                     and finance_freshness_usable(f.get("財務情報鮮度", "")))
+        rg=safe_float(f.get("売上成長率%")); eg=safe_float(f.get("利益成長率%"))
+        yearly="確認" if annual_ok and np.isfinite(rg) and np.isfinite(eg) and rg>0 and eg>0 else "未達" if annual_ok and np.isfinite(rg) and np.isfinite(eg) else "未確認"
+        ma5=x.Close.rolling(5).mean();ma25=x.Close.rolling(25).mean()
+        gc=bool(len(x)>=26 and ma5.iloc[-1]>ma25.iloc[-1] and ma5.iloc[-2]<=ma25.iloc[-2])
+        dd=(px/x.Close.tail(252).max()-1)*100
+        schemas = [
+            ("うねり", [(len(recent)>=60,"60日履歴不足"),(np.isfinite(width) and .05<=width<=.35,"レンジ幅5～35%外"),(lo_hits>=2 and hi_hits>=2 and len(visits)>=4,"支持・抵抗の反復不足"),
+                         (np.isfinite(support) and support<=px<=support+(resist-support)*.25,"支持帯の近くではない"),(rebound,"反発待ち")], support, resist*.99 if np.isfinite(resist) else np.nan),
+            ("モメンタム",[(context["上昇"],"市場の上昇未確認"),(slope and px>mav,"MA75上向き・上抜け未達"),(near,"MA75付近への押し目待ち"),(rebound,"反発待ち"),(np.isfinite(vr) and vr>1,"出来高増加未確認"),(week_up,"確定週の上昇未確認")], min(float(x.Low.tail(5).min()),mav) if np.isfinite(mav) else np.nan, mav*1.10),
+            ("暴落・高配当割安",[(context["暴落"],"市場の15%下落未確認"),(dd<=-15,"個別15%下落未達"),(np.isfinite(cap) and cap>=1e12,"時価総額1兆円未確認"),(np.isfinite(dy) and dy>=3,"配当利回り3%以上未確認"),
+                         ("割安" in label and "未" not in label and "不能" not in label,"割安未確認"),(bool(ev.get("有効")) and str(ev.get("長期業績・財務健全性", ""))=="確認済","長期業績・財務のIR確認待ち"),
+                         (bool(ev.get("有効")) and str(ev.get("個別悪材料", ""))=="問題なし確認済","個別悪材料の確認待ち"),(rebound,"反発待ち")],float(x.Low.tail(20).min()),float(x.Close.tail(252).max()))]
+        for strategy, checks, floor, take in schemas:
+            missing=blockers+[msg for ok,msg in checks if not ok]
+            stop=max(px*.93,floor*.99) if np.isfinite(floor) else np.nan
+            rr=(take-px)/(px-stop) if np.isfinite(take) and np.isfinite(stop) and stop<px<take else np.nan
+            if not np.isfinite(rr) or rr<2: missing.append("利益幅/損失幅2倍未達")
+            held=holdings.get(c,{}) if isinstance(holdings,dict) else {}
+            status="見送り" if missing else "研究候補（注文前IR確認）"
+            if held:
+                avg=safe_float(held.get("avg_price"))
+                if any(b in blockers for b in ("最新確定日足未確認","価格断絶・分割等の確認待ち")): status="保有判定保留"
+                elif np.isfinite(avg) and avg>0 and px<=avg*.93: status="保有：7%損切り条件"
+                elif strategy=="うねり" and np.isfinite(resist) and px>=resist*.99: status="保有：抵抗帯で利確検討"
+                elif strategy=="うねり" and np.isfinite(support) and px<support*.99: status="保有：支持帯割れ撤退検討"
+                elif strategy=="モメンタム" and np.isfinite(mav) and (px<mav or not slope): status="保有：トレンド悪化・撤退検討"
+                elif strategy=="モメンタム" and px>=take: status="保有：MA75乖離で利確検討"
+                else: status="保有：研究継続（取得時のルール優先）"
+            rows.append({"銘柄判定":label,"手法":strategy,"研究判定":status,"コード":c,"銘柄名":name(ticker),"終値":px,"基準日":str(x.index[-1].date()),
+                         "条件通過数":sum(bool(ok) for ok,msg in checks),"条件数":len(checks),"見送り理由":"／".join(dict.fromkeys(missing)),
+                         "支持帯":support,"抵抗帯":resist,"MA75":mav,"出来高倍率":vr,"週足":wlabel,"最大252日確認数":min(len(x),252),"高値から下落率%":dd,
+                         "新規参考損切り":stop,"新規参考利確":take,"利益幅/損失幅":rr,"年間増収増益":yearly,"四半期増収増益":"未確認","進捗率":"未確認",
+                         "MA5/25当日GC":"点灯" if gc else "なし","予想PER":safe_float(f.get("予想PER")),"配当利回り%":dy,
+                         "財務基準日":f.get("参考指標基準日",""),"財務情報鮮度":f.get("財務情報鮮度",""),"財務出典":f.get("財務参照URL",""),"IR根拠":ev.get("根拠URL","")})
+    return pd.DataFrame(rows),context
+
+
+def video_position_plan(row, cash, risk):
+    px=safe_float(row.get("終値"));stop=safe_float(row.get("新規参考損切り"));take=safe_float(row.get("新規参考利確"))
+    if not all(np.isfinite(v) for v in (px,stop,take)) or not 0<stop<px<take or cash<=0 or risk<=0: return None
+    qty=int(min(cash/px,risk/(px-stop))//100)*100
+    if qty<100: return None
+    return {"コード":row["コード"],"手法":row["手法"],"参考株数":qty,"参考価格":px,"必要資金":round(qty*px,2),"想定損失":round(qty*(px-stop),2),"想定利益":round(qty*(take-px),2),"参考損切り":stop,"参考利確":take}
+
+
+def render_video_research():
+    st.subheader("動画式AI投資研究")
+    st.caption("元動画の3手法と追加動画の業績・資金管理を、取得済みデータで比較します。生成AIの予測や動画手法の完全再現ではなく、条件に基づく研究です。")
+    st.info("朝の運用向けに前営業日までの確定日足を使います。候補は本番の買い候補・配分へ自動追加されません。過去成績は未検証です。")
+    with st.expander("動画の要点・補完条件・運用の違い"):
+        show_stock_table(VIDEO_RESEARCH_RULES,hide_index=True,use_container_width=True)
+        st.link_button("元動画", "https://youtu.be/TR0rURA4ySo")
+        st.caption("週足は取得範囲から作成し金曜日ラベルが基準日以下の確定週のみ使用。動画の2年以上の長期確認は履歴不足の場合未実施です。")
+    research_freshness=daily_bar_status_df.copy()
+    now=tokyo_now()
+    expected=pd.Timestamp(now.date()) - pd.Timedelta(days=0 if now.hour>=16 else 1)
+    while expected.weekday()>=5: expected-=pd.Timedelta(days=1)
+    target=video_reference_day(research_freshness)
+    if pd.notna(target) and target!=expected:
+        st.warning("保存日足の基準日が現在の営業日目安と一致しません。『今日の判定を更新』を実行してください。祝日等で確認できない場合も研究候補は保留します。")
+        research_freshness["直近東証取引日"]=str(expected.date())
+        research_freshness["状態"]="更新確認待ち"
+        target=expected
+    if st.button("研究用の日経平均を確認・更新",key="video_market_refresh"):
+        if pd.isna(target): st.warning("先に『今日の判定を更新』で確定日足の基準日を取得してください。")
+        else:
+            try:
+                with st.spinner("研究用の日経平均を確認中…"):
+                    st.session_state["video_market_frame"]=market_data(target)
+            except Exception as exc:
+                st.session_state.pop("video_market_frame",None)
+                st.warning("市場データを確認できません："+type(exc).__name__)
+    with st.expander("暴落時の配当・IR確認CSV（任意）"):
+        st.caption("根拠URLと7日以内の確認日を記録。配当利回りは%単位。最新の減配・下方修正・個別悪材料と長期業績・財務を公式IRで確認した場合のみ指定語を記入してください。URLの内容を自動検証する機能ではありません。")
+        template=pd.DataFrame([{"コード":"", "確認日":"", "配当利回り%":"", "長期業績・財務健全性":"未確認", "個別悪材料":"未確認", "根拠URL":""}])
+        st.code("長期業績・財務健全性：確認済\n個別悪材料：問題なし確認済\n確認日：YYYY-MM-DD")
+        st.download_button("IR確認CSVひな形",template.to_csv(index=False).encode("utf-8-sig"),"video_ir_template.csv",key="video_ir_template")
+        upload=st.file_uploader("IR確認CSV",type=["csv"],key="video_ir_csv")
+        evidence=pd.DataFrame()
+        if upload is not None:
+            try:
+                evidence=pd.read_csv(upload,dtype={"コード":str},encoding="utf-8-sig").fillna("")
+                if not set(template.columns).issubset(evidence.columns):
+                    st.warning("ひな形の列が不足しています。IR情報は採用しません。")
+                    evidence=pd.DataFrame()
+            except Exception:
+                st.warning("IR確認CSVを読み込めません。UTF-8のひな形を使ってください。")
+    table,context=build_video_research(data,research_freshness,valuation_master_df,mb_finance,st.session_state.get("video_market_frame"),short_confirmed,evidence,tokyo_now().date())
+    st.write("市場："+context["状態"]+" ／ 基準日："+(context["日付"] or "未確認"))
+    if context["確認日数"]: st.caption(f"市場の高値比較は取得済み{context['確認日数']}日。下落率 {context['下落率%']:.2f}%")
+    if table.empty:
+        st.info("NO DATA：先に今日の判定を更新してください。")
+        return
+    st.caption(f"調査範囲 {table['コード'].nunique()}銘柄。現在取得済みの範囲のみで、日本株全体を網羅した結果ではありません。")
+    tabs=st.tabs(["うねり","モメンタム","暴落・高配当割安","業績6項目・確認事項"])
+    for panel,strategy in zip(tabs[:3],["うねり","モメンタム","暴落・高配当割安"]):
+        with panel:
+            part=table[table["手法"].eq(strategy)].copy()
+            candidates=part[part["研究判定"].eq("研究候補（注文前IR確認）")]
+            st.write(f"研究候補 {len(candidates)}銘柄")
+            if candidates.empty: st.info("条件を満たす候補なし。下の一覧で待ち条件を確認できます。")
+            else: show_stock_table(candidates,hide_index=True,use_container_width=True)
+            held=part[part["研究判定"].str.startswith("保有")]
+            if not held.empty:
+                st.caption("現在保有をこの手法で比較した参考結果。購入時の採用手法を記録したものではありません。")
+                show_stock_table(held,hide_index=True,use_container_width=True)
+            with st.expander("全銘柄の条件・見送り理由"):
+                show_stock_table(part,hide_index=True,use_container_width=True)
+    with tabs[3]:
+        cols=["銘柄判定","コード","銘柄名","年間増収増益","四半期増収増益","進捗率","予想PER","MA5/25当日GC","出来高倍率","財務基準日","財務情報鮮度","財務出典"]
+        show_stock_table(table.drop_duplicates("コード")[cols],hide_index=True,use_container_width=True)
+        st.caption("年間成長率は比較期が12か月差の場合だけ表示判定。財務取得の鮮度は別列で確認。PERの絶対値だけで割安とはせず共通銘柄判定を参照。四半期と進捗は現在のパイプラインに十分な情報がないため未確認。")
+        st.code("選んだ銘柄の最新公式IR・適時開示を確認し、出典URL・発表日を付けて、総合判定／根拠／見通し／注目点を整理してください。売上と利益の前年同期比、通期進捗、利益の使途、下方修正・減配・希薄化を確認し、事実と推論を分け、不明は未確認としてください。ニュースは一時的要因と構造的問題を区別してください。")
+    st.caption("候補の資金管理：余力と許容損失から100株単位で逆算。各案は単独での計算です。複数案を同時に注文しないでください。")
+    cash=st.number_input("研究に使う余力（円）",min_value=0,value=int(buying_power),step=1000,key="video_cash")
+    risk=st.number_input("1取引の許容損失（円）",min_value=0,value=0,step=1000,key="video_risk")
+    picks=table[table["研究判定"].eq("研究候補（注文前IR確認）")]
+    plans=[plan for row in picks.to_dict("records") if (plan:=video_position_plan(row,cash,risk)) is not None]
+    if plans: show_stock_table(pd.DataFrame(plans),hide_index=True,use_container_width=True)
+    elif len(picks): st.info("余力・許容損失を設定し、100株を買える範囲か確認してください。")
+    st.warning("参考価格は直近終値で、翌朝の約定価格・注文可能価格ではありません。窓開けや滑りで許容損失を超えます。注文前にIR、実余力、呼値・制限値幅を確認し、買値が変わった場合は再計算してください。S株では同じ決済注文を使えるとは限りません。本番の売り指示・終値7%損切りを優先します。")
+    buf=io.BytesIO()
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
+        z.writestr("video_research_audit.csv",table.to_csv(index=False,encoding="utf-8-sig"))
+        z.writestr("video_research_rules.csv",VIDEO_RESEARCH_RULES.to_csv(index=False,encoding="utf-8-sig"))
+        z.writestr("video_research_market.csv",pd.DataFrame([context]).to_csv(index=False,encoding="utf-8-sig"))
+        z.writestr("video_research_position_plans.csv",pd.DataFrame(plans).to_csv(index=False,encoding="utf-8-sig"))
+    st.download_button("動画研究CSV一括ZIP",buf.getvalue(),"video_research.zip","application/zip",key="video_export")
+
+
+with video_tab:
+    render_video_research()
+
+
 with multibagger_tab:
     st.subheader("🌱 大化け候補（研究）")
-    st.caption("数年で大きく成長する企業を探す入口です。研究点は上昇確率・予想倍率ではありません。GFS非公開動画の再現ではなく、成績未検証の独立条件です。")
+    st.caption("数年で大きく成長する企業を探す入口です。研究点は上昇確率・予想倍率ではありません。成績未検証の独立条件です。")
     st.info("注文判断は『今日の売買』で確認してください。候補入りだけでは買い指示になりません。既存の利確・終値7%損切りは引き続き適用します。")
     st.write(f"調査対象 {len(multibagger_audit)}銘柄 ／ 大化け候補 {len(multibagger_candidates)}銘柄")
     if not multibagger_audit.empty:
@@ -8079,8 +8177,8 @@ with admin_tab:
         else:
             st.info("『今日の判定を更新』後に日足最終日と取得元を表示します。")
 
-    value_tab, surge_tab, compare_tab, gfs_tab, holdings_tab = st.tabs([
-        "企業価値", "急騰予兆", "3指標比較", "GFSロジック研究", "保有銘柄"
+    value_tab, surge_tab, compare_tab, holdings_tab = st.tabs([
+        "企業価値", "急騰予兆", "3指標比較", "保有銘柄"
     ])
 
     with value_tab:
@@ -8343,13 +8441,6 @@ with admin_tab:
                 admin_judgement_table(comp_full, "v7_comp_full", 520)
         st.caption("比較結果は全処理ZIP内の indicator_compare_candidates.csv に保存します。")
 
-    with gfs_tab:
-        if st.session_state.get("v172412_history_refresh_required"):
-            st.warning("旧版の取得日足が残っています。『今日の判定を更新』を押して研究用高値を再計算してください。")
-        gfs_research_buy, gfs_research_sell, gfs_research_audit, gfs_research_settings = render_gfs_research(
-            data, daily_bar_status_df, short_confirmed, [value_top50_df, signal_value_df], signal_audit_df
-        )
-
     with holdings_tab:
         st.caption("SBI約定履歴CSVから復元できた現在保有銘柄だけを表示します。")
         if confirmed:
@@ -8401,12 +8492,6 @@ try:
                                      ("multibagger_growth_fetch.csv", mb_extra)):
             zf.writestr(mb_filename, mb_frame.to_csv(index=False, encoding="utf-8-sig"))
         zf.writestr("daily_acquisition_diagnostics.csv",daily_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
-        for gfs_name, gfs_frame in [("gfs_research_buy.csv", gfs_research_buy),
-                                    ("gfs_research_sell.csv", gfs_research_sell),
-                                    ("gfs_research_audit.csv", gfs_research_audit),
-                                    ("gfs_research_settings.csv", pd.DataFrame([gfs_research_settings])),
-                                    ("gfs_research_sources.csv", pd.DataFrame(GFS_RESEARCH_SOURCES))]:
-            zf.writestr(gfs_name, gfs_frame.to_csv(index=False, encoding="utf-8-sig"))
         if isinstance(universe_df,pd.DataFrame):
             zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
         if isinstance(value_top50_df,pd.DataFrame):

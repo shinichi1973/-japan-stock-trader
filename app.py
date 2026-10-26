@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.45
-# BUILD: VER17-24-45-VIDEO-RESEARCH-20261025
+# 日本株 AI投資アシスタント Ver.17.24.47
+# BUILD: VER17-24-47-FLOW-RESEARCH-20261026
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -40,13 +40,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.45",
+    page_title="日本株 AI投資アシスタント Ver.17.24.47",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.46 動画研究・有力銘柄表示"
-BUILD = "VER17-24-45-VIDEO-RESEARCH-20261025"
+VERSION = "17.24.47 資金流入初期研究"
+BUILD = "VER17-24-47-FLOW-RESEARCH-20261026"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -5643,13 +5643,13 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.45")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.47")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
 st.caption("監視対象・購入予算・注文方式は設定欄で選択。株数上限解除・対象拡大の成績は比較検証で確認してください。")
 
-main_tab, single_tab, bottom_tab, video_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "1銘柄・利益1万円研究", "底打ち・上昇転換研究", "動画式AI投資研究", "大化け候補", "管理者"])
+main_tab, single_tab, bottom_tab, video_tab, flow_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "1銘柄・利益1万円研究", "底打ち・上昇転換研究", "動画式AI投資研究", "資金流入初期研究", "大化け候補", "管理者"])
 
 # ------------------------------------------------------------
 # 下部の入力値はウィジェットの再実行時に取得する。
@@ -8129,6 +8129,159 @@ def render_video_research():
         z.writestr("video_research_market.csv",pd.DataFrame([context]).to_csv(index=False,encoding="utf-8-sig"))
         z.writestr("video_research_position_plans.csv",pd.DataFrame(plans).to_csv(index=False,encoding="utf-8-sig"))
     st.download_button("動画研究CSV一括ZIP",buf.getvalue(),"video_research.zip","application/zip",key="video_export")
+
+
+# 資金流入初期研究：公開済み確定日足の代理指標。実際の資金流入・AI利用を測定しない。
+def build_flow_research(prices, freshness, valuations, evidence, today):
+    target = video_reference_day(freshness)
+    now = pd.Timestamp(today)
+    if now.tzinfo is not None:
+        now = now.tz_convert('Asia/Tokyo').tz_localize(None)
+    expected = now.normalize() - pd.Timedelta(days=0 if now.hour >= 16 else 1)
+    while expected.weekday() >= 5:
+        expected -= pd.Timedelta(days=1)
+    fresh = {str(code(str(r['コード']))): r for r in freshness.to_dict('records')} if isinstance(freshness, pd.DataFrame) and 'コード' in freshness else {}
+    vals = {str(code(str(r['コード']))): str(r.get('割安判定', r.get('銘柄判定', '算定不能'))) for r in valuations.to_dict('records')} if isinstance(valuations, pd.DataFrame) and 'コード' in valuations else {}
+    evs = {}
+    if isinstance(evidence, pd.DataFrame) and 'コード' in evidence:
+        for r in evidence.to_dict('records'):
+            c = str(code(str(r['コード'])))
+            day = pd.to_datetime(r.get('確認日', ''), errors='coerce', utc=True)
+            valid = pd.notna(day) and 0 <= (now.date() - day.date()).days <= 7
+            url = str(r.get('公式IR_URL', '')).strip()
+            evs[c] = dict(r, valid=bool(valid and url.startswith('https://') and str(r.get('確認結果', '')) == '確認済' and str(r.get('裏付け内容', '')).strip()))
+    rows = []
+    for ticker, frame in prices.items():
+        c = str(code(str(ticker)))
+        x = video_price_frame(frame)
+        if pd.notna(target):
+            x = x.loc[:min(target, expected)]
+        blockers = []
+        if pd.isna(target) or target != expected or x.empty or x.index[-1] != target or fresh.get(c, {}).get('状態') != '🟢 当日確定':
+            blockers.append('最新確定日足未確認（祝日も要確認）')
+        invalid = not x.empty and not np.isfinite(x[['Close','High','Low','Volume']].to_numpy()).all()
+        if invalid:
+            blockers.append('価格・出来高に非有限値')
+        if len(x) < 61 or invalid:
+            rows.append({'コード':c, '銘柄名':name(ticker), '銘柄判定':vals.get(c,'算定不能'), '研究判定':'データ不足', '確認事項':'／'.join(blockers + (['日足61本未満'] if len(x) < 61 else [])), '条件通過数':0})
+            continue
+        last = x.iloc[-1]
+        px = float(last.Close)
+        if not np.isfinite(x[['Close','High','Low','Volume']].to_numpy()).all() or not ((x.Low <= x.Close) & (x.Close <= x.High)).all():
+            blockers.append('価格・出来高の整合性未確認')
+        if (x.Close.pct_change().tail(60).abs() > .30).any():
+            blockers.append('価格断絶・分割等の確認待ち')
+        prev = x.iloc[-21:-1]
+        vbase = float(prev.Volume.mean())
+        vr = float(last.Volume/vbase) if vbase > 0 else np.nan
+        turnover = float((prev.Close * prev.Volume).mean())
+        width = float((prev.High.max()/prev.Low.min()-1)*100)
+        r5 = float((px/x.Close.iloc[-6]-1)*100)
+        r20 = float((px/x.Close.iloc[-21]-1)*100)
+        lowup = bool(x.Low.iloc[-5:].min() > x.Low.iloc[-10:-5].min() and px > x.Close.tail(5).mean())
+        high10 = float(x.High.iloc[-11:-1].max())
+        checks = {
+            '条件_出来高1.5倍': bool(np.isfinite(vr) and vr >= 1.5),
+            '条件_平均売買代金1億円': bool(turnover >= 100000000),
+            '条件_持合幅15%以内': bool(width <= 15),
+            '条件_急騰前または初期': bool(-3 <= r5 <= 8 and -5 <= r20 <= 15),
+            '条件_安値切上げ': lowup,
+            '条件_10日高値2%以内': bool(high10*.98 <= px <= high10*1.03),
+        }
+        label = vals.get(c, '算定不能')
+        ev = evs.get(c, {})
+        rows.append({'銘柄判定':label, 'コード':c, '銘柄名':name(ticker), '研究判定':'', '注目':'', '終値':px,
+                     '基準日':str(x.index[-1].date()), '出来高倍率':round(vr,2), '20日平均売買代金_概算':round(turnover),
+                     '20日持合幅%':round(width,2), '5日騰落率%':round(r5,2), '20日騰落率%':round(r20,2),
+                     '10日高値':high10, '直近5日安値_否定目安':float(x.Low.tail(5).min()),
+                     '業種・テーマ':str(ev.get('業種・テーマ','')).strip(), 'IR確認': '確認済（利用者入力）' if ev.get('valid') else '未確認',
+                     '公式IR_URL':str(ev.get('公式IR_URL','')), '裏付け内容':str(ev.get('裏付け内容','')),
+                     'データ確認':'／'.join(blockers), **checks})
+    out = pd.DataFrame(rows)
+    if out.empty or '終値' not in out:
+        return out
+    valid = out['データ確認'].fillna('データ不足').eq('')
+    median5 = out.loc[valid, '5日騰落率%'].median()
+    # 比較母集団10銘柄未満は相対強度を算定しない。市場指数比ではない。
+    relative_ok = int(valid.sum()) >= 10 and np.isfinite(median5)
+    out['取得母集団比5日超過率%'] = (out['5日騰落率%'] - median5).round(2) if relative_ok else np.nan
+    out['条件_母集団比2%以上'] = out['取得母集団比5日超過率%'].ge(2)
+    checkcols = [k for k in out if k.startswith('条件_')]
+    out['条件通過数'] = out[checkcols].fillna(False).astype(bool).sum(axis=1)
+    out['テーマ波及'] = '未確認（対応表なし・対象不足）'
+    for theme, group in out[valid & out['業種・テーマ'].fillna('').ne('')].groupby('業種・テーマ'):
+        strong = group['条件_出来高1.5倍'].fillna(False) & group['条件_母集団比2%以上']
+        if len(group) >= 3:
+            out.loc[group.index, 'テーマ波及'] = f'{theme}：取得{len(group)}銘柄中{int(strong.sum())}銘柄が出来高・相対強度通過' + ('（広がりあり）' if strong.sum() >= 2 and strong.mean() >= .5 else '（広がり不足）')
+    for idx, row in out.iterrows():
+        if row.get('研究判定') == 'データ不足':
+            continue
+        reasons = [str(row['データ確認'])] if row['データ確認'] else []
+        if not relative_ok: reasons.append('相対比較の有効銘柄10未満')
+        reasons += [k.replace('条件_', '')+'未達' for k in checkcols if not bool(row.get(k, False))]
+        label = str(row['銘柄判定'])
+        value_ok = any(k in label for k in ['割安','適正','妥当']) and '割高' not in label
+        if not value_ok: reasons.append('割高または企業価値未確認')
+        ir_ok = str(row['IR確認']).startswith('確認済')
+        if not ir_ok: reasons.append('公式IRの裏付け未確認')
+        tech_ok = not row['データ確認'] and relative_ok and row['条件通過数'] == len(checkcols)
+        out.at[idx, '研究判定'] = '初期候補（注文前確認）' if tech_ok and value_ok and ir_ok else '技術条件通過・確認待ち' if tech_ok else '見送り'
+        out.at[idx, '確認事項'] = '／'.join(reasons) if reasons else '当日の価格・ニュース・注文条件を確認'
+    out = out.sort_values(['条件通過数','出来高倍率','コード'], ascending=[False,False,True], kind='stable')
+    picks = out[out['研究判定'].eq('初期候補（注文前確認）')]
+    if not picks.empty:
+        out.at[picks.index[0], '注目'] = '★ 最優先研究候補'
+    first = ['銘柄判定','注目','研究判定','コード','銘柄名','条件通過数','確認事項']
+    return out[[k for k in first if k in out] + [k for k in out if k not in first]]
+
+
+def render_flow_research():
+    st.subheader('資金流入の初期候補（研究）')
+    st.info('確定日足の出来高と価格から注目の集まり始めを探す研究です。AI投資家の注文や実際の資金流入は識別しません。候補は正式な買い・配分へ自動追加されません。')
+    st.caption('取得済み銘柄のみを比較し追加の株価通信は行いません。場中の板・同時刻出来高・SNSは未使用。後場のリアルタイム判定とは別です。')
+    with st.expander('条件と判定の読み方'):
+        st.write('前20日比出来高1.5倍以上／前20日平均売買代金1億円以上／前20日高安幅15%以内／5日騰落−3～8%・20日騰落−5～15%／直近5日安値の切上げと5日平均終値回復／前10日高値の−2～＋3%／有効な取得母集団の5日騰落中央値比＋2%以上。この7条件は研究仮説で、上昇確率ではありません。')
+        st.write('確定日足61本・データ鮮度・価格整合性を確認します。相対比較は有効10銘柄以上が必要。割高・企業価値不明・IR未確認は初期候補にしません。テーマ波及は入力された対応表に3銘柄以上ある場合だけ補助表示します。')
+        st.caption('祝日を自動照合する機能は未追加です。営業日の目安と日足が一致しない場合は保留し、安全側に候補を出しません。価格断絶は分割調整の確認待ちとして扱います。')
+    with st.expander('業種・テーマと公式IR確認CSV（任意）'):
+        st.caption('公式IRを実際に確認した場合だけ確認結果に「確認済」を記入。確認日7日以内・https URL・裏付け内容が必要です。URLの内容・発表日を自動検証する機能ではありません。同一テーマ名で波及を比較します。')
+        template = pd.DataFrame(columns=['コード','業種・テーマ','確認日','確認結果','公式IR_URL','裏付け内容'])
+        st.download_button('資金流入研究・確認CSVひな形', template.to_csv(index=False).encode('utf-8-sig'), 'flow_evidence_template.csv', key='flow_template')
+        upload = st.file_uploader('資金流入研究の確認CSV', type=['csv'], key='flow_evidence')
+        evidence = pd.DataFrame()
+        if upload is not None:
+            try:
+                evidence = pd.read_csv(upload, dtype=str, encoding='utf-8-sig').fillna('')
+                if not set(template.columns).issubset(evidence.columns):
+                    st.warning('ひな形の列が不足しています。確認情報を採用しません。')
+                    evidence = pd.DataFrame()
+            except Exception:
+                st.warning('CSVを読み込めません。UTF-8のひな形を使用してください。')
+    result = build_flow_research(data, daily_bar_status_df, valuation_master_df, evidence, tokyo_now())
+    if result.empty:
+        st.info('NO DATA：今日の判定を更新してください。')
+        return
+    st.caption(f'取得済み{len(result)}銘柄を確認。データ鮮度・母集団の偏りにより候補が変わります。')
+    candidates = result[result['研究判定'].eq('初期候補（注文前確認）')]
+    if candidates.empty:
+        st.info('初期候補：該当なし。技術条件通過でもIR・企業価値未確認なら確認待ちです。')
+    else:
+        leader = candidates[candidates['注目'].fillna('').ne('')].iloc[0]
+        st.success(f"★ {leader['銘柄名']}（{leader['コード']}）：7条件通過。出来高 {leader['出来高倍率']:.2f}倍／母集団比 {leader['取得母集団比5日超過率%']:+.2f}%")
+        st.caption('同条件では出来高倍率→コード順で1銘柄を強調。急騰の予測や注文指示ではありません。')
+        st.dataframe(candidates.style.apply(lambda r: ['background-color: #fff2b3; color: #17202a' if r.get('注目') else '']*len(r), axis=1), hide_index=True, use_container_width=True)
+    waiting = result[result['研究判定'].eq('技術条件通過・確認待ち')]
+    if not waiting.empty:
+        st.write('技術条件通過・確認待ち')
+        st.dataframe(waiting, hide_index=True, use_container_width=True)
+    with st.expander('全銘柄の条件・見送り理由'):
+        st.dataframe(result, hide_index=True, use_container_width=True)
+    st.download_button('資金流入研究・全件CSV', result.to_csv(index=False).encode('utf-8-sig'), 'flow_research_audit.csv', key='flow_audit_download')
+    st.caption('直近5日安値は研究の否定目安です。利確・IFDOCOは本機能では作成しません。値幅・支持抵抗と公式情報を再確認し、既存の売買ルールを優先してください。')
+
+
+with flow_tab:
+    render_flow_research()
 
 
 with video_tab:

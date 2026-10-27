@@ -40,13 +40,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.47",
+    page_title="日本株 AI投資アシスタント Ver.17.24.48",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.47 資金流入初期研究"
-BUILD = "VER17-24-47-FLOW-RESEARCH-20261026"
+VERSION = "17.24.48 底打ち研究表示修正"
+BUILD = "VER17-24-48-BOTTOM-EMPTY-FIX-20261028"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -7627,10 +7627,18 @@ def render_bottom_research(valuations, holdings=None, verified=False):
         st.info('上昇転換と財務条件をすべて満たす研究候補は0件です。')
     elif not result['ranking'].empty:
         show_stock_table(result['ranking'], use_container_width=True, hide_index=True)
-    if not result['audit'].empty and result['audit']['対TOPIX連動ETF20日超過率%'].isna().all():
+    if not result['audit'].empty and '対TOPIX連動ETF20日超過率%' in result['audit'] and result['audit']['対TOPIX連動ETF20日超過率%'].isna().all():
         st.warning('比較用ETFの日足未確認のため、相対強さ10点は未算定です。')
     with st.expander('TOP300全件・監視銘柄・見送り理由', expanded=False):
-        show_reference_choice_table(result['audit'], candidates=result['audit'].loc[~result['audit']['研究判定'].eq('上昇転換確認'), 'コード'], use_container_width=True, hide_index=True)
+        audit = result.get('audit')
+        if not isinstance(audit, pd.DataFrame) or audit.empty:
+            st.info('研究対象の一覧はありません。取得状況を確認して研究ランキングを更新してください。')
+        elif not {'研究判定', 'コード'}.issubset(audit.columns):
+            st.warning('研究結果に必要な項目が不足しています。研究ランキングを更新してください。AI参考候補は選択できません。')
+            show_stock_table(audit, use_container_width=True, hide_index=True)
+        else:
+            candidates = audit.loc[~audit['研究判定'].eq('上昇転換確認'), 'コード']
+            show_reference_choice_table(audit, candidates=candidates, use_container_width=True, hide_index=True)
     with st.expander('構成銘柄の日足取得状況', expanded=False):
         show_stock_table(result['coverage'], use_container_width=True, hide_index=True)
     st.caption('財務は通常更新の取得済み評価を照合。研究対象にしかない銘柄は財務未確認として保留します。全件確認時のみ確定TOP300、欠損時は確認済み銘柄内の暫定TOP300です。')

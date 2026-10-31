@@ -1,5 +1,5 @@
 """Headless refresh: load definitions only. Streamlit screens/orders never execute."""
-import ast, os, argparse, json, zipfile, time, subprocess, sys
+import ast, os, argparse, json, zipfile, time, subprocess, sys, threading
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -27,8 +27,50 @@ def load_definitions(path):
         ns[name] = lru_cache(maxsize=None)(ns[name])
     # Successful pages may be reused within this run (150/300 bars and finance).
     ns['_fetch_free_finance_html'] = lru_cache(maxsize=4096)(ns['_fetch_free_finance_html'])
+    install_polite_transport(ns)
     install(ns)
     return ns
+
+def install_polite_transport(ns):
+    """Worker-only spacing; existing circuit breakers are always respected."""
+    original = ns['_finance_paced_get']
+    state = ns['_finance_transport_state']()
+    gate = threading.Lock()
+    next_slot = {}
+
+    def get(url):
+        host = ns['_finance_host'](url)
+        with gate:
+            # Do not sleep or retry a host which the app has already paused.
+            with state['lock']:
+                meta = state['hosts'].get(host, {})
+                blocked = max(meta.get('blocked_until', 0),
+                              meta.get('paths', {}).get(url, 0))
+            if blocked > time.monotonic():
+                raise RuntimeError(f'{host}: 取得先一時休止中・追加アクセス停止')
+            delay = next_slot.get(host, 0)-time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            next_slot[host] = time.monotonic()+5.0
+        response = original(url)
+        if response.status_code in (429, 503):
+            # Honor Retry-After; never shorten the original cooldown.
+            from email.utils import parsedate_to_datetime
+            value = response.headers.get('Retry-After', '')
+            try:
+                delay = max(0.0, float(value))
+            except (ValueError, TypeError):
+                try:
+                    delay = max(0.0, parsedate_to_datetime(value).timestamp()-time.time())
+                except (ValueError, TypeError, OverflowError):
+                    delay = 0.0
+            if delay:
+                with state['lock']:
+                    meta = state['hosts'][host]
+                    meta['blocked_until'] = max(meta['blocked_until'], time.monotonic()+delay)
+        return response
+    ns['_finance_paced_get'] = get
+
 
 def log(message):
     print(message, flush=True)
@@ -60,21 +102,6 @@ def worker(a):
               'cache':_STATS, 'complete':False, 'stage':'daily', 'finance_processed':0,
               'finance_errors':0}
     save_report(report)
-    for bars in (150, 300):
-        for start in range(0, len(symbols), 10):
-            chunk = symbols[start:start+10]
-            log(f'DAILY {bars}: {start+1}-{start+len(chunk)}/{len(symbols)} start')
-            frames, audit = ns['batch_domestic_stock_data'](chunk, phase, bars)
-            counts['daily_'+str(bars)] += len(frames)
-            for symbol, frame in frames.items():
-                for label in ('stoch_prepare_light','rsi_prepare_light','bb_prepare_light','stoch_signal_quality'):
-                    try:
-                        ns[label](frame)
-                    except Exception as exc:
-                        log(f'INDICATOR {symbol} {label}: {type(exc).__name__}: {str(exc)[:200]}')
-            report['stage'] = f'daily_{bars}'
-            save_report(report)
-            log(f'DAILY {bars}: finished {start+len(chunk)}/{len(symbols)}, frames={len(frames)}')
     def finance(symbol):
         log(f'FINANCE {symbol}: start')
         try:
@@ -85,16 +112,46 @@ def worker(a):
         except Exception as exc:
             log(f'FINANCE {symbol}: {type(exc).__name__}: {str(exc)[:300]}')
             return False, True
-    report['stage'] = 'finance'
-    # Share the original host pacing, cooldown and thread-local sessions.
-    ns['_finance_transport_state']()
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        for ok, error in pool.map(finance, symbols):
-            counts['finance'] += int(ok)
-            report['finance_errors'] += int(error)
-            report['finance_processed'] += 1
+    report['stage'] = 'finance_probe'
+    # Run sequentially before history pages consume the host's request allowance.
+    # Stop early if all three probes raise errors. No blind full-universe retry.
+    for index, symbol in enumerate(symbols):
+        ok, error = finance(symbol)
+        counts['finance'] += int(ok)
+        report['finance_errors'] += int(error)
+        report['finance_processed'] += 1
+        report['stage'] = 'finance'
+        save_report(report)
+        if index == min(3, len(symbols))-1 and report['finance_errors'] == index+1:
+            report['stage'] = 'finance_probe_failed'
             save_report(report)
+            raise RuntimeError('財務の接続確認が全件失敗。公開更新を停止します。直前の取得エラーを確認してください')
+    for bars in (300, 150):
+        report['daily_fresh_'+str(bars)] = 0
+        for start in range(0, len(symbols), 10):
+            chunk = symbols[start:start+10]
+            log(f'DAILY {bars}: {start+1}-{start+len(chunk)}/{len(symbols)} start')
+            frames, audit = ns['batch_domestic_stock_data'](chunk, phase, bars)
+            counts['daily_'+str(bars)] += len(frames)
+            if not audit.empty:
+                # This is the application's existing date/split validation result.
+                fresh = audit['状態'].eq('取得済')
+                report['daily_fresh_'+str(bars)] += int(fresh.sum())
+                for row in audit.loc[~fresh].to_dict('records'):
+                    log('DAILY_AUDIT '+json.dumps(row, ensure_ascii=False, default=str))
+            for symbol, frame in frames.items():
+                for label in ('stoch_prepare_light','rsi_prepare_light','bb_prepare_light','stoch_signal_quality'):
+                    try:
+                        ns[label](frame)
+                    except Exception as exc:
+                        log(f'INDICATOR {symbol} {label}: {type(exc).__name__}: {str(exc)[:200]}')
+            report['stage'] = f'daily_{bars}'
+            save_report(report)
+            log(f'DAILY {bars}: finished {start+len(chunk)}/{len(symbols)}, frames={len(frames)}')
     report['complete'] = True
+    report['data_complete'] = (counts['finance'] == len(symbols)
+        and report['daily_fresh_150'] == len(symbols)
+        and report['daily_fresh_300'] == len(symbols))
     report['stage'] = 'finished'
     save_report(report)
 
@@ -104,8 +161,13 @@ def package(a, timed_out):
     counts = report.get('counts', {})
     if not (counts.get('daily_150') or counts.get('daily_300') or counts.get('finance')):
         raise RuntimeError('新規取得結果なし。公開用キャッシュは更新しません')
+    if not counts.get('finance'):
+        raise RuntimeError('利用可能な財務情報がゼロのため公開更新を停止します')
     report['timed_out'] = timed_out
     report['complete'] = bool(report.get('complete')) and not timed_out
+    report['data_complete'] = bool(report.get('data_complete')) and not timed_out
+    if not report['data_complete']:
+        log('::warning::一部取得。財務・日足の取得件数と鮮度を確認してください')
     report['packaged_at'] = time.time()
     ROOT.mkdir(parents=True, exist_ok=True)
     temp = Path(a.output+'.tmp')
@@ -152,6 +214,8 @@ def main():
             child.wait()
         result = None
     if result not in (None, 0):
+        if Path('cache_status.json').exists():
+            log(Path('cache_status.json').read_text(encoding='utf-8'))
         raise RuntimeError(f'更新処理エラー (exit={result})。既存公開データを維持します')
     package(a, timed_out)
 

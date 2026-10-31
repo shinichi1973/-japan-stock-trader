@@ -40,12 +40,12 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.50",
+    page_title="日本株 AI投資アシスタント Ver.17.24.51",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.50 対象抽出・個別判定修正"
+VERSION = "17.24.51 最終判定一致検証"
 BUILD = "VER17-24-50-PRECOMPUTED-CACHE-20261031"
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -5570,6 +5570,22 @@ if _cache_url and st.session_state.get("precomputed_bundle_phase") != _cache_pha
         st.warning("事前キャッシュを取得できません。通常取得へ切り替えます: " + str(_cache_error)[:160])
 st.caption("日足・国内財務・共通指標：保存済みデータを優先。期限切れ・不足分は通常取得し、既存の鮮度判定を適用します。")
 
+# Validation captures outputs only; no extra network requests or account access.
+_parity_finance_records = {}
+_parity_original_finance = fundamental_snapshot
+
+def _parity_finance_key(args, kwargs):
+    return repr((args, sorted(kwargs.items())))
+
+def _parity_capture_finance(*args, **kwargs):
+    import copy
+    value = _parity_original_finance(*args, **kwargs)
+    _parity_finance_records[_parity_finance_key(args, kwargs)] = copy.deepcopy(value)
+    return value
+
+fundamental_snapshot = _parity_capture_finance
+
+
 st.markdown(
     """
     <style>
@@ -5667,7 +5683,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.47")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.51")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5987,6 +6003,17 @@ if not daily_acquisition_df.empty:
 # ------------------------------------------------------------
 # 固定45銘柄の未保有株の新規BUYと、全保有銘柄のSELLを監視。
 # ------------------------------------------------------------
+# PARITY_INPUT_CAPTURE
+_parity_input_names = (
+    "data", "value_top50_df", "universe_df", "short_confirmed", "all_held_codes",
+    "held_codes", "live_universe_mode", "signal_first", "min_turnover",
+    "filter_downtrend", "filter_churn", "replacement_live", "sl", "block_unrated",
+    "short_buying_power", "current_assets", "purchase_cap", "execution_mode",
+    "lot_cap", "order_inputs_ready", "live_trade_method", "STOCK_NAMES",
+)
+_parity_inputs = {k: globals()[k] for k in _parity_input_names}
+_parity_clock = tokyo_now()
+# PARITY_DECISION_BEGIN
 buy_view = pd.DataFrame()
 sell_view = pd.DataFrame()
 buy_signal_rows, sell_signal_rows = [], []
@@ -6197,6 +6224,11 @@ for _view in (buy_view, sell_view):
         for _col in ("値幅区分", "ATR比率%", "安値切上げ"):
             _view[_col] = _view["コード"].astype(str).map(lambda c: _metrics.get(c, {}).get(_col))
 
+# PARITY_DECISION_END
+_parity_production = {"買い候補": buy_view.copy(deep=True),
+                      "売り候補": sell_view.copy(deep=True),
+                      "判定監査": signal_audit_df.copy(deep=True),
+                      "抽出理由": signal_first_audit_df.copy(deep=True)}
 # 管理者研究用。実売買には一切使わない3方式比較。
 indicator_compare_df = build_indicator_compare(data, true_top50_codes, held_codes) if data and true_top50_codes else pd.DataFrame()
 if not isinstance(indicator_compare_df, pd.DataFrame):
@@ -8402,7 +8434,173 @@ with multibagger_tab:
         show_stock_table(MULTIBAGGER_RULES, use_container_width=True, hide_index=True)
         st.write("決算説明資料で、売上・利益が伸びた理由、翌期も続く根拠、顧客集中、増資予定を確認してください。減収・減益や資金繰り悪化は成長シナリオの再確認が必要です。")
 
+def run_final_decision_parity(live):
+    """Replay the production decision block offline in private namespaces/cache dirs.
+
+    Financial *inputs* and the universe are fixed. This tests today's decision
+    pipeline, not network acquisition, other research tabs or strategy profitability.
+    """
+    import ast
+    import copy
+    import types
+    import traceback
+    from pathlib import Path
+    import precomputed_cache as real_cache
+
+    result = {"ok": False, "diffs": [], "tables": {}, "errors": [], "hits": 0}
+    source = Path(__file__).read_text(encoding="utf-8")
+    inputs = copy.deepcopy(live['_parity_inputs'])
+    finance = copy.deepcopy(live['_parity_finance_records'])
+    clock = live['_parity_clock']
+    result['meta'] = {"検証日時": clock.isoformat(), "版": live['VERSION'],
+                      "売買ロジック": inputs['live_trade_method'],
+                      "監視対象": inputs['live_universe_mode'],
+                      "日足銘柄数": len(inputs['data']),
+                      "財務固定件数": len(finance),
+                      "ソースSHA256": hashlib.sha256(source.encode()).hexdigest(),
+                      "範囲": "今日の売買。取得済み日足と財務入力を固定。研究タブ・取得通信は対象外"}
+
+    class SilentUI:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def __getattr__(self, key):
+            if key == 'session_state': return {}
+            if key in ('caption', 'warning', 'info', 'error', 'dataframe', 'markdown', 'write', 'success'):
+                return lambda *a, **k: None
+            if key in ('expander', 'spinner', 'container'): return lambda *a, **k: self
+            raise RuntimeError('検証中に未対応の画面処理: ' + key)
+
+    class Offline:
+        def __getattr__(self, key): raise RuntimeError('検証中の外部取得を禁止: ' + key)
+
+    def frozen_finance(*args, **kwargs):
+        key = _parity_finance_key(args, kwargs)
+        if key not in finance:
+            raise RuntimeError('固定財務入力が不足: ' + str(args[0] if args else 'unknown'))
+        return copy.deepcopy(finance[key])
+
+    def compare(label, left, right):
+        # Preserve row order (ranking) and column presence; do not sort away changes.
+        for table in sorted(set(left) | set(right)):
+            a, b = left.get(table), right.get(table)
+            if a is None or b is None:
+                result['diffs'].append({'比較': label, '表': table, '項目': '表不足'})
+                continue
+            if list(a.columns) != list(b.columns) or a.shape != b.shape:
+                result['diffs'].append({'比較': label, '表': table, '項目': '行数・列構成',
+                                         '通常': str((a.shape, list(a.columns))),
+                                         '比較側': str((b.shape, list(b.columns)))})
+                continue
+            a, b = a.reset_index(drop=True), b.reset_index(drop=True)
+            for row in range(len(a)):
+                for col in a.columns:
+                    x, y = a.at[row, col], b.at[row, col]
+                    if pd.isna(x) and pd.isna(y): continue
+                    exact = any(word in str(col) for word in
+                                ('株数', '順位', '優先', '判定', '理由', 'コード', '買い', '売り', '条件', '可否'))
+                    equal = (x == y)
+                    if not exact and isinstance(x, (int, float, np.number)) and isinstance(y, (int, float, np.number)):
+                        equal = np.isclose(x, y, rtol=1e-12, atol=1e-12, equal_nan=True)
+                    if pd.isna(equal) or not bool(equal):
+                        result['diffs'].append({'比較': label, '表': table, '行': row + 1,
+                            'コード': str(a.at[row, 'コード']) if 'コード' in a else '',
+                            '項目': col, '通常': str(x), '比較側': str(y)})
+
+    try:
+        if not inputs['data'] or not any(isinstance(f, pd.DataFrame) and not f.empty for f in inputs['data'].values()):
+            raise RuntimeError('日足がありません。「今日の判定を更新」してから検証してください。')
+        begin = source.index('# PARITY_DECISION_BEGIN\n') + len('# PARITY_DECISION_BEGIN\n')
+        end = source.index('# PARITY_DECISION_END\n', begin)
+        decision = compile(source[begin:end], '最終判定ブロック', 'exec')
+        # Rebind original function bodies into each sandbox; strip Streamlit caches
+        # so baseline cannot accidentally reuse previously cached indicator outputs.
+        defs = [n for n in ast.parse(source).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for n in defs: n.decorator_list = []
+        definitions = compile(ast.fix_missing_locations(ast.Module(body=defs, type_ignores=[])), '検証用関数', 'exec')
+        cache_source = Path(real_cache.__file__).read_text(encoding='utf-8')
+        with tempfile.TemporaryDirectory(prefix='decision_check_') as directory:
+            cache = types.ModuleType('decision_check_private_cache')
+            exec(compile(cache_source, str(real_cache.__file__), 'exec'), cache.__dict__)
+            cache.ROOT = Path(directory)
+
+            def replay(use_cache):
+                ns = dict(live)
+                ns.update(copy.deepcopy(inputs))
+                ns['st'] = SilentUI()
+                exec(definitions, ns)
+                ns['tokyo_now'] = lambda: clock
+                ns['fundamental_snapshot'] = frozen_finance
+                ns['requests'] = Offline()
+                ns['yf'] = Offline()
+                ns['show_stock_table'] = lambda *a, **k: None
+                if use_cache: cache.install(ns)
+                exec(decision, ns)
+                return {'買い候補': ns['buy_view'].copy(deep=True),
+                        '売り候補': ns['sell_view'].copy(deep=True),
+                        '判定監査': ns['signal_audit_df'].copy(deep=True),
+                        '抽出理由': ns['signal_first_audit_df'].copy(deep=True)}
+
+            baseline = replay(False)
+            warmed = replay(True)
+            before = cache._STATS['hit']
+            cached = replay(True)
+            result['hits'] = cache._STATS['hit'] - before
+            result['tables'] = {'通常': baseline, '作成後': warmed, '読込後': cached}
+            compare('通常／作成後', baseline, warmed)
+            compare('通常／読込後', baseline, cached)
+            compare('画面判定／通常', live['_parity_production'], baseline)
+            if not result['hits']:
+                raise RuntimeError('キャッシュ読込を確認できませんでした。未検証として✖️にします。')
+            if baseline['判定監査'].empty:
+                raise RuntimeError('判定できた銘柄が0件です。空結果の一致は合格にしません。')
+            result['ok'] = not result['diffs']
+    except Exception:
+        result['errors'].append(traceback.format_exc())
+    result['meta'].update({'キャッシュ読込回数': result['hits'], '差分件数': len(result['diffs']),
+                           '合格': result['ok']})
+    # Only explicitly selected input data; never dump globals, secrets or tokens.
+    payload = {'設定': {k: v for k, v in inputs.items() if k not in
+                        ('data', 'value_top50_df', 'universe_df', 'STOCK_NAMES')},
+               '日足': inputs['data'], '企業価値表': inputs['value_top50_df'],
+               '母集団': inputs['universe_df'], '固定財務': finance}
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('summary.json', json.dumps(result['meta'], ensure_ascii=False, indent=2, default=str))
+        z.writestr('differences.csv', pd.DataFrame(result['diffs'], columns=['比較','表','行','コード','項目','通常','比較側']).to_csv(index=False).encode('utf-8-sig'))
+        z.writestr('errors.txt', '\n'.join(result['errors']))
+        z.writestr('fixed_inputs.json', json.dumps(real_cache.encode(payload), ensure_ascii=False, default=str))
+        for mode, tables in result['tables'].items():
+            for title, frame in tables.items():
+                z.writestr(mode + '_' + title + '.csv', frame.to_csv(index=False).encode('utf-8-sig'))
+        z.writestr('確認方法.txt', '差分の表・コード・項目を確認してください。通常と読込後の違いはキャッシュの保存復元・指標計算、画面判定と通常の違いは既存キャッシュ・関数定義・入力を確認します。errors.txtにエラーがある場合は検証未完了です。売買条件を緩めて一致させず、原因を修正後に再検証してください。固定入力には保有・余力を含みます。共有前に内容を確認してください。')
+    result['bundle'] = stream.getvalue()
+    return result
+
+
+def render_final_decision_parity(live):
+    st.subheader('最終判定の一致検証')
+    st.caption('「今日の売買」を通常計算とキャッシュ利用で比較します。研究タブと取得先の通信は対象外です。キャッシュ読込がない方式・データ不足も✖️（未検証）と表示します。')
+    if st.button('最終判定を検証する', key='v172451_verify', use_container_width=True):
+        with st.spinner('同じ入力で最終判定を比較中…'):
+            st.session_state['v172451_result'] = run_final_decision_parity(live)
+    result = st.session_state.get('v172451_result')
+    if result:
+        st.markdown('## ' + ('◯' if result['ok'] else '✖️'))
+        st.caption('前回検証日時：' + result['meta']['検証日時'] + '（入力・設定変更後は再実行してください）')
+        if result['ok']:
+            st.success('一致しました。今回の入力での検証結果です。利益や他の日の正常動作を保証するものではありません。')
+        else:
+            st.error('差分または検証未完了です。診断結果を確認してください。')
+            with st.expander('修正のための診断', expanded=True):
+                if result['diffs']: st.dataframe(pd.DataFrame(result['diffs']), hide_index=True, use_container_width=True)
+                if result['errors']: st.code('\n'.join(result['errors']))
+                st.write('下の診断ZIPを添えて修正を依頼できます。コードの自動書換えは行いません。')
+        st.download_button('診断結果をダウンロード', result['bundle'],
+                           'final_decision_check.zip', 'application/zip', key='v172451_download')
+
+
 with admin_tab:
+    render_final_decision_parity(globals())
     st.caption("比較・検証用。通常の朝はここを見る必要はありません。")
     ucnt = len(universe_df) if isinstance(universe_df, pd.DataFrame) else 0
     dcnt = len([1 for t in data if code(t) not in held_code_set]) if data else 0

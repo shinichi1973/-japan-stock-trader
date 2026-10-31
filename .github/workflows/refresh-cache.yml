@@ -29,8 +29,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-cache.txt
 
+      - name: Restore previous acquisition data
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache_store
+            .acquisition-cache
+          key: market-acquisition-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            market-acquisition-v2-
+
       - name: Refresh cache
-        run: python refresh_cache.py --limit 300
+        env:
+          DAILY_CACHE_DIR: ${{ github.workspace }}/.acquisition-cache/daily
+          FINANCE_CACHE_DIR: ${{ github.workspace }}/.acquisition-cache/finance
+        run: python -u refresh_cache.py --limit 300 --max-seconds 2400
 
       - name: Publish cache
         run: |

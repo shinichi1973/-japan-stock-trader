@@ -1,0 +1,19 @@
+{
+  "fetched_at": "2026-10-31T13:35:55.160475+09:00",
+  "scope": 300,
+  "counts": {
+    "daily_150": 120,
+    "daily_300": 120,
+    "finance": 0
+  },
+  "cache": {
+    "hit": 341,
+    "miss": 2359
+  },
+  "complete": true,
+  "stage": "finished",
+  "finance_processed": 300,
+  "finance_errors": 300,
+  "timed_out": false,
+  "packaged_at": 1793421719.2332075
+}

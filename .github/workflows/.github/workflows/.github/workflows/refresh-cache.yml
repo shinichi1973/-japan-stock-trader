@@ -1,0 +1,52 @@
+name: Refresh daily and finance cache
+
+on:
+  schedule:
+    - cron: '17 20,8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: precomputed-cache
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ver7
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements-cache.txt
+
+      - name: Refresh cache
+        run: python refresh_cache.py --limit 300
+
+      - name: Publish cache
+        run: |
+          cp cache_bundle.zip /tmp/cache_bundle.zip
+          cp cache_status.json /tmp/cache_status.json
+          rm cache_bundle.zip cache_status.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          if git show-ref --verify --quiet refs/remotes/origin/data-cache; then
+            git checkout -B data-cache origin/data-cache
+          else
+            git checkout --orphan data-cache
+            git rm -rf --ignore-unmatch .
+          fi
+          cp /tmp/cache_bundle.zip cache_bundle.zip
+          cp /tmp/cache_status.json cache_status.json
+          git add cache_bundle.zip cache_status.json
+          git diff --cached --quiet || git commit -m "Refresh market cache"
+          git push origin HEAD:data-cache

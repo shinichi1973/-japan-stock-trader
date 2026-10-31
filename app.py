@@ -40,13 +40,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.49",
+    page_title="日本株 AI投資アシスタント Ver.17.24.50",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.49 対象抽出・個別判定修正"
-BUILD = "VER17-24-49-CANDIDATE-SCOPE-FIX-20261031"
+VERSION = "17.24.50 対象抽出・個別判定修正"
+BUILD = "VER17-24-50-PRECOMPUTED-CACHE-20261031"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -5548,6 +5548,27 @@ def admin_judgement_table(df, key, maximum=520):
     show_stock_table(df, use_container_width=True, hide_index=True,
                  height=admin_table_height(df, maximum))
 
+
+
+# Precomputed snapshots are independent of holdings, buying power and order decisions.
+from precomputed_cache import install as _install_precomputed, import_bundle as _import_cache_bundle
+_install_precomputed(globals())
+_cache_url = os.environ.get("PRECOMPUTED_CACHE_URL", "")
+if not _cache_url:
+    try: _cache_url = st.secrets.get("PRECOMPUTED_CACHE_URL", "")
+    except Exception: pass
+_cache_phase = (str(tokyo_now().date()), tokyo_now().hour >= 16)
+if _cache_url and st.session_state.get("precomputed_bundle_phase") != _cache_phase:
+    try:
+        _cache_token = os.environ.get("PRECOMPUTED_CACHE_TOKEN", "")
+        if not _cache_token:
+            try: _cache_token = st.secrets.get("PRECOMPUTED_CACHE_TOKEN", "")
+            except Exception: pass
+        _import_cache_bundle(_cache_url, _cache_token)
+        st.session_state["precomputed_bundle_phase"] = _cache_phase
+    except Exception as _cache_error:
+        st.warning("事前キャッシュを取得できません。通常取得へ切り替えます: " + str(_cache_error)[:160])
+st.caption("日足・国内財務・共通指標：保存済みデータを優先。期限切れ・不足分は通常取得し、既存の鮮度判定を適用します。")
 
 st.markdown(
     """

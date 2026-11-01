@@ -40,12 +40,12 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.51",
+    page_title="日本株 AI投資アシスタント Ver.17.24.52",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.51 最終判定一致検証"
+VERSION = "17.24.52 日足キャッシュ優先・最終判定一致検証"
 BUILD = "VER17-24-50-PRECOMPUTED-CACHE-20261031"
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -3822,7 +3822,7 @@ def _history_provider(t, cutoff, provider, target_bars=150):
     cached = cached.loc[cached.index <= cutoff] if not cached.empty else cached
     origin = cached.attrs.get("origin", "")
     # 日付が確定済みなら、同一取引日への再アクセスを省く。前日以前を最新と偽らない。
-    if not cached.empty and len(cached) >= target_bars and pd.Timestamp(cached.index.max()).normalize() == cutoff:
+    if _usable_daily_cache(cached, cutoff, target_bars):
         return cached, 0, "保存履歴を再利用", "保存値"
     parts, seen, errors, overlapping = [], set(), [], False
     limit = 3 if provider == "traders" else min(15, int(math.ceil(target_bars / 20)))
@@ -3864,9 +3864,47 @@ def _history_provider(t, cutoff, provider, target_bars=150):
     return cached, pages, " / ".join(errors), "過去保存値（最終日を確認）" if not cached.empty else "取得不可"
 
 
+def _usable_daily_cache(frame, cutoff, target_bars):
+    """最新日・履歴数・OHLCV整合性を確認。異常値は通常取得へ戻す。"""
+    try:
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return False
+        if not isinstance(frame.index, pd.DatetimeIndex):
+            return False
+        if frame.index.hasnans or frame.index.has_duplicates or not frame.index.is_monotonic_increasing:
+            return False
+        if len(frame) < max(134, int(target_bars)):
+            return False
+        if frame.index.max().normalize() != cutoff:
+            return False
+        values = frame[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
+        if not np.isfinite(values.to_numpy()).all():
+            return False
+        prices = values[["Open", "High", "Low", "Close"]]
+        if not prices.gt(0).all().all() or not values["Volume"].ge(0).all():
+            return False
+        if not (values["High"].ge(prices.max(axis=1)).all() and
+                values["Low"].le(prices.min(axis=1)).all()):
+            return False
+        # 既存の分割・価格断絶ガードを緩めず、再取得で確認する。
+        return not values["Close"].pct_change().tail(60).abs().gt(.40).any()
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
 def _download_domestic_history(t, cutoff, target_bars=150):
     best, audit = pd.DataFrame(), []
     source, mode, pages = "", "", 0
+    # 両取得先の保存値を先に確認。Yahoo側が最新ならtradersへの通信も不要。
+    for provider, label in (("traders", "トレーダーズ・ウェブ無料日足"),
+                            ("yahoo", "Yahoo!ファイナンス日本版・時系列日足")):
+        saved = _daily_cache_read(t, provider)
+        if _usable_daily_cache(saved, cutoff, target_bars):
+            saved = saved.copy()
+            origin = saved.attrs.get("origin", "")
+            saved.attrs.update({"source": (origin+"＋" if origin else "")+label,
+                                "data_mode": "保存値（最新日・価格検査済／外部取得省略）"})
+            return saved, 0, label+": 最新保存履歴を利用・外部取得省略"
     for provider, label in (("traders", "トレーダーズ・ウェブ無料日足"), ("yahoo", "Yahoo!ファイナンス日本版・時系列日足")):
         frame, count, message, data_mode = _history_provider(t, cutoff, provider, target_bars)
         audit.append(label + ": " + (message or "取得済"))
@@ -5683,7 +5721,7 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.51")
+st.title("📈 日本株 AI投資アシスタント Ver.17.24.52")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
 st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
@@ -5868,6 +5906,10 @@ if run_clicked:
             _daily_diagnostics = pd.DataFrame()
         st.session_state["v172419_daily_diagnostics"] = _daily_diagnostics
     _update_times["日足確認"] = round(time.perf_counter() - _stage_started, 2)
+    if not _daily_diagnostics.empty and "使用データ" in _daily_diagnostics:
+        _saved_count = int(_daily_diagnostics["使用データ"].fillna("").astype(str).str.contains("保存値|保存履歴を再利用").sum())
+        _pages_count = int(pd.to_numeric(_daily_diagnostics.get("取得ページ数", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        st.caption(f"日足：保存値利用 {_saved_count}/{len(_daily_diagnostics)}銘柄・取得ページ数 {_pages_count}・処理 {_update_times['日足確認']:.2f}秒")
     _stage_started = time.perf_counter()
     st.session_state["v177_data"] = data
     st.session_state["v177_daily_bar_status"] = build_daily_bar_status(data)

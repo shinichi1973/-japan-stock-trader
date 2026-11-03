@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-11-03T11:24:18.634198+09:00",
+  "fetched_at": "2026-11-04T01:19:14.975867+09:00",
   "scope": 300,
   "counts": {
     "daily_150": 0,
@@ -14,8 +14,8 @@
   "stage": "daily_300",
   "finance_processed": 300,
   "finance_errors": 0,
-  "daily_fresh_300": 7,
+  "daily_fresh_300": 0,
   "timed_out": true,
   "data_complete": false,
-  "packaged_at": 1793675051.8291264
+  "packaged_at": 1793725147.0616417
 }

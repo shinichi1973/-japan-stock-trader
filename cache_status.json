@@ -1,14 +1,14 @@
 {
-  "fetched_at": "2026-11-04T01:19:14.975867+09:00",
+  "fetched_at": "2026-11-04T09:39:22.753722+09:00",
   "scope": 300,
   "counts": {
     "daily_150": 0,
     "daily_300": 10,
-    "finance": 273
+    "finance": 271
   },
   "cache": {
-    "hit": 20,
-    "miss": 350
+    "hit": 46,
+    "miss": 315
   },
   "complete": false,
   "stage": "daily_300",
@@ -17,5 +17,5 @@
   "daily_fresh_300": 0,
   "timed_out": true,
   "data_complete": false,
-  "packaged_at": 1793725147.0616417
+  "packaged_at": 1793755153.4516926
 }

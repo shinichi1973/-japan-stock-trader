@@ -1,21 +1,21 @@
 {
-  "fetched_at": "2026-11-05T09:55:44.053974+09:00",
+  "fetched_at": "2026-11-06T01:30:37.643722+09:00",
   "scope": 300,
   "counts": {
     "daily_150": 0,
     "daily_300": 10,
-    "finance": 272
+    "finance": 277
   },
   "cache": {
-    "hit": 16,
-    "miss": 354
+    "hit": 10,
+    "miss": 360
   },
   "complete": false,
   "stage": "daily_300",
   "finance_processed": 300,
   "finance_errors": 0,
-  "daily_fresh_300": 8,
+  "daily_fresh_300": 7,
   "timed_out": true,
   "data_complete": false,
-  "packaged_at": 1793842534.941394
+  "packaged_at": 1793898628.1854382
 }

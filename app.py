@@ -40,13 +40,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.24.52",
+    page_title="日本株 AI投資アシスタント Ver.17.25.0",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.24.52 日足キャッシュ優先・最終判定一致検証"
-BUILD = "VER17-24-50-PRECOMPUTED-CACHE-20261031"
+VERSION = "17.25.0 シンプル画面・高配当10銘柄監視"
+BUILD = "VER17-25-0-SIMPLE-DIVIDEND-20261106"
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -5721,13 +5721,17 @@ st.markdown(
 )
 
 
-st.title("📈 日本株 AI投資アシスタント Ver.17.24.52")
+st.title("📈 日本株 AI投資アシスタント")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
-st.caption("売買条件は管理者設定の売買ロジックで選択。保有銘柄数・1銘柄購入額の固定上限なし。終値7%損切りを適用します。")
-st.caption("45銘柄外の保有銘柄も、DCまたは終値で−7%の売りを判定します。")
-st.caption("監視対象・購入予算・注文方式は設定欄で選択。株数上限解除・対象拡大の成績は比較検証で確認してください。")
-
-main_tab, single_tab, bottom_tab, video_tab, flow_tab, multibagger_tab, admin_tab = st.tabs(["今日の売買", "1銘柄・利益1万円研究", "底打ち・上昇転換研究", "動画式AI投資研究", "資金流入初期研究", "大化け候補", "管理者"])
+st.caption("今日の判断で通常売買を確認。監視リストで短期反発と高配当の買い待ち条件を確認します。")
+main_tab, monitor_tab, admin_tab = st.tabs(["今日の判断", "監視リスト", "設定・検証"])
+with monitor_tab:
+    dividend_tab, bottom_tab = st.tabs(["高配当10銘柄", "短期反発・底打ち"])
+with admin_tab:
+    show_legacy_research = st.checkbox("過去の研究機能を表示", value=False, key="simple_show_research")
+    if show_legacy_research:
+        single_tab, video_tab, flow_tab, multibagger_tab = st.tabs([
+            "1銘柄研究", "動画式研究", "資金流入研究", "大化け研究"])
 
 # ------------------------------------------------------------
 # 下部の入力値はウィジェットの再実行時に取得する。
@@ -5784,52 +5788,54 @@ for _key, _fixed in {
     "v1717_quality_mode": False,
 }.items():
     st.session_state[_key] = _fixed
-with st.expander("⚙ 購入額・注文方式", expanded=False):
-    live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン", "TOPIX＋日経225＋グロースからAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], index=0, key="v172440_universe")
-    signal_first = live_universe_mode == "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン"
-    live_trade_method = st.selectbox("売買ロジック", ["現行Stoch GC/DC", "55日高値更新＋MA200（試験採用）"], key="v17247_method")
-    replacement_live = live_trade_method == "55日高値更新＋MA200（試験採用）"
-    st.caption("試験採用：買い＝前日までの55日高値を終値で更新＋終値>MA200、売り＝前日までの20日安値を終値で割る、または取得単価から終値7%損切り。候補は63日騰落率順。Stochは売買・順位に使いません。")
-    if replacement_live:
-        st.warning("拡大344銘柄の過去比較では有望ですが、TOPIX全体と財務除外込みの成績は未検証です。保有銘柄の売り条件もこの方式へ切り替わります。")
-    block_unrated = True
-    st.caption("国内財務の判定不能は新規買いを見送ります。")
-    min_turnover = st.number_input("買い候補の20日平均売買代金下限（円・最低1億円）", 100000000, 10000000000, 100000000, 10000000, key="v172416_liquidity", disabled=not signal_first)
-    filter_downtrend = False  # 下降トレンドによる新規買い除外を解除
-    filter_churn = not replacement_live
-    st.caption("全監視対象で割高・赤字予想・財務未確認・日足未確定を新規買いから除外します。Stochでは短期クロス多発も除外します。下降トレンドは新規買い除外に使用しません。成績改善は未検証です。")
-    st.caption("値幅：ATR14/終値が3%以上＝大、1.5%以上＝中、それ未満＝小。大のみ新規対象。安値切上げ：直近3つの10営業日安値が順に上昇し、終値が25日平均より上。20日平均売買代金は最低1億円。国内財務の判定不能は除外。")
-    cap_mode = "上限なし（買付余力を候補へ均等配分）"
-    purchase_cap = None
-    lot_cap = None
-    st.caption("1銘柄の購入額・通常注文予算の固定上限は解除済みです。資産の3分の1による制限も適用しません。")
-    execution_mode = st.selectbox("実行する注文方式", ["自動（通常注文優先・不足はS株）", "S株のみ（1〜99株）", "100株単位（通常注文）"], key="v1724_order")
-    ifd_take_profit = st.slider("参考IFDOCOの利確率（%）", 3.0, 30.0, 15.0, 0.5, key="v1724_tp")
-    st.caption("保有数上限なし。買い候補TOP3の件数で余力を均等配分します。注文単位・価格余裕・値幅上限による注文拘束額を考慮するため、未使用の余力が残る場合があります。自動は余力内で100株買えれば通常注文、買えなければS株（最大99株）。参考IFDOCO表は代替案なので、買いカードと二重発注しないでください。")
-    st.caption("IFDOCOは参考案です。日中の逆指値と固定利確は、終値損切り・Stoch売りとは異なります。利確15%は検証結果ではなく初期値です。")
-with st.expander("⚙ 管理者設定", expanded=False):
-    a1, a2, a3, a4 = st.columns(4)
-    current_assets = a1.number_input("現在資産（円）", 10000, 200000000, 600000, 10000, key="v177_assets")
-    maxbuy = "上限なし（買付余力内）"
-    a2.metric("1銘柄の購入予算", "上限なし")
-    sl = a3.slider("損切りセンサー（%）", 3.0, 15.0, 7.0, .5, key="v177_sl", disabled=True)
-    maxpos = None
-    a4.metric("最大保有銘柄数", "上限なし")
-    b1, b2, b3, b4 = st.columns(4)
-    reserve_pct = b1.slider("現金温存率（%）", 0, 80, 0, 5, key="v177_reserve", disabled=True)
-    daily_deploy_pct = b2.slider("1日使用上限（%）", 10, 100, 100, 5, key="v177_daily", disabled=True)
-    risk_per_trade_pct = b3.slider("1銘柄許容損失（資産比%）", 0.25, 3.0, 1.0, 0.25, key="v177_risk", disabled=True)
-    price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
-    c1, c2 = st.columns(2)
-    universe_size = c1.number_input("日本株母集団（売買代金上位）", 100, 500, 300, 25, key="v172449_universe_n", disabled=live_universe_mode not in ("TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン", "対象拡大（売買代金上位）"))
-    fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225＋グロースからAI選定TOP50", "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン"))
-    st.caption(f"標準選定：TOPIX＋グロース（旧マザーズ相当の現行市場）→国内売買代金上位{int(universe_size)}→値動きが大きい＋買いサイン→流動性→安値切上げ→国内財務で割安／やや割安。構成一覧には基準日の差があります。")
-    st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
-    churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
-    st.caption("今回の主ロジックでは短期反転除外を使用しません。")
-    quality_mode = st.checkbox("トレンド＋振れ幅フィルターを実売買判定に使用（検証後に切替）",
-                               value=False, key="v1717_quality_mode", disabled=True)
-    st.caption("トレンド＋振れ幅フィルターは主ロジックでは使用しません。")
+with admin_tab:
+    with st.expander("⚙ 購入額・注文方式", expanded=False):
+        live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン", "TOPIX＋日経225＋グロースからAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], index=0, key="v172440_universe")
+        signal_first = live_universe_mode == "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン"
+        live_trade_method = st.selectbox("売買ロジック", ["現行Stoch GC/DC", "55日高値更新＋MA200（試験採用）"], key="v17247_method")
+        replacement_live = live_trade_method == "55日高値更新＋MA200（試験採用）"
+        st.caption("試験採用：買い＝前日までの55日高値を終値で更新＋終値>MA200、売り＝前日までの20日安値を終値で割る、または取得単価から終値7%損切り。候補は63日騰落率順。Stochは売買・順位に使いません。")
+        if replacement_live:
+            st.warning("拡大344銘柄の過去比較では有望ですが、TOPIX全体と財務除外込みの成績は未検証です。保有銘柄の売り条件もこの方式へ切り替わります。")
+        block_unrated = True
+        st.caption("国内財務の判定不能は新規買いを見送ります。")
+        min_turnover = st.number_input("買い候補の20日平均売買代金下限（円・最低1億円）", 100000000, 10000000000, 100000000, 10000000, key="v172416_liquidity", disabled=not signal_first)
+        filter_downtrend = False  # 下降トレンドによる新規買い除外を解除
+        filter_churn = not replacement_live
+        st.caption("全監視対象で割高・赤字予想・財務未確認・日足未確定を新規買いから除外します。Stochでは短期クロス多発も除外します。下降トレンドは新規買い除外に使用しません。成績改善は未検証です。")
+        st.caption("値幅：ATR14/終値が3%以上＝大、1.5%以上＝中、それ未満＝小。大のみ新規対象。安値切上げ：直近3つの10営業日安値が順に上昇し、終値が25日平均より上。20日平均売買代金は最低1億円。国内財務の判定不能は除外。")
+        cap_mode = "上限なし（買付余力を候補へ均等配分）"
+        purchase_cap = None
+        lot_cap = None
+        st.caption("1銘柄の購入額・通常注文予算の固定上限は解除済みです。資産の3分の1による制限も適用しません。")
+        execution_mode = st.selectbox("実行する注文方式", ["自動（通常注文優先・不足はS株）", "S株のみ（1〜99株）", "100株単位（通常注文）"], key="v1724_order")
+        ifd_take_profit = st.slider("参考IFDOCOの利確率（%）", 3.0, 30.0, 15.0, 0.5, key="v1724_tp")
+        st.caption("保有数上限なし。買い候補TOP3の件数で余力を均等配分します。注文単位・価格余裕・値幅上限による注文拘束額を考慮するため、未使用の余力が残る場合があります。自動は余力内で100株買えれば通常注文、買えなければS株（最大99株）。参考IFDOCO表は代替案なので、買いカードと二重発注しないでください。")
+        st.caption("IFDOCOは参考案です。日中の逆指値と固定利確は、終値損切り・Stoch売りとは異なります。利確15%は検証結果ではなく初期値です。")
+with admin_tab:
+    with st.expander("⚙ 管理者設定", expanded=False):
+        a1, a2, a3, a4 = st.columns(4)
+        current_assets = a1.number_input("現在資産（円）", 10000, 200000000, 600000, 10000, key="v177_assets")
+        maxbuy = "上限なし（買付余力内）"
+        a2.metric("1銘柄の購入予算", "上限なし")
+        sl = a3.slider("損切りセンサー（%）", 3.0, 15.0, 7.0, .5, key="v177_sl", disabled=True)
+        maxpos = None
+        a4.metric("最大保有銘柄数", "上限なし")
+        b1, b2, b3, b4 = st.columns(4)
+        reserve_pct = b1.slider("現金温存率（%）", 0, 80, 0, 5, key="v177_reserve", disabled=True)
+        daily_deploy_pct = b2.slider("1日使用上限（%）", 10, 100, 100, 5, key="v177_daily", disabled=True)
+        risk_per_trade_pct = b3.slider("1銘柄許容損失（資産比%）", 0.25, 3.0, 1.0, 0.25, key="v177_risk", disabled=True)
+        price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
+        c1, c2 = st.columns(2)
+        universe_size = c1.number_input("日本株母集団（売買代金上位）", 100, 500, 300, 25, key="v172449_universe_n", disabled=live_universe_mode not in ("TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン", "対象拡大（売買代金上位）"))
+        fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225＋グロースからAI選定TOP50", "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン"))
+        st.caption(f"標準選定：TOPIX＋グロース（旧マザーズ相当の現行市場）→国内売買代金上位{int(universe_size)}→値動きが大きい＋買いサイン→流動性→安値切上げ→国内財務で割安／やや割安。構成一覧には基準日の差があります。")
+        st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
+        churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
+        st.caption("今回の主ロジックでは短期反転除外を使用しません。")
+        quality_mode = st.checkbox("トレンド＋振れ幅フィルターを実売買判定に使用（検証後に切替）",
+                                   value=False, key="v1717_quality_mode", disabled=True)
+        st.caption("トレンド＋振れ幅フィルターは主ロジックでは使用しません。")
 
 # 既存のStreamlitセッションに過去の設定が残っていても検証済み条件を固定する。
 sl, churn_filter, quality_mode = 7.0, False, False
@@ -7773,7 +7779,8 @@ def render_bottom_research(valuations, holdings=None, verified=False):
 # 短期売買と管理者タブ
 # ------------------------------------------------------------
 with main_tab:
-    st.subheader("🟢 今日の買い候補 TOP3")
+    st.subheader("通常売買の買い候補")
+    st.caption("既存の売買条件・均等配分・終値7%損切りを使用。高配当監視・底打ち研究は通常注文へ自動追加しません。")
     if buy_view.empty:
         st.info("監視対象に、現在の買い条件を満たす銘柄はありません。")
     else:
@@ -7790,20 +7797,21 @@ with main_tab:
                 show_stock_table(ifd_table, use_container_width=True, hide_index=True)
                 st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
     st.caption(f"新規買い：{live_universe_mode}の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定：{'割高・判定不能を除外' if signal_first and block_unrated else '割高を除外・判定不能は許可' if signal_first else '参考表示'}")
-    st.subheader("買い候補から外れた銘柄・理由")
-    _snapshot = buy_view.to_dict('records') if not buy_view.empty else []
-    _signature = (st.session_state.get('v177_generated_at', ''), tuple(str(r['コード']) for r in _snapshot))
-    if st.session_state.get('v172437_buy_signature') != _signature:
-        st.session_state['v172437_previous_buys'] = st.session_state.get('v172437_last_buys', [])
-        st.session_state['v172437_last_buys'] = _snapshot
-        st.session_state['v172437_buy_signature'] = _signature
-    excluded_buy_df = build_buy_exclusions(signal_audit_df, buy_view, held_codes,
-                                           st.session_state.get('v172437_previous_buys', []))
-    if excluded_buy_df.empty:
-        st.info("今回の買いサインから見送った銘柄はありません。")
-    else:
-        show_reference_choice_table(excluded_buy_df, context=signal_audit_df, use_container_width=True, hide_index=True)
-    st.caption("今回の買いサインの見送り、およびこの起動中に直前の買い候補から外れた銘柄です。再起動前の候補履歴は含みません。")
+    with st.expander("買い待ち・見送り理由", expanded=False):
+        st.subheader("買い候補から外れた銘柄・理由")
+        _snapshot = buy_view.to_dict('records') if not buy_view.empty else []
+        _signature = (st.session_state.get('v177_generated_at', ''), tuple(str(r['コード']) for r in _snapshot))
+        if st.session_state.get('v172437_buy_signature') != _signature:
+            st.session_state['v172437_previous_buys'] = st.session_state.get('v172437_last_buys', [])
+            st.session_state['v172437_last_buys'] = _snapshot
+            st.session_state['v172437_buy_signature'] = _signature
+        excluded_buy_df = build_buy_exclusions(signal_audit_df, buy_view, held_codes,
+                                               st.session_state.get('v172437_previous_buys', []))
+        if excluded_buy_df.empty:
+            st.info("今回の買いサインから見送った銘柄はありません。")
+        else:
+            show_reference_choice_table(excluded_buy_df, context=signal_audit_df, use_container_width=True, hide_index=True)
+        st.caption("今回の買いサインの見送り、およびこの起動中に直前の買い候補から外れた銘柄です。再起動前の候補履歴は含みません。")
     st.subheader("🔻 売り")
     if sell_view.empty:
         st.success("売り候補はありません。")
@@ -7815,6 +7823,7 @@ with main_tab:
     render_current_holdings(current_holdings_rows(
         short_confirmed, sell_view, signal_audit_rows, valuation_master_df, data
     ))
+with admin_tab:
     st.subheader("参考株数の計算（候補確認後に入力）")
     st.caption("余力を候補数で均等に分けて参考株数を計算します。入力確定後に自動再計算します。CSVは保有照合に使用します。")
     st.subheader("約定履歴CSV")
@@ -7830,18 +7839,23 @@ with main_tab:
         st.info("余力を入力すると参考株数を計算します。未入力は買い条件の不成立を意味しません。")
     if order_inputs_ready and not holdings_verified:
         st.warning("参考株数は保有照合前の暫定値です。CSV未入力・読込エラー・履歴不足の場合、保有株を新規候補から除外できない場合があります。注文前に確認してください。")
+
+with main_tab:
     loaded_codes = {code(t) for t in data}
     if set(held_codes) - loaded_codes:
         st.warning("追加取得後も保有銘柄の日足を確認できません。該当銘柄の売り判定は未確認です。『今日の判定を更新』で再確認してください。")
 
-    news_pick_result, news_pick_exclusions, news_pick_signature = render_triple_news_pick(
-        indicator_compare_df, daily_bar_status_df, data, held_codes,
-        [value_top50_df, signal_value_df], buy_view, signal_audit_df,
-        short_buying_power, bool(block_unrated), run_clicked,
-    )
-    with st.expander("🌱 大化け候補 TOP3（研究）", expanded=False):
-        st.caption("数年の成長を調べる候補です。購入株数・売買指示には反映しません。")
-        render_multibagger_cards(multibagger_candidates)
+    news_pick_result, news_pick_exclusions, news_pick_signature = None, pd.DataFrame(), None
+    if show_legacy_research:
+        with admin_tab:
+            news_pick_result, news_pick_exclusions, news_pick_signature = render_triple_news_pick(
+                indicator_compare_df, daily_bar_status_df, data, held_codes,
+                [value_top50_df, signal_value_df], buy_view, signal_audit_df,
+                short_buying_power, bool(block_unrated), run_clicked,
+            )
+            with st.expander("🌱 大化け候補 TOP3（研究）", expanded=False):
+                st.caption("数年の成長を調べる候補です。購入株数・売買指示には反映しません。")
+                render_multibagger_cards(multibagger_candidates)
     m1, m2 = st.columns(2)
     m1.metric("保有", f"{len(held_codes)}銘柄")
     m2.metric("買付余力", "未入力" if buying_power_input is None else f"¥{int(short_buying_power):,}")
@@ -7947,8 +7961,9 @@ def render_single_profit_research(price_data, live_audit):
                        "single_profit_research.csv", "text/csv", key="single_profit_csv")
 
 
-with single_tab:
-    render_single_profit_research(data, signal_audit_df)
+if show_legacy_research:
+    with single_tab:
+        render_single_profit_research(data, signal_audit_df)
 
 with bottom_tab:
     render_bottom_research(valuation_master_df, short_confirmed, holdings_verified)
@@ -8406,75 +8421,78 @@ def render_flow_research():
     st.caption('直近5日安値は研究の否定目安です。利確・IFDOCOは本機能では作成しません。値幅・支持抵抗と公式情報を再確認し、既存の売買ルールを優先してください。')
 
 
-with flow_tab:
-    render_flow_research()
+if show_legacy_research:
+    with flow_tab:
+        render_flow_research()
 
 
-with video_tab:
-    render_video_research()
+if show_legacy_research:
+    with video_tab:
+        render_video_research()
 
 
-with multibagger_tab:
-    st.subheader("🌱 大化け候補（研究）")
-    st.caption("数年で大きく成長する企業を探す入口です。研究点は上昇確率・予想倍率ではありません。成績未検証の独立条件です。")
-    st.info("注文判断は『今日の売買』で確認してください。候補入りだけでは買い指示になりません。既存の利確・終値7%損切りは引き続き適用します。")
-    st.write(f"調査対象 {len(multibagger_audit)}銘柄 ／ 大化け候補 {len(multibagger_candidates)}銘柄")
-    if not multibagger_audit.empty:
-        complete_count = int(multibagger_audit[["売上成長率%", "利益成長率%"]].notna().all(axis=1).sum())
-        st.caption(f"成長率2項目の取得 {complete_count}/{len(multibagger_audit)}銘柄。未取得は低成長と区別して保留します。")
-    if multibagger_sources_paused():
-        st.warning("業績取得先がアクセス制限中です。追加通信を停止しています。時間を空けて追加確認してください。未試行分は次回へ残します。")
-    st.caption("主要条件を満たし、FCF・D/E・営業利益率に欠損がある場合は暫定候補として表示します。企業価値・主要データ未確認は評価保留、取得済みの健全性指標が除外条件に該当すれば条件外です。")
-    render_multibagger_choice(multibagger_candidates)
-    render_multibagger_cards(multibagger_candidates)
-    st.caption("取得済み財務に成長率がない場合は、下のボタンでトレーダーズ・株探の無料公開業績表を追加確認できます。監視対象の一部を順番に確認します。")
-    st.caption("通常の売買更新では研究用の追加通信を行いません。下の追加確認ボタンで取得し、結果を保存・復元します。サーバー再構築で保存が消えた場合は追加取得結果CSVを読み込めます。過去の取得日は書き換えず、鮮度条件を満たさないデータは保留します。")
-    save_status = st.session_state.get("v172427_growth_save", "")
-    if str(save_status).startswith("保存失敗"):
-        st.warning("成長実績を保存できませんでした。追加取得結果CSVをダウンロードしてください。" + save_status)
-    imported_growth = st.file_uploader("成長実績の追加取得結果CSVを復元", type=["csv"], key="v172427_growth_import")
-    if imported_growth is not None and st.button("CSVの成長実績を読み込む", key="v172427_growth_import_apply"):
-        try:
-            imported = pd.read_csv(imported_growth, encoding="utf-8-sig", dtype={"コード": str})
-            required = {"コード", "売上成長率%", "利益成長率%", "実績EPS", "成長比較期", "成長比較前期", "財務取得日時", "財務参照URL"}
-            if not required.issubset(imported.columns): raise ValueError("追加取得結果CSVの必要列が不足しています")
-            imported = imported[imported["コード"].isin(mb_scope)]
-            # 現在セッションの結果を優先し、CSVで欠けている銘柄だけを復元する。
-            restored = pd.concat([imported, mb_extra], ignore_index=True).drop_duplicates("コード", keep="last")
-            st.session_state["v172423_growth_extra"] = restored
-            st.session_state["v172427_growth_save"] = save_multibagger_growth(restored)
-        except (ValueError, TypeError, pd.errors.ParserError) as exc:
-            st.error("CSVを読み込めませんでした: " + str(exc))
-        else:
+if show_legacy_research:
+    with multibagger_tab:
+        st.subheader("🌱 大化け候補（研究）")
+        st.caption("数年で大きく成長する企業を探す入口です。研究点は上昇確率・予想倍率ではありません。成績未検証の独立条件です。")
+        st.info("注文判断は『今日の売買』で確認してください。候補入りだけでは買い指示になりません。既存の利確・終値7%損切りは引き続き適用します。")
+        st.write(f"調査対象 {len(multibagger_audit)}銘柄 ／ 大化け候補 {len(multibagger_candidates)}銘柄")
+        if not multibagger_audit.empty:
+            complete_count = int(multibagger_audit[["売上成長率%", "利益成長率%"]].notna().all(axis=1).sum())
+            st.caption(f"成長率2項目の取得 {complete_count}/{len(multibagger_audit)}銘柄。未取得は低成長と区別して保留します。")
+        if multibagger_sources_paused():
+            st.warning("業績取得先がアクセス制限中です。追加通信を停止しています。時間を空けて追加確認してください。未試行分は次回へ残します。")
+        st.caption("主要条件を満たし、FCF・D/E・営業利益率に欠損がある場合は暫定候補として表示します。企業価値・主要データ未確認は評価保留、取得済みの健全性指標が除外条件に該当すれば条件外です。")
+        render_multibagger_choice(multibagger_candidates)
+        render_multibagger_cards(multibagger_candidates)
+        st.caption("取得済み財務に成長率がない場合は、下のボタンでトレーダーズ・株探の無料公開業績表を追加確認できます。監視対象の一部を順番に確認します。")
+        st.caption("通常の売買更新では研究用の追加通信を行いません。下の追加確認ボタンで取得し、結果を保存・復元します。サーバー再構築で保存が消えた場合は追加取得結果CSVを読み込めます。過去の取得日は書き換えず、鮮度条件を満たさないデータは保留します。")
+        save_status = st.session_state.get("v172427_growth_save", "")
+        if str(save_status).startswith("保存失敗"):
+            st.warning("成長実績を保存できませんでした。追加取得結果CSVをダウンロードしてください。" + save_status)
+        imported_growth = st.file_uploader("成長実績の追加取得結果CSVを復元", type=["csv"], key="v172427_growth_import")
+        if imported_growth is not None and st.button("CSVの成長実績を読み込む", key="v172427_growth_import_apply"):
+            try:
+                imported = pd.read_csv(imported_growth, encoding="utf-8-sig", dtype={"コード": str})
+                required = {"コード", "売上成長率%", "利益成長率%", "実績EPS", "成長比較期", "成長比較前期", "財務取得日時", "財務参照URL"}
+                if not required.issubset(imported.columns): raise ValueError("追加取得結果CSVの必要列が不足しています")
+                imported = imported[imported["コード"].isin(mb_scope)]
+                # 現在セッションの結果を優先し、CSVで欠けている銘柄だけを復元する。
+                restored = pd.concat([imported, mb_extra], ignore_index=True).drop_duplicates("コード", keep="last")
+                st.session_state["v172423_growth_extra"] = restored
+                st.session_state["v172427_growth_save"] = save_multibagger_growth(restored)
+            except (ValueError, TypeError, pd.errors.ParserError) as exc:
+                st.error("CSVを読み込めませんでした: " + str(exc))
+            else:
+                st.rerun()
+        growth_limit = st.number_input("1回に成長実績を追加確認する件数", 5, 20, 10, 5, key="v172423_growth_limit")
+        if st.button("成長実績を追加確認", key="v172423_growth_fetch", disabled=not mb_scope):
+            targets = multibagger_fetch_targets(mb_scope, mb_extra, growth_limit, tokyo_now().date())
+            if not targets:
+                st.info("追加確認の対象がないか、再試行の待機中です。失敗分は15分以上空けて再確認してください。")
+            else:
+                with st.spinner("国内無料公開の連続する年度実績を確認中…"):
+                    combined_growth = collect_multibagger_growth(mb_finance, mb_extra, mb_scope, growth_limit, tokyo_now().date())
+                combined_growth = restore_multibagger_optional(combined_growth, finance_acquisition_df, tokyo_now().date())
+                st.session_state["v172423_growth_extra"] = combined_growth
+                st.session_state["v172427_growth_save"] = save_multibagger_growth(combined_growth)
+                st.rerun()
+        if st.button("成長実績の追加確認をリセット", key="v172423_growth_reset"):
+            st.session_state["v172423_growth_extra"] = pd.DataFrame()
+            st.session_state["v172427_growth_save"] = save_multibagger_growth(pd.DataFrame())
             st.rerun()
-    growth_limit = st.number_input("1回に成長実績を追加確認する件数", 5, 20, 10, 5, key="v172423_growth_limit")
-    if st.button("成長実績を追加確認", key="v172423_growth_fetch", disabled=not mb_scope):
-        targets = multibagger_fetch_targets(mb_scope, mb_extra, growth_limit, tokyo_now().date())
-        if not targets:
-            st.info("追加確認の対象がないか、再試行の待機中です。失敗分は15分以上空けて再確認してください。")
-        else:
-            with st.spinner("国内無料公開の連続する年度実績を確認中…"):
-                combined_growth = collect_multibagger_growth(mb_finance, mb_extra, mb_scope, growth_limit, tokyo_now().date())
-            combined_growth = restore_multibagger_optional(combined_growth, finance_acquisition_df, tokyo_now().date())
-            st.session_state["v172423_growth_extra"] = combined_growth
-            st.session_state["v172427_growth_save"] = save_multibagger_growth(combined_growth)
-            st.rerun()
-    if st.button("成長実績の追加確認をリセット", key="v172423_growth_reset"):
-        st.session_state["v172423_growth_extra"] = pd.DataFrame()
-        st.session_state["v172427_growth_save"] = save_multibagger_growth(pd.DataFrame())
-        st.rerun()
-    if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
-        st.download_button("成長実績の追加取得結果CSV", mb_extra.to_csv(index=False).encode("utf-8-sig"), "multibagger_growth_fetch.csv", "text/csv", key="v172425_growth_csv")
-    if not multibagger_audit.empty:
-        with st.expander("全件の判定・評価保留・条件外理由", expanded=False):
-            show_stock_table(multibagger_audit, use_container_width=True, hide_index=True)
-        st.download_button("大化け候補の全件CSV", multibagger_audit.to_csv(index=False).encode("utf-8-sig"), "multibagger_research_audit.csv", "text/csv", key="v172423_mb_csv")
-    if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
-        with st.expander("成長実績の追加取得結果", expanded=False):
-            show_stock_table(mb_extra[[c for c in ("コード", "銘柄名", "成長追加確認", "成長取得経路", "財務参照URL", "財務取得日時") if c in mb_extra]], use_container_width=True, hide_index=True)
-    with st.expander("選定条件と確認すべき点", expanded=False):
-        show_stock_table(MULTIBAGGER_RULES, use_container_width=True, hide_index=True)
-        st.write("決算説明資料で、売上・利益が伸びた理由、翌期も続く根拠、顧客集中、増資予定を確認してください。減収・減益や資金繰り悪化は成長シナリオの再確認が必要です。")
+        if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
+            st.download_button("成長実績の追加取得結果CSV", mb_extra.to_csv(index=False).encode("utf-8-sig"), "multibagger_growth_fetch.csv", "text/csv", key="v172425_growth_csv")
+        if not multibagger_audit.empty:
+            with st.expander("全件の判定・評価保留・条件外理由", expanded=False):
+                show_stock_table(multibagger_audit, use_container_width=True, hide_index=True)
+            st.download_button("大化け候補の全件CSV", multibagger_audit.to_csv(index=False).encode("utf-8-sig"), "multibagger_research_audit.csv", "text/csv", key="v172423_mb_csv")
+        if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
+            with st.expander("成長実績の追加取得結果", expanded=False):
+                show_stock_table(mb_extra[[c for c in ("コード", "銘柄名", "成長追加確認", "成長取得経路", "財務参照URL", "財務取得日時") if c in mb_extra]], use_container_width=True, hide_index=True)
+        with st.expander("選定条件と確認すべき点", expanded=False):
+            show_stock_table(MULTIBAGGER_RULES, use_container_width=True, hide_index=True)
+            st.write("決算説明資料で、売上・利益が伸びた理由、翌期も続く根拠、顧客集中、増資予定を確認してください。減収・減益や資金繰り悪化は成長シナリオの再確認が必要です。")
 
 def run_final_decision_parity(live):
     """Replay the production decision block offline in private namespaces/cache dirs.
@@ -9082,3 +9100,152 @@ except Exception as e:
     st.warning(f"ZIP作成エラー: {e}")
 
 st.caption("売買判断補助です。自動発注は行いません。")
+
+# 高配当監視は通常売買の候補・配分・保有の売り判定を変更しない。
+DIVIDEND_WATCH = (
+    ('2914', 'JT'), ('8593', '三菱HCキャピタル'), ('9432', 'NTT'),
+    ('3003', 'ヒューリック'), ('1928', '積水ハウス'), ('9433', 'KDDI'),
+    ('8766', '東京海上'), ('8316', '三井住友FG'),
+    ('8750', '第一ライフグループ'), ('8591', 'オリックス'),
+)
+
+
+def build_dividend_watch(prices, evidence, target, today, buying_power, holdings,
+                         drawdown_limit=15.0, yield_min=3.5, payout_max=85.0):
+    """公式IRを確認した入力値と確定日足を照合。欠損・古い値は必ず保留。"""
+    from urllib.parse import urlparse
+    today = pd.Timestamp(today).normalize()
+    target = pd.to_datetime(target, errors='coerce')
+    target = target.normalize() if pd.notna(target) else pd.NaT
+    evs = {}
+    if isinstance(evidence, pd.DataFrame) and 'コード' in evidence:
+        for row in evidence.to_dict('records'):
+            c = str(row.get('コード', '')).strip().removesuffix('.0')
+            if c in evs:
+                raise ValueError('IR確認CSVに重複コードがあります：' + c)
+            evs[c] = row
+    rows = []
+    for rank, (c, label) in enumerate(DIVIDEND_WATCH, 1):
+        ev = evs.get(c, {})
+        reasons = []
+        x = video_price_frame(prices.get(c + '.T', pd.DataFrame()))
+        if pd.notna(target):
+            x = x.loc[:target]
+        close = safe_float(x.Close.iloc[-1]) if not x.empty else np.nan
+        fresh = bool(pd.notna(target) and not x.empty and x.index[-1].normalize() == target)
+        if not fresh: reasons.append('最新確定日足未確認')
+        if len(x) < 252: reasons.append('252営業日の日足不足')
+        # OHLC is on the same split-adjusted basis as the existing history pipeline.
+        discontinuity = bool(not x.empty and (x.Close.pct_change().tail(252).abs() > .4).any())
+        if discontinuity: reasons.append('価格断絶・分割等の確認待ち')
+        high = safe_float(x.High.tail(252).max()) if len(x) >= 252 else np.nan
+        dd = (close / high - 1) * 100 if high > 0 else np.nan
+        low_stop = bool(len(x) >= 21 and x.Low.tail(3).min() > x.Low.iloc[-21:-3].min())
+        rising = bool(len(x) >= 6 and x.Low.tail(3).min() > x.Low.iloc[-6:-3].min())
+        breakout = bool(len(x) >= 6 and close > x.High.iloc[-6:-1].max())
+        volbase = safe_float(x.Volume.iloc[-21:-1].mean()) if len(x) >= 21 else np.nan
+        volume_ratio = safe_float(x.Volume.iloc[-1]) / volbase if volbase > 0 else np.nan
+        rebound = low_stop and rising and breakout and volume_ratio >= 1.2
+        day = pd.to_datetime(ev.get('確認日', ''), errors='coerce')
+        age = (today - pd.Timestamp(day.date())).days if pd.notna(day) else -1
+        url = urlparse(str(ev.get('根拠URL', '')).strip())
+        evidence_ok = (0 <= age <= 7 and url.scheme == 'https' and bool(url.netloc)
+                       and str(ev.get('配当・EPSの株式数基準', '')) == '現在株式数で確認済'
+                       and str(ev.get('業績・配当確認', '')) == '維持可能確認済'
+                       and bool(str(ev.get('予想対象期', '')).strip()))
+        if not evidence_ok: reasons.append('7日以内の公式IR・配当維持・株式数基準の確認待ち')
+        dividend = safe_float(ev.get('年間予想配当円'))
+        eps = safe_float(ev.get('予想EPS円'))
+        dy = dividend / close * 100 if dividend >= 0 and close > 0 else np.nan
+        payout = dividend / eps * 100 if dividend >= 0 and eps > 0 else np.nan
+        if not np.isfinite(payout) or payout > payout_max:
+            reasons.append('赤字予想・配当性向超過または未確認')
+        if not np.isfinite(dy) or dy < yield_min:
+            reasons.append('予想利回り条件未達または未確認')
+        if not np.isfinite(dd) or dd > -drawdown_limit:
+            reasons.append('高値からの下落率条件未達')
+        if not rebound: reasons.append('下げ止まり・高値突破・出来高の確認待ち')
+        amount = close * 100 if close > 0 else np.nan
+        # 5% margin is a budget estimate, not SBI's actual order reservation amount.
+        affordable = bool(buying_power is not None and buying_power > 0 and amount * 1.05 <= buying_power)
+        if not affordable: reasons.append('余力未入力または100株予算不足（5%余裕込み）')
+        held = str(c) in {str(k) for k in holdings}
+        if held: reasons.append('保有中・買い増し対象外')
+        verdict = '保有中' if held else '買い検討' if not reasons else '確認待ち' if not fresh or not evidence_ok else '買い待ち'
+        rows.append({'判定': verdict, '動画順位': rank, 'コード': c, '銘柄名': label,
+                     '終値': close, '100株概算円': amount, '予想利回り%': dy,
+                     '配当性向%': payout, '252日高値から%': dd,
+                     '安値更新停止': low_stop, '安値切上げ': rising, '5日高値突破': breakout,
+                     '出来高倍率': volume_ratio, '日足日': str(x.index[-1].date()) if not x.empty else '',
+                     'IR確認日': str(ev.get('確認日', '')), '確認・買い待ち理由': '／'.join(reasons) or '全条件通過・注文前に決算と実余力を再確認'})
+    return pd.DataFrame(rows)
+
+
+with dividend_tab:
+    st.subheader('暴落時・高配当10銘柄の監視')
+    st.caption('動画順位は固定。判定は配当・業績確認と確定日足で行います。通常の買い候補・均等配分には追加しません。')
+    with st.expander('監視条件・配当情報の入力', expanded=False):
+        div_draw = st.number_input('高値からの下落率（%）以上', 5.0, 60.0, 15.0, 1.0, key='div_draw')
+        div_yield = st.number_input('予想配当利回り（%）以上', 0.0, 15.0, 3.5, .1, key='div_yield')
+        div_payout = st.number_input('配当性向（%）以下', 10.0, 150.0, 85.0, 5.0, key='div_payout')
+        st.caption('数値は検証前の初期条件。下げ止まり＝直近3日がそれ以前18日の安値を上回る＋3日安値切上げ＋過去5日高値を終値で突破＋出来高が過去20日平均の1.2倍以上。')
+        template = pd.DataFrame([{'コード': c, '確認日': '', '予想対象期': '',
+            '年間予想配当円': '', '予想EPS円': '', '配当・EPSの株式数基準': '未確認',
+            '業績・配当確認': '未確認', '根拠URL': ''} for c, _ in DIVIDEND_WATCH])
+        st.download_button('配当・IR確認CSVひな形', template.to_csv(index=False).encode('utf-8-sig'),
+                           'dividend_ir_template.csv', key='div_template')
+        st.caption('公式IRで最新予想・減配・下方修正・配当の持続性を確認して入力。配当とEPSは同じ予想期・現在の株式数基準にそろえ、確認日と公式IRのHTTPS URLを記録します。URL内容の自動確認は行いません。')
+        st.code('配当・EPSの株式数基準：現在株式数で確認済\n業績・配当確認：維持可能確認済\n確認日：YYYY-MM-DD')
+        div_upload = st.file_uploader('配当・IR確認CSV', type=['csv'], key='div_evidence')
+    div_evidence = pd.DataFrame()
+    if div_upload is not None:
+        try:
+            div_evidence = pd.read_csv(div_upload, dtype={'コード': str}).fillna('')
+            if not set(template.columns).issubset(div_evidence.columns):
+                raise ValueError('ひな形の列が不足しています')
+        except Exception as exc:
+            st.warning('配当情報を採用できません：' + str(exc))
+            div_evidence = pd.DataFrame()
+    div_refresh = st.button('高配当10銘柄の日足を更新', key='div_refresh')
+    if run_clicked or div_refresh:
+        st.session_state.pop('div_snapshot', None)
+        try:
+            with st.spinner('高配当10銘柄の確定日足を確認中…'):
+                session = latest_tse_session_status()
+                if not session.get('confirmed') or pd.isna(session.get('session_date')):
+                    raise ValueError('直近取引日の確定を確認できません')
+                target = str(pd.Timestamp(session['session_date']).date())
+                frames, _ = batch_domestic_stock_data(tuple(c + '.T' for c, _ in DIVIDEND_WATCH),
+                    (str(tokyo_now().date()), tokyo_now().hour >= 16), 300)
+                statuses = build_daily_bar_status(frames)
+                confirmed_codes = set(statuses.loc[statuses['状態'].eq('🟢 当日確定'), 'コード'].astype(str)) if not statuses.empty else set()
+                frames = {t: f for t, f in frames.items() if str(code(t)) in confirmed_codes}
+                st.session_state['div_snapshot'] = {'prices': frames, 'target': target,
+                    'phase': (str(tokyo_now().date()), tokyo_now().hour >= 16)}
+        except Exception as exc:
+            st.warning('高配当日足の更新を保留しました：' + str(exc))
+    snap = st.session_state.get('div_snapshot', {})
+    phase_ok = snap.get('phase') == (str(tokyo_now().date()), tokyo_now().hour >= 16)
+    if not phase_ok:
+        st.info('高配当日足を更新してください。古い保存結果から買い検討は出しません。')
+    try:
+        dividend_watch_df = build_dividend_watch(snap.get('prices', {}), div_evidence,
+            snap.get('target') if phase_ok else None, tokyo_now().date(),
+            buying_power_input, short_confirmed, div_draw, div_yield, div_payout)
+    except ValueError as exc:
+        st.warning(str(exc))
+        dividend_watch_df = build_dividend_watch({}, pd.DataFrame(), None, tokyo_now().date(), None, {})
+    st.dataframe(dividend_watch_df, hide_index=True, use_container_width=True)
+    st.download_button('高配当監視CSV', dividend_watch_df.to_csv(index=False).encode('utf-8-sig'),
+                       'dividend_watch.csv', key='div_watch_csv')
+    st.caption('100株予算には5%の余裕を計上。実際の注文拘束額はSBIで確認。高配当枠の売り条件・成績は未検証のため、本版では監視と買い検討までとします。既存保有の売り条件は現在の通常売買設定を使います。')
+
+with main_tab:
+    st.subheader('高配当・暴落時の買い待ち')
+    div_candidates = dividend_watch_df[dividend_watch_df['判定'].eq('買い検討')]
+    if div_candidates.empty:
+        st.info('高配当枠：買い検討条件を満たす銘柄はありません。監視リストで不足条件を確認できます。')
+    else:
+        st.dataframe(div_candidates[['コード', '銘柄名', '終値', '100株概算円', '予想利回り%']],
+                     hide_index=True, use_container_width=True)
+        st.caption('通常売買とは別の監視候補です。注文・利確・撤退条件を確認してから判断してください。')

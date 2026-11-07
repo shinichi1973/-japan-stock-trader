@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.6",
+    page_title="日本株 AI投資アシスタント Ver.17.25.7",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.6 TOP50・SBI自動評価"
-BUILD = "VER17-25-6-TOP50-SBI-AUTO-20261108"
+VERSION = "17.25.7 TOP50・SBI自動評価"
+BUILD = "VER17-25-7-TOP50-SBI-AUTO-20261108"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -3784,7 +3784,7 @@ def _history_overlap_compatible(cached, current):
 
 
 def _daily_cache_path(t, provider):
-    if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)) or provider not in ("traders", "yahoo", "sbi"): raise ValueError("国内日足コード形式不正")
+    if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)) or provider not in ("traders", "yahoo", "sbi", "bottom"): raise ValueError("国内日足コード形式不正")
     root = os.environ.get("DAILY_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "jp_stock_daily_cache_v21")
     return os.path.join(root, t + "-" + provider + ".json")
 
@@ -7392,10 +7392,20 @@ def build_buy_exclusions(audit, purchases, holdings, previous=None):
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def download_bottom_research(tickers_tuple, target_day, retry_tag=0):
-    """Explicit research request only; raw prices for turnover, adjusted for patterns."""
-    result = {}
-    for offset in range(0, len(tickers_tuple), 60):
-        chunk = list(tickers_tuple[offset:offset + 60])
+    """研究用の調整済み日足を基準日が一致する銘柄ごとに再利用する。"""
+    target = pd.Timestamp(target_day)
+    result, missing = {}, []
+    for t in tickers_tuple:
+        saved = _daily_cache_read(t, "bottom")
+        if (_usable_daily_cache(saved, target, 60, minimum_bars=60)
+                and {"RawClose", "Turnover"}.issubset(saved.columns)):
+            metrics = saved[["RawClose", "Turnover"]].apply(pd.to_numeric, errors="coerce")
+            if np.isfinite(metrics.to_numpy()).all() and metrics.RawClose.gt(0).all() and metrics.Turnover.ge(0).all():
+                result[t] = saved
+                continue
+        missing.append(t)
+    for offset in range(0, len(missing), 60):
+        chunk = missing[offset:offset + 60]
         try:
             raw = yf.download(tickers=chunk, period='6mo', interval='1d', auto_adjust=False,
                               actions=False, progress=False, threads=8, group_by='ticker', timeout=25)
@@ -7407,7 +7417,7 @@ def download_bottom_research(tickers_tuple, target_day, retry_tag=0):
             try:
                 one = raw[t] if isinstance(raw.columns, pd.MultiIndex) and t in raw.columns.get_level_values(0) else raw.xs(t, axis=1, level=1) if isinstance(raw.columns, pd.MultiIndex) else raw if len(chunk) == 1 else pd.DataFrame()
                 x = _normalize_ohlcv(one)
-                x = x.loc[x.index <= pd.Timestamp(target_day)].copy()
+                x = x.loc[x.index <= target].copy()
                 if x.empty:
                     continue
                 x['Turnover'] = x['Close'] * x['Volume']
@@ -7423,6 +7433,8 @@ def download_bottom_research(tickers_tuple, target_day, retry_tag=0):
                 for col in ['Open', 'High', 'Low', 'Close']:
                     x[col] = x[col] * ratio
                 result[t] = x
+                if _usable_daily_cache(x, target, 60, minimum_bars=60):
+                    _daily_cache_write(t, "bottom", x.rename_axis("Date"))
             except (KeyError, ValueError, TypeError, IndexError):
                 continue
     return result
@@ -7719,7 +7731,7 @@ def render_bottom_research(valuations, holdings=None, verified=False):
     st.subheader('底打ち・上昇転換ランキング〈研究〉')
     st.caption('独立売買判定を追加。通常タブの売買・株数には反映しません。研究点は勝率ではありません。確定日足で判定します。')
     st.write('TOPIX内の取得時点の売買代金上位50銘柄を先に選抜し、確定日足で底打ち・上昇転換を採点します。表の売買代金順位は選抜内の20日平均（終値×出来高の概算）です。')
-    st.caption('相対評価はTOPIX連動ETF（1306）の調整後20日騰落率と比較。底打ち否定ラインは観測した安値の参考値です。')
+    st.caption('基準日が同じ調整済み日足は保存分を再利用します。相対評価はTOPIX連動ETF（1306）の調整後20日騰落率と比較します。')
     if st.button('TOPIX上位50銘柄の研究ランキングを更新', key='v172451_bottom_run'):
         st.session_state.pop('v172451_bottom_result', None)
         try:
@@ -7734,10 +7746,10 @@ def render_bottom_research(valuations, holdings=None, verified=False):
                 frames = download_bottom_research(ts, target)
                 # Retry only missing/stale histories; bypass the initial cached failure.
                 retry_codes = []
-                for code in dict.fromkeys(universe['コード'].astype(str).tolist() + list(holdings or {})):
-                    history = frames.get(code + '.T', pd.DataFrame())
+                for t in ts:
+                    history = frames.get(t, pd.DataFrame())
                     if history.empty or history.index.max() != pd.Timestamp(target) or len(history) < 60:
-                        retry_codes.append(code + '.T')
+                        retry_codes.append(t)
                 if retry_codes:
                     for retry_no in (1, 2):
                         recovered = download_bottom_research(tuple(retry_codes), target, retry_tag=retry_no)
@@ -9445,6 +9457,27 @@ DIVIDEND_WATCH = (
 )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_dividend_watch_prices(tickers, target):
+    """252日高値の計算に、共通キャッシュの指標計算前の日足を使う。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    cutoff = pd.Timestamp(target)
+
+    def fetch(t):
+        try:
+            raw, _, _ = _download_domestic_history(t, cutoff, target_bars=252)
+            if (not raw.empty and raw.index[-1] == cutoff
+                    and not raw["Close"].pct_change().tail(60).abs().gt(.40).any()):
+                return t, raw
+        except Exception:
+            logging.getLogger(__name__).warning("高配当監視の日足確認に失敗: %s", t, exc_info=True)
+        return t, None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        return {t: frame for t, frame in pool.map(fetch, tickers) if frame is not None}
+
+
 def build_dividend_watch(prices, evidence, target, today, buying_power, holdings,
                          drawdown_limit=15.0, yield_min=3.5, payout_max=85.0):
     """公式IRを確認した入力値と確定日足を照合。欠損・古い値は必ず保留。"""
@@ -9518,7 +9551,7 @@ def build_dividend_watch(prices, evidence, target, today, buying_power, holdings
 
 with dividend_tab:
     st.subheader('暴落時・高配当10銘柄の監視')
-    st.caption('動画順位は固定。判定は配当・業績確認と確定日足で行います。通常の買い候補・均等配分には追加しません。')
+    st.caption('高配当10銘柄は、基準日が一致する共通の日足キャッシュを優先します。252営業日分が足りない場合に追加取得します。')
     with st.expander('監視条件・配当情報の入力', expanded=False):
         div_draw = st.number_input('高値からの下落率（%）以上', 5.0, 60.0, 15.0, 1.0, key='div_draw')
         div_yield = st.number_input('予想配当利回り（%）以上', 0.0, 15.0, 3.5, .1, key='div_yield')
@@ -9550,11 +9583,7 @@ with dividend_tab:
                 if not session.get('confirmed') or pd.isna(session.get('session_date')):
                     raise ValueError('直近取引日の確定を確認できません')
                 target = str(pd.Timestamp(session['session_date']).date())
-                frames, _ = batch_domestic_stock_data(tuple(c + '.T' for c, _ in DIVIDEND_WATCH),
-                    (str(tokyo_now().date()), tokyo_now().hour >= 16), 300)
-                statuses = build_daily_bar_status(frames)
-                confirmed_codes = set(statuses.loc[statuses['状態'].eq('🟢 当日確定'), 'コード'].astype(str)) if not statuses.empty else set()
-                frames = {t: f for t, f in frames.items() if str(code(t)) in confirmed_codes}
+                frames = load_dividend_watch_prices(tuple(c + '.T' for c, _ in DIVIDEND_WATCH), target)
                 st.session_state['div_snapshot'] = {'prices': frames, 'target': target,
                     'phase': (str(tokyo_now().date()), tokyo_now().hour >= 16)}
         except Exception as exc:

@@ -45,8 +45,8 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "17.25.1 TOP50・SBI買いシグナル"
-BUILD = "VER17-25-1-TOP50-SBI-SIGNALS-20261108"
+VERSION = "17.25.2 TOP50・SBI自動評価"
+BUILD = "VER17-25-2-TOP50-SBI-AUTO-20261108"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -3815,7 +3815,7 @@ def _daily_cache_write(t, provider, frame):
             except OSError: pass
 
 
-def _history_provider(t, cutoff, provider, target_bars=150):
+def _history_provider(t, cutoff, provider, target_bars=150, *, short_history=False):
     cached = _daily_cache_read(t, provider)
     initial = _initial_jp_history().get(t)
     if initial is not None and (cached.empty or len(cached) < len(initial)):
@@ -3823,7 +3823,7 @@ def _history_provider(t, cutoff, provider, target_bars=150):
     cached = cached.loc[cached.index <= cutoff] if not cached.empty else cached
     origin = cached.attrs.get("origin", "")
     # 日付が確定済みなら、同一取引日への再アクセスを省く。前日以前を最新と偽らない。
-    if _usable_daily_cache(cached, cutoff, target_bars):
+    if _usable_daily_cache(cached, cutoff, target_bars, minimum_bars=21 if short_history else 134):
         return cached, 0, "保存履歴を再利用", "保存値"
     parts, seen, errors, overlapping = [], set(), [], False
     limit = 3 if provider == "traders" else min(15, int(math.ceil(target_bars / 20)))
@@ -3847,7 +3847,7 @@ def _history_provider(t, cutoff, provider, target_bars=150):
                 else:
                     errors.append("保存履歴との価格基準不一致・初期履歴を結合せず公開範囲を再取得")
                     cached = pd.DataFrame(); origin = ""; overlapping = False
-            if len(seen) >= target_bars: break
+            if (sum(day <= cutoff for day in seen) if short_history else len(seen)) >= target_bars: break
         except Exception as exc:
             errors.append(f"page={page}: {type(exc).__name__}: {str(exc)[:180]}"); break
     current = pd.concat(parts).drop_duplicates("Date").set_index("Date").sort_index() if parts else pd.DataFrame()
@@ -3860,12 +3860,13 @@ def _history_provider(t, cutoff, provider, target_bars=150):
             if len(overlap_dates): current = current.loc[current.index >= overlap_dates[0]]
             current = pd.concat([cached, current]).loc[lambda x:~x.index.duplicated(keep="last")].sort_index()
         current.attrs["origin"] = origin
-        _daily_cache_write(t, provider, current)
+        if not short_history:
+            _daily_cache_write(t, provider, current)
         return current, pages, " / ".join(errors), ("今回取得＋"+origin+"・重複照合済" if origin else "今回取得＋保存履歴") if overlapping else "今回取得"
     return cached, pages, " / ".join(errors), "過去保存値（最終日を確認）" if not cached.empty else "取得不可"
 
 
-def _usable_daily_cache(frame, cutoff, target_bars):
+def _usable_daily_cache(frame, cutoff, target_bars, *, minimum_bars=134):
     """最新日・履歴数・OHLCV整合性を確認。異常値は通常取得へ戻す。"""
     try:
         if not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -3874,7 +3875,7 @@ def _usable_daily_cache(frame, cutoff, target_bars):
             return False
         if frame.index.hasnans or frame.index.has_duplicates or not frame.index.is_monotonic_increasing:
             return False
-        if len(frame) < max(134, int(target_bars)):
+        if len(frame) < max(minimum_bars, int(target_bars)):
             return False
         if frame.index.max().normalize() != cutoff:
             return False
@@ -5411,19 +5412,23 @@ def render_mobile_trade_cards(df, side, trend_by_code=None):
         range_text = html_escape(rm["値幅区分"])
         range_pct = _mobile_number(rm["ATR比率%"], 1, "%")
         detail_text = f"<span>{range_text}（ATR14 {range_pct}）</span>" + detail_text
-        st.markdown(
-            f"""
-            <div class="trade-card {card_class}">
-              <div class="trade-card-main">
-                <span class="trade-action">{action_text}</span>
-                <span class="trade-name">{code_text} {name_text}</span>
-                <span class="trade-quantity">{quantity_text}</span>
-              </div>
-              <div class="trade-card-detail">{detail_text}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        _render_trade_card(card_class, action_text, code_text, name_text, quantity_text, detail_text)
+
+
+def _render_trade_card(card_class, action_text, code_text, name_text, quantity_text, detail_text):
+    st.markdown(
+        f"""
+        <div class="trade-card {card_class}">
+          <div class="trade-card-main">
+            <span class="trade-action">{action_text}</span>
+            <span class="trade-name">{code_text} {name_text}</span>
+            <span class="trade-quantity">{quantity_text}</span>
+          </div>
+          <div class="trade-card-detail">{detail_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def prepare_admin_display(df, rename_columns=None):
@@ -7849,13 +7854,16 @@ def fetch_sbi_buy_signals(refresh_key):
 
 
 def sbi_rebound_score(frame, signal_day):
-    """A score for observable rebound conditions using already downloaded daily bars."""
+    """SBI基準日の確定日足から反発条件を評価する。"""
     columns = ["Close", "High", "Low", "Volume"]
     if frame is None or len(frame) < 21 or frame.attrs.get("daily_bar_status") != "🟢 当日確定":
         return None, "確定日足なし"
-    if pd.Timestamp(frame.index[-1]).date() != signal_day or not set(columns).issubset(frame.columns):
+    if not set(columns).issubset(frame.columns):
+        return None, "日足・出来高の必要項目なし"
+    through_signal = frame.loc[frame.index <= pd.Timestamp(signal_day)]
+    if len(through_signal) < 21 or pd.Timestamp(through_signal.index[-1]).date() != signal_day:
         return None, "SBI基準日の確定日足なし"
-    x = frame[columns].tail(21).apply(pd.to_numeric, errors="coerce")
+    x = through_signal[columns].tail(21).apply(pd.to_numeric, errors="coerce")
     avg_volume = x.Volume.iloc[:-1].mean()
     if (not np.isfinite(x.to_numpy()).all() or (x[["Close", "High", "Low"]] <= 0).any().any()
             or (x.Volume < 0).any() or avg_volume <= 0):
@@ -7872,13 +7880,50 @@ def sbi_rebound_score(frame, signal_day):
     return len(met) * 20, "・".join(met) or "反発条件未達"
 
 
+@st.cache_data(ttl=600, max_entries=16, show_spinner=False)
+def fetch_sbi_rebound_scores(codes, signal_day, refresh_key):
+    """通常判定の日足と分けて、必要な銘柄の直近21本だけを評価する。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    cutoff = pd.Timestamp(signal_day)
+
+    def fetch(c):
+        t = c + ".T"
+        providers = ("traders", "yahoo")
+        # 既に保存済みの日足があれば、提供元を問わず先に再利用する。
+        for provider in providers:
+            cached = _daily_cache_read(t, provider)
+            if not cached.empty:
+                cached = cached.loc[cached.index <= cutoff].tail(21)
+            if _usable_daily_cache(cached, cutoff, 21, minimum_bars=21):
+                cached.attrs["daily_bar_status"] = "🟢 当日確定"
+                score, reason = sbi_rebound_score(cached, signal_day)
+                if score is not None:
+                    return c, (score, reason)
+
+        reason = "SBI基準日の確定日足を取得できず"
+        for provider in providers:
+            frame, _, _ = _history_provider(t, cutoff, provider, 21, short_history=True)
+            recent = frame.tail(21)
+            if not _usable_daily_cache(recent, cutoff, 21, minimum_bars=21):
+                continue
+            recent.attrs["daily_bar_status"] = "🟢 当日確定"
+            score, reason = sbi_rebound_score(recent, signal_day)
+            if score is not None:
+                return c, (score, reason)
+        return c, (None, reason)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        return dict(pool.map(fetch, codes))
+
+
 def render_sbi_buy_signals(data, held_codes, refresh):
     st.subheader("追加枠｜SBI買いシグナル")
     st.caption("SBI勝率は直近1年の過去実績。AIおすすめ度は反発の5条件を各20点で評価した参考値で、上昇確率ではありません。")
     retry = st.button("SBIシグナルだけ更新", key="sbi_buy_signals_refresh")
     state_key = "sbi_buy_signal_snapshot"
+    now = tokyo_now()
     if refresh or retry or state_key not in st.session_state:
-        now = tokyo_now()
         refresh_key = now.isoformat() if retry else int(now.timestamp()) // 600
         try:
             with st.spinner("SBIトレードチャンスを確認中…"):
@@ -7893,7 +7938,6 @@ def render_sbi_buy_signals(data, held_codes, refresh):
 
     signal_day, signals = snapshot
     st.caption(f"SBI基準日 {signal_day:%Y/%m/%d} ｜ 朝は前営業日分を参照")
-    now = tokyo_now()
     current_dates = {pd.Timestamp(frame.index[-1]).date() for frame in data.values()
                      if not frame.empty and frame.attrs.get("daily_bar_status") == "🟢 当日確定"}
     latest_day = max(current_dates, default=None)
@@ -7906,27 +7950,61 @@ def render_sbi_buy_signals(data, held_codes, refresh):
         st.info("SBIの買いシグナル点灯銘柄はありません。")
         return
 
+    scores = {c: sbi_rebound_score(data.get(c + ".T"), signal_day) for c in signals}
+    missing = tuple(sorted(c for c, (score, _) in scores.items() if score is None))
+    if missing:
+        scores_key = "sbi_rebound_scores"
+        signature = (signal_day, missing)
+        saved_signature, supplemental = st.session_state.get(scores_key, (None, {}))
+        if refresh or retry or saved_signature != signature:
+            with st.spinner(f"SBI候補の日足を確認し、AIおすすめ度を計算中（追加対象 {len(missing)} 銘柄）…"):
+                refresh_key = now.isoformat() if retry else int(now.timestamp()) // 600
+                supplemental = fetch_sbi_rebound_scores(missing, signal_day, refresh_key)
+                st.session_state[scores_key] = (signature, supplemental)
+        scores.update(supplemental)
+
     held = set(held_codes)
     rows = []
     for c, (title, wins, losses) in signals.items():
-        frame = data.get(c + ".T")
-        score, reason = sbi_rebound_score(frame, signal_day)
+        score, reason = scores[c]
         rebound_ready = score is not None and score >= 80 and "安値切上げ" in reason and "5日高値突破" in reason
         status = "買い検討" if rebound_ready else "買い待ち" if score is not None else "未評価"
         rows.append({
             "コード": c,
             "銘柄名": STOCK_NAMES.get(c, title or c),
             "SBI買いシグナル": "発生",
-            "SBI勝率": f"{wins / (wins + losses):.1%}",
+            "SBI勝率": wins / (wins + losses),
             "直近1年": f"{wins}勝{losses}敗",
             "AIおすすめ度": score,
             "状態": "保有中" if c in held else status,
-            "AI判定根拠": reason if frame is not None else "今回の日足取得範囲外",
+            "AI判定根拠": reason,
         })
-    table = pd.DataFrame(rows).sort_values("AIおすすめ度", ascending=False, kind="stable", na_position="last")
+    table = pd.DataFrame(rows).sort_values(
+        ["AIおすすめ度", "SBI勝率", "コード"], ascending=[False, False, True], na_position="last"
+    )
+    top3 = table.loc[table["AIおすすめ度"].notna() & table["状態"].ne("保有中")].head(3)
+    st.markdown("#### SBI買いシグナル TOP3（参考）")
+    if top3.empty:
+        st.info("AI評価済みの未保有銘柄はありません。")
+    for rank, row in enumerate(top3.to_dict("records"), 1):
+        status = row["状態"]
+        detail = (
+            f'<span>SBI勝率 {row["SBI勝率"]:.1%}（{row["直近1年"]}）</span>'
+            f'<span class="trade-valuation">{_mobile_text(status)}</span>'
+            f'<span class="trade-valuation">{_mobile_text(row["AI判定根拠"])}</span>'
+        )
+        _render_trade_card(
+            "buy-card" if status == "買い検討" else "skip-card",
+            f"{rank}位", _mobile_text(row["コード"]), _mobile_text(row["銘柄名"]),
+            f'AI {row["AIおすすめ度"]:.0f}%', detail,
+        )
+
+    st.markdown("#### SBI買いシグナル一覧")
+    table["SBI勝率"] = table["SBI勝率"].map(lambda value: f"{value:.1%}")
     table["AIおすすめ度"] = table["AIおすすめ度"].map(lambda value: f"{value:.0f}%" if pd.notna(value) else "―")
     st.dataframe(table, use_container_width=True, hide_index=True)
-    st.caption("5条件は安値更新停止・安値切上げ・5日高値突破・5日線改善・出来高増加。80%以上で安値切上げと5日高値突破を満たせば買い検討。日足取得範囲外はSBI実績のみ表示します。")
+    st.caption("5条件は安値更新停止・安値切上げ・5日高値突破・5日線改善・出来高増加。80%以上で安値切上げと5日高値突破を満たせば買い検討。日足を確認できない銘柄は未評価と理由を表示します。")
+
 
 
 with main_tab:

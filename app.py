@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.3",
+    page_title="日本株 AI投資アシスタント Ver.17.25.4",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.3 TOP50・SBI自動評価"
-BUILD = "VER17-25-3-TOP50-SBI-AUTO-20261108"
+VERSION = "17.25.4 TOP50・SBI自動評価"
+BUILD = "VER17-25-4-TOP50-SBI-AUTO-20261108"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -7890,43 +7890,84 @@ def fetch_sbi_rebound_scores(codes, signal_day, refresh_key):
     logger = logging.getLogger(__name__)
 
     def score_history(frame):
-        if not frame.empty:
-            frame = frame.loc[frame.index <= cutoff].tail(21).copy()
+        if frame.empty:
+            return None, "有効な日足なし"
+        frame = frame.loc[frame.index <= cutoff].tail(21).copy()
+        if frame.empty or frame.index[-1] != cutoff:
+            return None, "SBI基準日の日足なし"
+        if len(frame) < 21:
+            return None, f"日足不足（{len(frame)}/21本）"
         if not _usable_daily_cache(frame, cutoff, 21, minimum_bars=21):
-            return None, "SBI基準日の確定日足を確認できず"
+            return None, "日足の価格・出来高に不整合"
         frame.attrs["daily_bar_status"] = "🟢 当日確定"
         return sbi_rebound_score(frame, signal_day)
 
     def fetch(c):
         t = c + ".T"
-        providers = ("traders", "yahoo")
-        # 保存済みの日足を優先し、異常な保存値や取得先のエラーは銘柄単位で扱う。
-        for provider in providers:
+        providers = (("traders", "トレーダーズ・ウェブ"), ("yahoo", "Yahoo!ファイナンス日本版"))
+        diagnostics = []
+        for provider, label in providers:
             try:
                 score, reason = score_history(_daily_cache_read(t, provider))
-            except Exception:
+            except Exception as exc:
+                diagnostics.append(f"{label}保存値: {type(exc).__name__}: {str(exc)[:160]}")
                 logger.warning("SBI日足キャッシュの確認に失敗: %s (%s)", t, provider, exc_info=True)
                 continue
             if score is not None:
-                return c, (score, reason)
+                return c, (score, reason, label + "（保存値）", " / ".join(diagnostics))
 
-        reason = "SBI基準日の確定日足を取得できず"
-        for provider in providers:
+        for provider, label in providers:
             try:
-                frame, _, _ = _history_provider(t, cutoff, provider, 21, short_history=True)
+                frame, _, message, mode = _history_provider(t, cutoff, provider, 21, short_history=True)
                 score, reason = score_history(frame)
-            except Exception:
+                diagnostics.append(f"{label}: {reason}" + (f"（{message}）" if message else ""))
+            except Exception as exc:
+                diagnostics.append(f"{label}: {type(exc).__name__}: {str(exc)[:160]}")
                 logger.warning("SBI日足の追加評価に失敗: %s (%s)", t, provider, exc_info=True)
                 continue
             if score is not None:
-                return c, (score, reason)
-        return c, (None, reason)
+                return c, (score, reason, f"{label}（{mode}）", " / ".join(diagnostics))
+        return c, (None, "SBI基準日の確定日足を確認できず", "", " / ".join(diagnostics))
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        return dict(pool.map(fetch, codes))
+        results = dict(pool.map(fetch, codes))
+
+    # 国内2経路で評価できなかった銘柄のみ、SBI基準日までの東証日足を一括で補う。
+    missing = [c for c, (score, _, _, _) in results.items() if score is None]
+    if not missing:
+        return results
+    tickers = [c + ".T" for c in missing]
+    try:
+        raw = yf.download(
+            tickers=tickers, start=(cutoff - pd.Timedelta(days=60)).date().isoformat(),
+            end=(cutoff + pd.Timedelta(days=1)).date().isoformat(), interval="1d",
+            auto_adjust=False, actions=False, group_by="ticker", progress=False,
+            threads=4, timeout=8,
+        )
+        download_error = ""
+    except Exception as exc:
+        logger.warning("SBI日足の一括補完に失敗", exc_info=True)
+        raw, download_error = pd.DataFrame(), type(exc).__name__
+    for c, t in zip(missing, tickers):
+        try:
+            if raw is None or raw.empty:
+                frame = pd.DataFrame()
+            elif isinstance(raw.columns, pd.MultiIndex):
+                frame = raw[t] if t in raw.columns.get_level_values(0) else pd.DataFrame()
+            else:
+                frame = raw if len(tickers) == 1 else pd.DataFrame()
+            score, reason = score_history(_normalize_ohlcv(frame))
+        except Exception as exc:
+            logger.warning("SBI補完日足の評価に失敗: %s", t, exc_info=True)
+            score, reason = None, type(exc).__name__
+        previous = results[c]
+        diagnostic = f"{previous[3]} / Yahoo Finance: {download_error or reason}"
+        results[c] = (score, reason, "Yahoo Finance（東証日足）" if score is not None else "", diagnostic)
+    return results
 
 
 def render_sbi_buy_signals(data, held_codes, refresh):
+    st.session_state.pop("sbi_buy_signal_diagnostics", None)
     st.subheader("追加枠｜SBI買いシグナル")
     st.caption("SBI勝率は直近1年の過去実績。AIおすすめ度は反発の5条件を各20点で評価した参考値で、上昇確率ではありません。")
     retry = st.button("SBIシグナルだけ更新", key="sbi_buy_signals_refresh")
@@ -7959,10 +8000,11 @@ def render_sbi_buy_signals(data, held_codes, refresh):
         st.info("SBIの買いシグナル点灯銘柄はありません。")
         return
 
-    scores = {c: sbi_rebound_score(data.get(c + ".T"), signal_day) for c in signals}
-    missing = tuple(sorted(c for c, (score, _) in scores.items() if score is None))
+    scores = {c: (*sbi_rebound_score(data.get(c + ".T"), signal_day), "通常判定の日足", "")
+              for c in signals}
+    missing = tuple(sorted(c for c, (score, _, _, _) in scores.items() if score is None))
     if missing:
-        scores_key = "sbi_rebound_scores"
+        scores_key = "sbi_rebound_scores_v17254"
         signature = (signal_day, missing)
         saved_signature, supplemental = st.session_state.get(scores_key, (None, {}))
         if refresh or retry or saved_signature != signature:
@@ -7973,9 +8015,11 @@ def render_sbi_buy_signals(data, held_codes, refresh):
         scores.update(supplemental)
 
     held = set(held_codes)
-    rows = []
+    rows, diagnostics = [], []
     for c, (title, wins, losses) in signals.items():
-        score, reason = scores[c]
+        score, reason, source, detail = scores[c]
+        diagnostics.append({"SBI基準日": signal_day, "コード": c, "日足取得元": source,
+                            "AIおすすめ度": score, "AI判定根拠": reason, "取得診断": detail})
         rebound_ready = score is not None and score >= 80 and "安値切上げ" in reason and "5日高値突破" in reason
         status = "買い検討" if rebound_ready else "買い待ち" if score is not None else "未評価"
         rows.append({
@@ -7991,7 +8035,10 @@ def render_sbi_buy_signals(data, held_codes, refresh):
     table = pd.DataFrame(rows).sort_values(
         ["AIおすすめ度", "SBI勝率", "コード"], ascending=[False, False, True], na_position="last"
     )
-    top3 = table.loc[table["AIおすすめ度"].notna() & table["状態"].ne("保有中")].head(3)
+    st.session_state["sbi_buy_signal_diagnostics"] = pd.DataFrame(diagnostics)
+    evaluated = table["AIおすすめ度"].notna()
+    st.caption(f"AI評価済み {int(evaluated.sum())}/{len(table)}銘柄")
+    top3 = table.loc[evaluated & table["状態"].ne("保有中")].head(3)
     st.markdown("#### SBI買いシグナル TOP3（参考）")
     if top3.empty:
         st.info("AI評価済みの未保有銘柄はありません。")
@@ -9234,6 +9281,9 @@ try:
             "トレンド振れ幅フィルター実売買":bool(quality_mode),
         }])
         zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
+        sbi_diagnostics = st.session_state.get("sbi_buy_signal_diagnostics")
+        if isinstance(sbi_diagnostics, pd.DataFrame):
+            zf.writestr("sbi_buy_signal_diagnostics.csv", sbi_diagnostics.to_csv(index=False, encoding="utf-8-sig"))
         zf.writestr("update_processing_times.csv", pd.DataFrame([{"処理": k, "秒": v} for k, v in st.session_state.get("v172429_update_times", {}).items()]).to_csv(index=False, encoding="utf-8-sig"))
         zf.writestr("finance_acquisition_status.csv",finance_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
         for mb_filename, mb_frame in (("multibagger_candidates.csv", multibagger_candidates),

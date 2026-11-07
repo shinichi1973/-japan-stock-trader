@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.5",
+    page_title="日本株 AI投資アシスタント Ver.17.25.6",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.5 TOP50・SBI自動評価"
-BUILD = "VER17-25-5-TOP50-SBI-AUTO-20261108"
+VERSION = "17.25.6 TOP50・SBI自動評価"
+BUILD = "VER17-25-6-TOP50-SBI-AUTO-20261108"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -3293,7 +3293,7 @@ def render_allocation_research():
 
 def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_codes,
                                 cap_yen=None, execution_mode="自動（通常注文優先・不足はS株）",
-                                lot_cap=None, order_inputs_ready=True):
+                                lot_cap=None, order_inputs_ready=True, *, preserve_order=False):
     """候補は余力と独立。未保有TOP3へ予算を均等配分し、余力入力後に株数を計算。"""
     cols = ["購入優先度", "コード", "銘柄名", "総合AIスコア", "現在株価", "計算用株価",
             "購入株数", "予定購入額", "余力引当額", "買付余力使用率", "注文想定",
@@ -3303,8 +3303,10 @@ def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_c
         return pd.DataFrame(columns=cols)
     held = set(map(str, held_codes or []))
     x = candidates[~candidates["コード"].astype(str).isin(held)].copy()
-    x = (x.sort_values(["候補スコア", "%K", "コード"], ascending=[False, True, True])
-         if "候補スコア" in x else x.sort_values(["%K", "コード"], ascending=[True, True])).head(3)
+    if not preserve_order:
+        x = (x.sort_values(["候補スコア", "%K", "コード"], ascending=[False, True, True])
+             if "候補スコア" in x else x.sort_values(["%K", "コード"], ascending=[True, True]))
+    x = x.head(3)
     remaining = max(float(buying_power or 0), 0)
     allocation_count = len(x)
     equal_budget = remaining / allocation_count if allocation_count else 0
@@ -4119,6 +4121,12 @@ def common_new_buy_reasons(label, daily_status, downtrend=False, churn_reason=""
     return reasons
 
 
+def valuation_at_price(symbol, price):
+    f = fundamental_snapshot(symbol, market_price_hint=price) if np.isfinite(price) and price > 0 else {}
+    return valuation_label(f.get("参考価値上昇余地"), f.get("株式分割補正", ""),
+                           f.get("適正株価異常値ガード", ""), f.get("取得状態"), f.get("財務情報鮮度"))
+
+
 def build_valuation_master(frames, holdings, price_data, display_frames):
     """同一実行内の共通判定。TOP50外の保有・表示対象も一度だけ算定する。"""
     records = {}
@@ -4134,10 +4142,7 @@ def build_valuation_master(frames, holdings, price_data, display_frames):
         symbol = c + ".T"
         history = price_data.get(symbol, pd.DataFrame())
         hint = safe_float(history["Close"].iloc[-1]) if not history.empty else np.nan
-        f = fundamental_snapshot(symbol, market_price_hint=hint) if np.isfinite(hint) and hint > 0 else {}
-        records[c] = {"コード": c, "割安判定": valuation_label(
-            f.get("参考価値上昇余地"), f.get("株式分割補正", ""),
-            f.get("適正株価異常値ガード", ""), f.get("取得状態"), f.get("財務情報鮮度"))}
+        records[c] = {"コード": c, "割安判定": valuation_at_price(symbol, hint)}
     return pd.DataFrame(records.values())
 
 
@@ -7891,21 +7896,21 @@ def fetch_sbi_rebound_scores(codes, signal_day, refresh_key):
 
     def score_history(frame, *, save_ticker=None, source=""):
         if frame.empty:
-            return None, "有効な日足なし"
+            return None, "有効な日足なし", np.nan
         frame = frame.loc[frame.index <= cutoff].tail(21).copy()
         if frame.empty or frame.index[-1] != cutoff:
-            return None, "SBI基準日の日足なし"
+            return None, "SBI基準日の日足なし", np.nan
         if len(frame) < 21:
-            return None, f"日足不足（{len(frame)}/21本）"
+            return None, f"日足不足（{len(frame)}/21本）", np.nan
         if not _usable_daily_cache(frame, cutoff, 21, minimum_bars=21):
-            return None, "日足の価格・出来高に不整合"
+            return None, "日足の価格・出来高に不整合", np.nan
         frame.attrs["daily_bar_status"] = "🟢 当日確定"
         score, reason = sbi_rebound_score(frame, signal_day)
         if score is not None and save_ticker is not None:
             cache_frame = frame[["Open", "High", "Low", "Close", "Volume"]].rename_axis("Date")
             cache_frame.attrs["origin"] = source
             _daily_cache_write(save_ticker, "sbi", cache_frame)
-        return score, reason
+        return score, reason, float(frame["Close"].iloc[-1])
 
     def fetch(c):
         t = c + ".T"
@@ -7914,33 +7919,33 @@ def fetch_sbi_rebound_scores(codes, signal_day, refresh_key):
         for provider, label in (("sbi", "SBI評価用キャッシュ"), *providers):
             try:
                 cached = _daily_cache_read(t, provider)
-                score, reason = score_history(cached)
+                score, reason, price = score_history(cached)
             except Exception as exc:
                 diagnostics.append(f"{label}保存値: {type(exc).__name__}: {str(exc)[:160]}")
                 logger.warning("SBI日足キャッシュの確認に失敗: %s (%s)", t, provider, exc_info=True)
                 continue
             if score is not None:
                 source = cached.attrs.get("origin") if provider == "sbi" else label
-                return c, (score, reason, f"{source or label}（保存値）", " / ".join(diagnostics))
+                return c, (score, reason, f"{source or label}（保存値）", " / ".join(diagnostics), price)
 
         for provider, label in providers:
             try:
                 frame, _, message, mode = _history_provider(t, cutoff, provider, 21, short_history=True)
-                score, reason = score_history(frame, save_ticker=t, source=label)
+                score, reason, price = score_history(frame, save_ticker=t, source=label)
                 diagnostics.append(f"{label}: {reason}" + (f"（{message}）" if message else ""))
             except Exception as exc:
                 diagnostics.append(f"{label}: {type(exc).__name__}: {str(exc)[:160]}")
                 logger.warning("SBI日足の追加評価に失敗: %s (%s)", t, provider, exc_info=True)
                 continue
             if score is not None:
-                return c, (score, reason, f"{label}（{mode}）", " / ".join(diagnostics))
-        return c, (None, "SBI基準日の確定日足を確認できず", "", " / ".join(diagnostics))
+                return c, (score, reason, f"{label}（{mode}）", " / ".join(diagnostics), price)
+        return c, (None, "SBI基準日の確定日足を確認できず", "", " / ".join(diagnostics), np.nan)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = dict(pool.map(fetch, codes))
 
     # 国内2経路で評価できなかった銘柄のみ、SBI基準日までの東証日足を一括で補う。
-    missing = [c for c, (score, _, _, _) in results.items() if score is None]
+    missing = [c for c, (score, _, _, _, _) in results.items() if score is None]
     if not missing:
         return results
     tickers = [c + ".T" for c in missing]
@@ -7963,19 +7968,20 @@ def fetch_sbi_rebound_scores(codes, signal_day, refresh_key):
                 frame = raw[t] if t in raw.columns.get_level_values(0) else pd.DataFrame()
             else:
                 frame = raw if len(tickers) == 1 else pd.DataFrame()
-            score, reason = score_history(
+            score, reason, price = score_history(
                 _normalize_ohlcv(frame), save_ticker=t, source="Yahoo Finance（東証日足）"
             )
         except Exception as exc:
             logger.warning("SBI補完日足の評価に失敗: %s", t, exc_info=True)
-            score, reason = None, type(exc).__name__
+            score, reason, price = None, type(exc).__name__, np.nan
         previous = results[c]
         diagnostic = f"{previous[3]} / Yahoo Finance: {download_error or reason}"
-        results[c] = (score, reason, "Yahoo Finance（東証日足）" if score is not None else "", diagnostic)
+        results[c] = (score, reason, "Yahoo Finance（東証日足）" if score is not None else "", diagnostic, price)
     return results
 
 
-def render_sbi_buy_signals(data, held_codes, refresh):
+def render_sbi_buy_signals(data, held_codes, refresh, value_by_code, buying_power,
+                           execution_mode, purchase_cap, lot_cap):
     st.session_state.pop("sbi_buy_signal_diagnostics", None)
     st.subheader("追加枠｜SBI買いシグナル")
     st.caption("SBI勝率は直近1年の過去実績。AIおすすめ度は反発の5条件を各20点で評価した参考値で、上昇確率ではありません。")
@@ -8009,11 +8015,15 @@ def render_sbi_buy_signals(data, held_codes, refresh):
         st.info("SBIの買いシグナル点灯銘柄はありません。")
         return
 
-    scores = {c: (*sbi_rebound_score(data.get(c + ".T"), signal_day), "通常判定の日足", "")
-              for c in signals}
-    missing = tuple(sorted(c for c, (score, _, _, _) in scores.items() if score is None))
+    scores = {}
+    for c in signals:
+        frame = data.get(c + ".T")
+        score, reason = sbi_rebound_score(frame, signal_day)
+        price = float(frame.at[pd.Timestamp(signal_day), "Close"]) if score is not None else np.nan
+        scores[c] = (score, reason, "通常判定の日足", "", price)
+    missing = tuple(sorted(c for c, result in scores.items() if result[0] is None))
     if missing:
-        scores_key = "sbi_rebound_scores_v17255"
+        scores_key = "sbi_rebound_scores_v17256"
         signature = (signal_day, missing)
         saved_signature, supplemental = st.session_state.get(scores_key, (None, {}))
         if refresh or retry or saved_signature != signature:
@@ -8026,7 +8036,7 @@ def render_sbi_buy_signals(data, held_codes, refresh):
     held = set(held_codes)
     rows, diagnostics = [], []
     for c, (title, wins, losses) in signals.items():
-        score, reason, source, detail = scores[c]
+        score, reason, source, detail, price = scores[c]
         diagnostics.append({"SBI基準日": signal_day, "コード": c, "日足取得元": source,
                             "AIおすすめ度": score, "AI判定根拠": reason, "取得診断": detail})
         rebound_ready = score is not None and score >= 80 and "安値切上げ" in reason and "5日高値突破" in reason
@@ -8040,6 +8050,7 @@ def render_sbi_buy_signals(data, held_codes, refresh):
             "AIおすすめ度": score,
             "状態": "保有中" if c in held else status,
             "AI判定根拠": reason,
+            "現在株価": price,
         })
     table = pd.DataFrame(rows).sort_values(
         ["AIおすすめ度", "SBI勝率", "コード"], ascending=[False, False, True], na_position="last"
@@ -8051,23 +8062,42 @@ def render_sbi_buy_signals(data, held_codes, refresh):
     st.markdown("#### SBI買いシグナル TOP3（参考）")
     if top3.empty:
         st.info("AI評価済みの未保有銘柄はありません。")
+    purchase_by_code = {}
+    if buying_power is not None and not top3.empty:
+        plan = build_fixed45_purchase_plan(
+            top3.rename(columns={"AIおすすめ度": "総合AIスコア"}), buying_power,
+            None, held_codes, purchase_cap, execution_mode, lot_cap, preserve_order=True,
+        )
+        purchase_by_code = plan.set_index("コード").to_dict("index")
+    if not top3.empty:
+        st.caption("株価はSBI基準日の確定終値。参考株数は、入力余力をSBI TOP3内だけで均等配分した場合の目安です。")
     for rank, row in enumerate(top3.to_dict("records"), 1):
-        status = row["状態"]
+        c, status, price = row["コード"], row["状態"], row["現在株価"]
+        valuation = value_by_code.get(c) or valuation_at_price(c + ".T", price)
+        price_text = _mobile_number(price, 0 if float(price).is_integer() else 1, "円")
+        purchase = purchase_by_code.get(c)
+        shares_text = ""
+        if purchase is not None:
+            shares = int(purchase["購入株数"])
+            order_label = _mobile_text(purchase["注文区分"]) if shares else "余力不足"
+            shares_text = f"<span>参考 {shares:,}株・{order_label}</span>"
         detail = (
+            f'<span>現在株価 {price_text}</span>'
+            f'<span class="trade-valuation">{_mobile_text(valuation)}</span>'
+            f'{shares_text}'
             f'<span>SBI勝率 {row["SBI勝率"]:.1%}（{row["直近1年"]}）</span>'
             f'<span class="trade-valuation">{_mobile_text(status)}</span>'
             f'<span class="trade-valuation">{_mobile_text(row["AI判定根拠"])}</span>'
         )
         _render_trade_card(
-            "buy-card" if status == "買い検討" else "skip-card",
-            f"{rank}位", _mobile_text(row["コード"]), _mobile_text(row["銘柄名"]),
+            "buy-card", f"{rank}位", _mobile_text(c), _mobile_text(row["銘柄名"]),
             f'AI {row["AIおすすめ度"]:.0f}%', detail,
         )
 
     st.markdown("#### SBI買いシグナル一覧")
     table["SBI勝率"] = table["SBI勝率"].map(lambda value: f"{value:.1%}")
     table["AIおすすめ度"] = table["AIおすすめ度"].map(lambda value: f"{value:.0f}%" if pd.notna(value) else "―")
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table.drop(columns="現在株価"), use_container_width=True, hide_index=True)
     st.caption("5条件は安値更新停止・安値切上げ・5日高値突破・5日線改善・出来高増加。80%以上で安値切上げと5日高値突破を満たせば買い検討。日足を確認できない銘柄は未評価と理由を表示します。")
 
 
@@ -8091,7 +8121,10 @@ with main_tab:
                 show_stock_table(ifd_table, use_container_width=True, hide_index=True)
                 st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
     sbi_started = time.perf_counter()
-    render_sbi_buy_signals(data, held_codes, run_clicked)
+    render_sbi_buy_signals(
+        data, held_codes, run_clicked, value_judgement_by_code,
+        short_buying_power if order_inputs_ready else None, execution_mode, purchase_cap, lot_cap,
+    )
     sbi_elapsed = round(time.perf_counter() - sbi_started, 2)
     st.caption(f"新規買い：{live_universe_mode}の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定：{'割高・判定不能を除外' if signal_first and block_unrated else '割高を除外・判定不能は許可' if signal_first else '参考表示'}")
     with st.expander("買い待ち・見送り理由", expanded=False):

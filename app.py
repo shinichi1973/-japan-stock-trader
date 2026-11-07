@@ -40,13 +40,14 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.0",
+    page_title="日本株 AI投資アシスタント Ver.17.25.1",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.0 シンプル画面・高配当10銘柄監視"
-BUILD = "VER17-25-0-SIMPLE-DIVIDEND-20261106"
+VERSION = "17.25.1 TOP50・SBI買いシグナル"
+BUILD = "VER17-25-1-TOP50-SBI-SIGNALS-20261108"
+TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -4017,12 +4018,14 @@ def selection_range_metrics(df):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def discover_domestic_topix_turnover100(limit=300):
-    """JPX構成一覧と日本版Yahoo売買代金ランキングの積集合を順位順に指定件数。"""
-    limit = int(limit)
-    if not 100 <= limit <= 500:
-        raise ValueError("対象件数は100〜500件で指定してください")
-    topix = discover_topix_growth_stock_universe()
+def discover_domestic_turnover_universe(scope, limit=TOPIX_SCAN_LIMIT):
+    """JPX構成一覧を国内売買代金順位で絞り、日足・財務取得の対象を決める。"""
+    scope_name, load_constituents = {
+        "topix": ("TOPIX", discover_topix_stock_universe),
+        "topix_growth": ("TOPIX＋グロース", discover_topix_growth_stock_universe),
+        "ai": ("TOPIX＋日経225＋グロース", discover_topix_nikkei225_stock_universe),
+    }[scope]
+    topix = load_constituents()
     allowed = set(topix["コード"].astype(str))
     selected = []
     for page in range(1, 31):
@@ -4033,16 +4036,16 @@ def discover_domestic_topix_turnover100(limit=300):
         response.raise_for_status()
         # SSRランキングの銘柄リンクを文書順に読み取る（JSON内の順不同コードは使わない）。
         found = re.findall(r'href=["\'](?:https://finance.yahoo.co.jp)?/quote/([0-9A-Z]{4})\.T(?:[?/#][^"\']*)?["\']', response.text)
-        added = 0
         for c in found:
             if c in allowed and c not in selected:
                 selected.append(c)
-                added += 1
             if len(selected) == limit:
                 out = topix.set_index("コード").loc[selected].reset_index()
                 out["売買代金順位"] = np.arange(1, limit + 1)
                 out["選定情報源"] = "JPX構成一覧＋Yahoo!ファイナンス日本版売買代金順位"
-                out.attrs["universe_notice"] = f"TOPIX＋グロース内の売買代金上位{limit}。ランキングは取得時点（日中は進行中）、買いサインは最新確定日足。"
+                scope_note = f"{scope_name}内の売買代金上位{limit}。ランキングは取得時点（日中は進行中）、買いサインは最新確定日足。"
+                source_note = topix.attrs.get("universe_notice", "")
+                out.attrs["universe_notice"] = " ".join(filter(None, (scope_note, source_note)))
                 return out
         if not found:
             break
@@ -4137,12 +4140,7 @@ def build_valuation_master(frames, holdings, price_data, display_frames):
 
 
 def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filter=True):
-    """数百銘柄の母集団から一次選抜→企業価値AIで最終TOP50。
-
-    重いファンダ取得を全銘柄へ直列実行するとStreamlit Cloudでタイムアウトしやすいため、
-    まず全母集団を流動性・トレンド・値動き安定性で一次選抜し、上位だけ詳細な企業価値評価を行う。
-    これにより「49銘柄全部がTOP50」という旧状態を避けつつ、数百銘柄から本当の50銘柄を選ぶ。
-    """
+    """取得済みの母集団を流動性・トレンド・値動きで一次選抜し、企業価値を評価する。"""
     tech_rows = []
     for t, df in (data or {}).items():
         if df is None or df.empty or len(df) < 60:
@@ -4531,10 +4529,10 @@ def discover_topix_nikkei225_stock_universe():
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def discover_japan_stock_universe(limit=350):
-    """TradingView日本株スキャナーから売買代金上位の普通株を数百銘柄取得する。
+    """TradingView日本株スキャナーから売買代金上位の普通株を取得する。
     旧49銘柄へ黙ってフォールバックすると「本物のTOP50」ではなくなるため、失敗時は空を返す。
     """
-    limit = int(np.clip(limit, 100, 500))
+    limit = int(np.clip(limit, TOPIX_SCAN_LIMIT, 500))
     columns = ["name", "description", "close", "volume", "Value.Traded", "market_cap_basic", "exchange"]
     payload = {
         "filter": [{"left": "type", "operation": "equal", "right": "stock"}],
@@ -5723,8 +5721,8 @@ st.markdown(
 
 st.title("📈 日本株 AI投資アシスタント")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
-st.caption("今日の判断で通常売買を確認。監視リストで短期反発と高配当の買い待ち条件を確認します。")
-main_tab, monitor_tab, admin_tab = st.tabs(["今日の判断", "監視リスト", "設定・検証"])
+st.caption("今日の売買で通常売買とSBI買いシグナルを確認。監視リストでは短期反発と高配当の買い待ち条件を確認します。")
+main_tab, monitor_tab, admin_tab = st.tabs(["今日の売買", "監視リスト", "設定・検証"])
 with monitor_tab:
     dividend_tab, bottom_tab = st.tabs(["高配当10銘柄", "短期反発・底打ち"])
 with admin_tab:
@@ -5827,9 +5825,14 @@ with admin_tab:
         risk_per_trade_pct = b3.slider("1銘柄許容損失（資産比%）", 0.25, 3.0, 1.0, 0.25, key="v177_risk", disabled=True)
         price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
         c1, c2 = st.columns(2)
-        universe_size = c1.number_input("日本株母集団（売買代金上位）", 100, 500, 300, 25, key="v172449_universe_n", disabled=live_universe_mode not in ("TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン", "対象拡大（売買代金上位）"))
-        fundamental_pool_size = c2.number_input("詳細企業価値評価へ進める一次選抜数", 60, 150, 90, 10, key="v177_fund_pool", disabled=live_universe_mode not in ("TOPIX＋日経225＋グロースからAI選定TOP50", "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン"))
-        st.caption(f"標準選定：TOPIX＋グロース（旧マザーズ相当の現行市場）→国内売買代金上位{int(universe_size)}→値動きが大きい＋買いサイン→流動性→安値切上げ→国内財務で割安／やや割安。構成一覧には基準日の差があります。")
+        universe_size = TOPIX_SCAN_LIMIT
+        if live_universe_mode == "対象拡大（売買代金上位）":
+            universe_size = c1.number_input("日本株母集団（売買代金上位）", TOPIX_SCAN_LIMIT, 500,
+                                            TOPIX_SCAN_LIMIT, 25, key="v172451_expanded_universe_n")
+        else:
+            c1.metric("日足・財務を取得する新規監視対象", "45銘柄" if live_universe_mode == "固定45銘柄" else f"上位{TOPIX_SCAN_LIMIT}銘柄")
+        c2.caption("保有銘柄は監視対象外でも売り判定のため取得します。")
+        st.caption(f"標準選定：TOPIX＋グロース → 国内売買代金上位{TOPIX_SCAN_LIMIT} → 値動き・買いサイン・流動性・安値切上げ・国内財務を確認。AI選定モードも売買代金で先に絞り込みます。")
         st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
         churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
         st.caption("今回の主ロジックでは短期反転除外を使用しません。")
@@ -5873,12 +5876,17 @@ if run_clicked:
     st.session_state.pop("v172412_history_refresh_required", None)
     universe_error = ""
     try:
-        universe_df = (discover_domestic_topix_turnover100(int(universe_size)) if live_universe_mode == "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン" else discover_topix_nikkei225_stock_universe() if live_universe_mode in ("TOPIX＋日経225＋グロースからAI選定TOP50", "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン")
-                       else pd.DataFrame([
-                           {"コード": c, "銘柄名": STOCK_NAMES[c], "ticker": c + ".T"}
-                           for c in VERIFIED_45_CODES
-                       ]) if live_universe_mode == "固定45銘柄"
-                       else discover_japan_stock_universe(int(universe_size)))
+        if signal_first:
+            universe_df = discover_domestic_turnover_universe("topix_growth")
+        elif live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50":
+            universe_df = discover_domestic_turnover_universe("ai")
+        elif live_universe_mode == "固定45銘柄":
+            universe_df = pd.DataFrame([
+                {"コード": c, "銘柄名": STOCK_NAMES[c], "ticker": c + ".T"}
+                for c in VERIFIED_45_CODES
+            ])
+        else:
+            universe_df = discover_japan_stock_universe(int(universe_size))
     except Exception as exc:
         universe_df = pd.DataFrame()
         universe_error = str(exc)
@@ -5931,8 +5939,7 @@ if run_clicked:
         eligible_count = sum(isinstance(d, pd.DataFrame) and len(d) >= 60
                              for d in mother_data.values())
         value_top50_df, _ = (build_value_ai_top50(
-            mother_data, max_rows=min(50, eligible_count) if live_universe_mode in ("TOPIX＋日経225＋グロースからAI選定TOP50", "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン") else eligible_count,
-            fundamental_pool_size=int(fundamental_pool_size) if live_universe_mode in ("TOPIX＋日経225＋グロースからAI選定TOP50", "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン") else eligible_count,
+            mother_data, max_rows=eligible_count, fundamental_pool_size=eligible_count,
             churn_filter=False,
         ) if eligible_count else (pd.DataFrame(), pd.DataFrame()))
         st.session_state["v177_value_top50"] = value_top50_df
@@ -7424,10 +7431,9 @@ def rank_bottom_research(universe, prices, target_day, valuations):
         if status == '確認済':
             eligible.append((float(x['Turnover'].tail(20).mean()), c, u['銘柄名'], x))
     cov = pd.DataFrame(coverage)
-    complete = len(eligible) == len(universe) and len(eligible) >= 300
+    complete = len(eligible) == len(universe) == TOPIX_SCAN_LIMIT
     eligible.sort(key=lambda r: (-r[0], r[1]))
-    # Missing stocks may change the true TOP300: publish explicitly provisional research.
-    if len(eligible) < 300:
+    if not eligible:
         return pd.DataFrame(), pd.DataFrame(), cov, False
     benchmark = prices.get('1306.T', pd.DataFrame())
     if not benchmark.empty:
@@ -7436,7 +7442,7 @@ def rank_bottom_research(universe, prices, target_day, valuations):
     if len(benchmark) >= 21 and benchmark.index.max() == target:
         bench_return = (benchmark.Close.iloc[-1] / benchmark.Close.iloc[-21] - 1) * 100
     labels = dict(zip(valuations['コード'].astype(str), valuations['割安判定'])) if not valuations.empty and {'コード', '割安判定'}.issubset(valuations.columns) else {}
-    for turnover_rank, (turnover, c, nm, x) in enumerate(eligible[:300], 1):
+    for turnover_rank, (turnover, c, nm, x) in enumerate(eligible, 1):
         close, low, high = x.Close, x.Low, x.High
         bottom_pos = len(x) - 20 + int(np.argmin(low.tail(20).to_numpy()))
         elapsed = len(x) - 1 - bottom_pos
@@ -7484,7 +7490,7 @@ def rank_bottom_research(universe, prices, target_day, valuations):
     audit = pd.DataFrame(rows).sort_values(['研究点', '売買代金順位'], ascending=[False, True]).reset_index(drop=True)
     ranking = audit[audit['研究判定'].eq('上昇転換確認')].copy().reset_index(drop=True)
     ranking.insert(0, '順位', np.arange(1, len(ranking) + 1))
-    scope = '確定TOP300' if complete else '暫定TOP300（未確認銘柄あり）'
+    scope = '事前選抜50銘柄の日足確認済' if complete else '暫定（事前選抜内に日足未確認あり）'
     audit['母集団確認'] = scope
     ranking['母集団確認'] = scope
     return ranking, audit, cov, complete
@@ -7701,17 +7707,17 @@ def render_bottom_trade_decisions(result, valuations, holdings, verified):
 def render_bottom_research(valuations, holdings=None, verified=False):
     st.subheader('底打ち・上昇転換ランキング〈研究〉')
     st.caption('独立売買判定を追加。通常タブの売買・株数には反映しません。研究点は勝率ではありません。確定日足で判定します。')
-    st.write('TOPIX全構成銘柄 → 直近20営業日の平均売買代金上位300 → 底打ち・上昇転換を採点。売買代金は終値×出来高の概算です。')
+    st.write('TOPIX内の取得時点の売買代金上位50銘柄を先に選抜し、確定日足で底打ち・上昇転換を採点します。表の売買代金順位は選抜内の20日平均（終値×出来高の概算）です。')
     st.caption('相対評価はTOPIX連動ETF（1306）の調整後20日騰落率と比較。底打ち否定ラインは観測した安値の参考値です。')
-    if st.button('TOPIX全体から研究ランキングを更新', key='v172437_bottom_run'):
-        st.session_state.pop('v172437_bottom_result', None)
+    if st.button('TOPIX上位50銘柄の研究ランキングを更新', key='v172451_bottom_run'):
+        st.session_state.pop('v172451_bottom_result', None)
         try:
-            with st.spinner('研究専用：TOPIX構成銘柄と6か月日足を確認中。通常更新とは別に数分かかる場合があります…'):
+            with st.spinner('TOPIX売買代金上位50銘柄と比較用ETFの日足を確認中…'):
                 session = latest_tse_session_status()
                 if not session.get('confirmed') or pd.isna(session.get('session_date')):
                     raise ValueError('直近東証日の確定を確認できません。朝または16時以降に再実行してください。')
                 target = str(pd.Timestamp(session['session_date']).date())
-                universe = discover_topix_stock_universe()
+                universe = discover_domestic_turnover_universe("topix")
                 ts = tuple(dict.fromkeys(universe['ticker'].astype(str).tolist() + ['1306.T'] + [str(c) + '.T' for c in (holdings or {})]))
                 started = time.perf_counter()
                 frames = download_bottom_research(ts, target)
@@ -7730,13 +7736,13 @@ def render_bottom_research(valuations, holdings=None, verified=False):
                         if not retry_codes:
                             break
                 ranking, audit, coverage, complete = rank_bottom_research(universe, frames, target, valuations)
-                st.session_state['v172437_bottom_result'] = {'ranking': ranking, 'audit': audit, 'coverage': coverage,
+                st.session_state['v172451_bottom_result'] = {'ranking': ranking, 'audit': audit, 'coverage': coverage,
                     'complete': complete, 'target': target, 'created': tokyo_now().isoformat(),
                     'seconds': round(time.perf_counter() - started, 1), 'universe_count': len(universe),
                     'prices': {t: f for t, f in frames.items() if t == '1306.T' or t[:-2] in set(audit.get('コード', pd.Series(dtype=str)).astype(str)) | set(holdings or {})}}
         except Exception as exc:
             st.error('研究ランキングを更新できませんでした：' + str(exc))
-    result = st.session_state.get('v172437_bottom_result')
+    result = st.session_state.get('v172451_bottom_result')
     if not result:
         st.info('専用ボタンで研究を実行します。通常の判定更新・余力入力では追加取得しません。')
         return
@@ -7745,7 +7751,7 @@ def render_bottom_research(valuations, holdings=None, verified=False):
         st.caption('保存された研究結果です。基準日を確認してください。朝は前営業日の日足が判定対象です。')
     if not result['complete']:
         good = int(result['coverage']['状態'].eq('確認済').sum())
-        st.warning(f"TOPIX {result['universe_count']}銘柄中、確認済み{good}銘柄・未確認{result['universe_count'] - good}銘柄。暫定TOP300として表示します。未確認銘柄の復旧で順位・構成が変わる可能性があります。" if good >= 300 else f"確認済み{good}銘柄のためTOP300を作成できません。300銘柄以上の確認が必要です。")
+        st.warning(f"事前選抜{result['universe_count']}銘柄中、日足確認済み{good}銘柄。確認済みの範囲で暫定表示します。" if good else "確定日足を確認できる研究対象がありません。")
     render_bottom_trade_decisions(result, valuations, holdings or {}, verified)
     if result['ranking'].empty and not result['audit'].empty:
         st.info('上昇転換と財務条件をすべて満たす研究候補は0件です。')
@@ -7753,7 +7759,7 @@ def render_bottom_research(valuations, holdings=None, verified=False):
         show_stock_table(result['ranking'], use_container_width=True, hide_index=True)
     if not result['audit'].empty and '対TOPIX連動ETF20日超過率%' in result['audit'] and result['audit']['対TOPIX連動ETF20日超過率%'].isna().all():
         st.warning('比較用ETFの日足未確認のため、相対強さ10点は未算定です。')
-    with st.expander('TOP300全件・監視銘柄・見送り理由', expanded=False):
+    with st.expander('TOP50全件・監視銘柄・見送り理由', expanded=False):
         audit = result.get('audit')
         if not isinstance(audit, pd.DataFrame) or audit.empty:
             st.info('研究対象の一覧はありません。取得状況を確認して研究ランキングを更新してください。')
@@ -7765,7 +7771,7 @@ def render_bottom_research(valuations, holdings=None, verified=False):
             show_reference_choice_table(audit, candidates=candidates, use_container_width=True, hide_index=True)
     with st.expander('構成銘柄の日足取得状況', expanded=False):
         show_stock_table(result['coverage'], use_container_width=True, hide_index=True)
-    st.caption('財務は通常更新の取得済み評価を照合。研究対象にしかない銘柄は財務未確認として保留します。全件確認時のみ確定TOP300、欠損時は確認済み銘柄内の暫定TOP300です。')
+    st.caption('財務は通常更新の取得済み評価を照合。研究対象にしかない銘柄は財務未確認として保留します。')
     for key in ['ranking', 'audit', 'coverage']:
         st.download_button('研究CSV：' + key, result[key].to_csv(index=False).encode('utf-8-sig'), 'bottom_research_' + key + '.csv', 'text/csv', key='bottom_dl_' + key)
     with st.expander('判定ルール・本番採用前の確認', expanded=False):
@@ -7778,6 +7784,151 @@ def render_bottom_research(valuations, holdings=None, verified=False):
 # ------------------------------------------------------------
 # 短期売買と管理者タブ
 # ------------------------------------------------------------
+SBI_BUY_URL = "https://sbi.alpaca-tech.ai/trade_chance/jp/buy"
+
+
+class _SbiBuyPageText(HTMLParser):
+    """Keep visible text and block boundaries, including text split over inline tags."""
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.hidden_tag = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "template"}:
+            self.hidden_tag = tag
+        elif self.hidden_tag is None and tag in {"h1", "h2", "h3", "div", "p", "li", "br", "tr", "section"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag == self.hidden_tag:
+            self.hidden_tag = None
+        elif self.hidden_tag is None and tag in {"h1", "h2", "h3", "div", "p", "li", "tr", "section"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.hidden_tag is None and data.strip():
+            self.parts.append(" ".join(data.split()) + " ")
+
+
+def parse_sbi_buy_page(html):
+    parser = _SbiBuyPageText()
+    parser.feed(html)
+    text = "".join(parser.parts)
+    stamp = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*終値時点", text)
+    _, heading, body = text.partition("買いシグナル銘柄一覧")
+    if stamp is None or not heading:
+        raise ValueError("SBIの基準日または買いシグナル一覧を確認できません")
+    day = datetime(*map(int, stamp.groups())).date()
+    anchor = re.compile(r"(?<![0-9A-Z])([0-9][0-9A-Z]{3})\s*(?=\d{1,2}\s*/\s*\d{1,2}\s*終値)")
+    cards = list(anchor.finditer(body))
+    rows = {}
+    for i, card in enumerate(cards):
+        end = cards[i + 1].start() if i + 1 < len(cards) else len(body)
+        tally = re.search(r"(\d+)\s*勝\s*[/／]\s*(\d+)\s*敗", body[card.end():end])
+        if tally is None:
+            raise ValueError("SBIの勝敗数を確認できません")
+        wins, losses = map(int, tally.groups())
+        if wins + losses < 10 or wins / (wins + losses) < .6:
+            raise ValueError("SBIの勝敗数が買いシグナル条件と一致しません")
+        c = card[1]
+        preceding = body[:card.start()].rstrip()
+        title = preceding.rsplit("\n", 1)[-1].strip() if preceding else ""
+        rows[c] = (title, wins, losses)
+    if not rows and not re.search(r"(?:該当|買いシグナル.{0,24}点灯).{0,30}(?:ありません|ございません|0件)", " ".join(body.split())):
+        raise ValueError("SBIの銘柄と勝敗数を確認できません")
+    return day, rows
+
+
+@st.cache_data(ttl=600, max_entries=4, show_spinner=False)
+def fetch_sbi_buy_signals(refresh_key):
+    response = requests.get(SBI_BUY_URL, headers={"User-Agent": "Mozilla/5.0"},
+                            timeout=(3.05, 5))
+    response.raise_for_status()
+    return parse_sbi_buy_page(response.content.decode("utf-8-sig"))
+
+
+def sbi_rebound_score(frame, signal_day):
+    """A score for observable rebound conditions using already downloaded daily bars."""
+    columns = ["Close", "High", "Low", "Volume"]
+    if frame is None or len(frame) < 21 or frame.attrs.get("daily_bar_status") != "🟢 当日確定":
+        return None, "確定日足なし"
+    if pd.Timestamp(frame.index[-1]).date() != signal_day or not set(columns).issubset(frame.columns):
+        return None, "SBI基準日の確定日足なし"
+    x = frame[columns].tail(21).apply(pd.to_numeric, errors="coerce")
+    avg_volume = x.Volume.iloc[:-1].mean()
+    if (not np.isfinite(x.to_numpy()).all() or (x[["Close", "High", "Low"]] <= 0).any().any()
+            or (x.Volume < 0).any() or avg_volume <= 0):
+        return None, "日足・出来高の整合性を確認できず"
+    ma5 = x.Close.rolling(5).mean()
+    checks = {
+        "安値更新停止": x.Low.tail(3).min() > x.Low.iloc[-20:-3].min(),
+        "安値切上げ": x.Low.tail(3).min() > x.Low.iloc[-6:-3].min(),
+        "5日高値突破": x.Close.iloc[-1] > x.High.iloc[-6:-1].max(),
+        "5日線改善": ma5.iloc[-1] > ma5.iloc[-2] and x.Close.iloc[-1] > ma5.iloc[-1],
+        "出来高増加": x.Volume.iloc[-1] >= avg_volume * 1.2,
+    }
+    met = [label for label, passed in checks.items() if passed]
+    return len(met) * 20, "・".join(met) or "反発条件未達"
+
+
+def render_sbi_buy_signals(data, held_codes, refresh):
+    st.subheader("追加枠｜SBI買いシグナル")
+    st.caption("SBI勝率は直近1年の過去実績。AIおすすめ度は反発の5条件を各20点で評価した参考値で、上昇確率ではありません。")
+    retry = st.button("SBIシグナルだけ更新", key="sbi_buy_signals_refresh")
+    state_key = "sbi_buy_signal_snapshot"
+    if refresh or retry or state_key not in st.session_state:
+        now = tokyo_now()
+        refresh_key = now.isoformat() if retry else int(now.timestamp()) // 600
+        try:
+            with st.spinner("SBIトレードチャンスを確認中…"):
+                st.session_state[state_key] = (fetch_sbi_buy_signals(refresh_key), "")
+        except (requests.RequestException, ValueError) as exc:
+            st.session_state[state_key] = (None, type(exc).__name__)
+    snapshot, error = st.session_state[state_key]
+    st.markdown("[SBIトレードチャンスを開く](" + SBI_BUY_URL + ")")
+    if snapshot is None:
+        st.warning("SBIシグナルを取得できませんでした。提供元をご確認ください。（" + error + "）")
+        return
+
+    signal_day, signals = snapshot
+    st.caption(f"SBI基準日 {signal_day:%Y/%m/%d} ｜ 朝は前営業日分を参照")
+    now = tokyo_now()
+    current_dates = {pd.Timestamp(frame.index[-1]).date() for frame in data.values()
+                     if not frame.empty and frame.attrs.get("daily_bar_status") == "🟢 当日確定"}
+    latest_day = max(current_dates, default=None)
+    evening_due = (now.hour, now.minute) >= (18, 20)
+    if (signal_day > now.date() or (now.date() - signal_day).days > 10
+            or (latest_day and signal_day < latest_day and (latest_day != now.date() or evening_due))):
+        st.warning("SBI掲載日が現在の基準日と合わないため、候補表示を保留します。")
+        return
+    if not signals:
+        st.info("SBIの買いシグナル点灯銘柄はありません。")
+        return
+
+    held = set(held_codes)
+    rows = []
+    for c, (title, wins, losses) in signals.items():
+        frame = data.get(c + ".T")
+        score, reason = sbi_rebound_score(frame, signal_day)
+        rebound_ready = score is not None and score >= 80 and "安値切上げ" in reason and "5日高値突破" in reason
+        status = "買い検討" if rebound_ready else "買い待ち" if score is not None else "未評価"
+        rows.append({
+            "コード": c,
+            "銘柄名": STOCK_NAMES.get(c, title or c),
+            "SBI買いシグナル": "発生",
+            "SBI勝率": f"{wins / (wins + losses):.1%}",
+            "直近1年": f"{wins}勝{losses}敗",
+            "AIおすすめ度": score,
+            "状態": "保有中" if c in held else status,
+            "AI判定根拠": reason if frame is not None else "今回の日足取得範囲外",
+        })
+    table = pd.DataFrame(rows).sort_values("AIおすすめ度", ascending=False, kind="stable", na_position="last")
+    table["AIおすすめ度"] = table["AIおすすめ度"].map(lambda value: f"{value:.0f}%" if pd.notna(value) else "―")
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption("5条件は安値更新停止・安値切上げ・5日高値突破・5日線改善・出来高増加。80%以上で安値切上げと5日高値突破を満たせば買い検討。日足取得範囲外はSBI実績のみ表示します。")
+
+
 with main_tab:
     st.subheader("通常売買の買い候補")
     st.caption("既存の売買条件・均等配分・終値7%損切りを使用。高配当監視・底打ち研究は通常注文へ自動追加しません。")
@@ -7796,6 +7947,7 @@ with main_tab:
             else:
                 show_stock_table(ifd_table, use_container_width=True, hide_index=True)
                 st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
+    render_sbi_buy_signals(data, held_codes, run_clicked)
     st.caption(f"新規買い：{live_universe_mode}の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定：{'割高・判定不能を除外' if signal_first and block_unrated else '割高を除外・判定不能は許可' if signal_first else '参考表示'}")
     with st.expander("買い待ち・見送り理由", expanded=False):
         st.subheader("買い候補から外れた銘柄・理由")
@@ -8982,7 +9134,7 @@ try:
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
             "買付余力（短期）":short_buying_power,"保有件数":len(held_codes),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
-            "詳細企業価値評価件数設定":int(fundamental_pool_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" else 0,
+            "詳細企業価値評価件数設定":int(universe_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" else 0,
             "固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "売買ロジック":live_trade_method, "Stoch不使用の試験採用":bool(replacement_live), "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(filter_downtrend), "クロス多発除外":bool(filter_churn), "購入予算方式":cap_mode,
@@ -9031,7 +9183,7 @@ try:
             buy_export = pd.DataFrame(columns=buy_cols_default)
         zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
         zf.writestr("buy_candidate_exclusions.csv", excluded_buy_df.to_csv(index=False, encoding="utf-8-sig"))
-        _bottom_saved = st.session_state.get('v172437_bottom_result')
+        _bottom_saved = st.session_state.get('v172451_bottom_result')
         if _bottom_saved:
             if isinstance(_bottom_saved.get('trades'), pd.DataFrame):
                 zf.writestr('bottom_independent_trades.csv', _bottom_saved['trades'].to_csv(index=False, encoding='utf-8-sig'))

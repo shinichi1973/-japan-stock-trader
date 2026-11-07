@@ -19,6 +19,7 @@ import io
 import zipfile
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -40,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.1",
+    page_title="日本株 AI投資アシスタント Ver.17.25.3",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.2 TOP50・SBI自動評価"
-BUILD = "VER17-25-2-TOP50-SBI-AUTO-20261108"
+VERSION = "17.25.3 TOP50・SBI自動評価"
+BUILD = "VER17-25-3-TOP50-SBI-AUTO-20261108"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -7886,29 +7887,37 @@ def fetch_sbi_rebound_scores(codes, signal_day, refresh_key):
     from concurrent.futures import ThreadPoolExecutor
 
     cutoff = pd.Timestamp(signal_day)
+    logger = logging.getLogger(__name__)
+
+    def score_history(frame):
+        if not frame.empty:
+            frame = frame.loc[frame.index <= cutoff].tail(21).copy()
+        if not _usable_daily_cache(frame, cutoff, 21, minimum_bars=21):
+            return None, "SBI基準日の確定日足を確認できず"
+        frame.attrs["daily_bar_status"] = "🟢 当日確定"
+        return sbi_rebound_score(frame, signal_day)
 
     def fetch(c):
         t = c + ".T"
         providers = ("traders", "yahoo")
-        # 既に保存済みの日足があれば、提供元を問わず先に再利用する。
+        # 保存済みの日足を優先し、異常な保存値や取得先のエラーは銘柄単位で扱う。
         for provider in providers:
-            cached = _daily_cache_read(t, provider)
-            if not cached.empty:
-                cached = cached.loc[cached.index <= cutoff].tail(21)
-            if _usable_daily_cache(cached, cutoff, 21, minimum_bars=21):
-                cached.attrs["daily_bar_status"] = "🟢 当日確定"
-                score, reason = sbi_rebound_score(cached, signal_day)
-                if score is not None:
-                    return c, (score, reason)
+            try:
+                score, reason = score_history(_daily_cache_read(t, provider))
+            except Exception:
+                logger.warning("SBI日足キャッシュの確認に失敗: %s (%s)", t, provider, exc_info=True)
+                continue
+            if score is not None:
+                return c, (score, reason)
 
         reason = "SBI基準日の確定日足を取得できず"
         for provider in providers:
-            frame, _, _ = _history_provider(t, cutoff, provider, 21, short_history=True)
-            recent = frame.tail(21)
-            if not _usable_daily_cache(recent, cutoff, 21, minimum_bars=21):
+            try:
+                frame, _, _ = _history_provider(t, cutoff, provider, 21, short_history=True)
+                score, reason = score_history(frame)
+            except Exception:
+                logger.warning("SBI日足の追加評価に失敗: %s (%s)", t, provider, exc_info=True)
                 continue
-            recent.attrs["daily_bar_status"] = "🟢 当日確定"
-            score, reason = sbi_rebound_score(recent, signal_day)
             if score is not None:
                 return c, (score, reason)
         return c, (None, reason)

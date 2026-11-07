@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.4",
+    page_title="日本株 AI投資アシスタント Ver.17.25.5",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.4 TOP50・SBI自動評価"
-BUILD = "VER17-25-4-TOP50-SBI-AUTO-20261108"
+VERSION = "17.25.5 TOP50・SBI自動評価"
+BUILD = "VER17-25-5-TOP50-SBI-AUTO-20261108"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -3782,7 +3782,7 @@ def _history_overlap_compatible(cached, current):
 
 
 def _daily_cache_path(t, provider):
-    if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)) or provider not in ("traders", "yahoo"): raise ValueError("国内日足コード形式不正")
+    if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)) or provider not in ("traders", "yahoo", "sbi"): raise ValueError("国内日足コード形式不正")
     root = os.environ.get("DAILY_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "jp_stock_daily_cache_v21")
     return os.path.join(root, t + "-" + provider + ".json")
 
@@ -7889,7 +7889,7 @@ def fetch_sbi_rebound_scores(codes, signal_day, refresh_key):
     cutoff = pd.Timestamp(signal_day)
     logger = logging.getLogger(__name__)
 
-    def score_history(frame):
+    def score_history(frame, *, save_ticker=None, source=""):
         if frame.empty:
             return None, "有効な日足なし"
         frame = frame.loc[frame.index <= cutoff].tail(21).copy()
@@ -7900,26 +7900,33 @@ def fetch_sbi_rebound_scores(codes, signal_day, refresh_key):
         if not _usable_daily_cache(frame, cutoff, 21, minimum_bars=21):
             return None, "日足の価格・出来高に不整合"
         frame.attrs["daily_bar_status"] = "🟢 当日確定"
-        return sbi_rebound_score(frame, signal_day)
+        score, reason = sbi_rebound_score(frame, signal_day)
+        if score is not None and save_ticker is not None:
+            cache_frame = frame[["Open", "High", "Low", "Close", "Volume"]].rename_axis("Date")
+            cache_frame.attrs["origin"] = source
+            _daily_cache_write(save_ticker, "sbi", cache_frame)
+        return score, reason
 
     def fetch(c):
         t = c + ".T"
         providers = (("traders", "トレーダーズ・ウェブ"), ("yahoo", "Yahoo!ファイナンス日本版"))
         diagnostics = []
-        for provider, label in providers:
+        for provider, label in (("sbi", "SBI評価用キャッシュ"), *providers):
             try:
-                score, reason = score_history(_daily_cache_read(t, provider))
+                cached = _daily_cache_read(t, provider)
+                score, reason = score_history(cached)
             except Exception as exc:
                 diagnostics.append(f"{label}保存値: {type(exc).__name__}: {str(exc)[:160]}")
                 logger.warning("SBI日足キャッシュの確認に失敗: %s (%s)", t, provider, exc_info=True)
                 continue
             if score is not None:
-                return c, (score, reason, label + "（保存値）", " / ".join(diagnostics))
+                source = cached.attrs.get("origin") if provider == "sbi" else label
+                return c, (score, reason, f"{source or label}（保存値）", " / ".join(diagnostics))
 
         for provider, label in providers:
             try:
                 frame, _, message, mode = _history_provider(t, cutoff, provider, 21, short_history=True)
-                score, reason = score_history(frame)
+                score, reason = score_history(frame, save_ticker=t, source=label)
                 diagnostics.append(f"{label}: {reason}" + (f"（{message}）" if message else ""))
             except Exception as exc:
                 diagnostics.append(f"{label}: {type(exc).__name__}: {str(exc)[:160]}")
@@ -7956,7 +7963,9 @@ def fetch_sbi_rebound_scores(codes, signal_day, refresh_key):
                 frame = raw[t] if t in raw.columns.get_level_values(0) else pd.DataFrame()
             else:
                 frame = raw if len(tickers) == 1 else pd.DataFrame()
-            score, reason = score_history(_normalize_ohlcv(frame))
+            score, reason = score_history(
+                _normalize_ohlcv(frame), save_ticker=t, source="Yahoo Finance（東証日足）"
+            )
         except Exception as exc:
             logger.warning("SBI補完日足の評価に失敗: %s", t, exc_info=True)
             score, reason = None, type(exc).__name__
@@ -8004,7 +8013,7 @@ def render_sbi_buy_signals(data, held_codes, refresh):
               for c in signals}
     missing = tuple(sorted(c for c, (score, _, _, _) in scores.items() if score is None))
     if missing:
-        scores_key = "sbi_rebound_scores_v17254"
+        scores_key = "sbi_rebound_scores_v17255"
         signature = (signal_day, missing)
         saved_signature, supplemental = st.session_state.get(scores_key, (None, {}))
         if refresh or retry or saved_signature != signature:
@@ -8081,7 +8090,9 @@ with main_tab:
             else:
                 show_stock_table(ifd_table, use_container_width=True, hide_index=True)
                 st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
+    sbi_started = time.perf_counter()
     render_sbi_buy_signals(data, held_codes, run_clicked)
+    sbi_elapsed = round(time.perf_counter() - sbi_started, 2)
     st.caption(f"新規買い：{live_universe_mode}の未保有株 / 売り：現在保有 {len(held_codes)}銘柄 / 企業価値判定：{'割高・判定不能を除外' if signal_first and block_unrated else '割高を除外・判定不能は許可' if signal_first else '参考表示'}")
     with st.expander("買い待ち・見送り理由", expanded=False):
         st.subheader("買い候補から外れた銘柄・理由")
@@ -9284,7 +9295,9 @@ try:
         sbi_diagnostics = st.session_state.get("sbi_buy_signal_diagnostics")
         if isinstance(sbi_diagnostics, pd.DataFrame):
             zf.writestr("sbi_buy_signal_diagnostics.csv", sbi_diagnostics.to_csv(index=False, encoding="utf-8-sig"))
-        zf.writestr("update_processing_times.csv", pd.DataFrame([{"処理": k, "秒": v} for k, v in st.session_state.get("v172429_update_times", {}).items()]).to_csv(index=False, encoding="utf-8-sig"))
+        update_times = dict(st.session_state.get("v172429_update_times", {}))
+        update_times["SBI欄の処理（今回の表示）"] = sbi_elapsed
+        zf.writestr("update_processing_times.csv", pd.DataFrame([{"処理": k, "秒": v} for k, v in update_times.items()]).to_csv(index=False, encoding="utf-8-sig"))
         zf.writestr("finance_acquisition_status.csv",finance_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
         for mb_filename, mb_frame in (("multibagger_candidates.csv", multibagger_candidates),
                                      ("multibagger_research_audit.csv", multibagger_audit),

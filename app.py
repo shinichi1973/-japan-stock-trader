@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.9",
+    page_title="日本株 AI投資アシスタント Ver.17.25.10",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.9 全処理結果ZIP"
-BUILD = "VER17-25-9-COMPLETE-EXPORT-20261108"
+VERSION = "17.25.10 高配当監視の日足一括取得"
+BUILD = "VER17-25-10-DIVIDEND-DAILY-BATCH-20261108"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -1910,7 +1910,7 @@ def _finance_host(url):
     return urlsplit(url).netloc.lower()
 
 
-def _finance_paced_get(url):
+def _finance_paced_get(url, *, timeout=(15, 20)):
     state = _finance_transport_state()
     host = _finance_host(url)
     with state["lock"]:
@@ -1928,7 +1928,7 @@ def _finance_paced_get(url):
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "text/html", "Accept-Language": "ja,en;q=0.5"})
         state["local"].session = session
-    response = state["local"].session.get(url, timeout=(15, 20))
+    response = state["local"].session.get(url, timeout=timeout)
     with state["lock"]:
         meta["server_failures"] = meta.get("server_failures", 0) + 1 if response.status_code in (500, 502, 503, 504) else 0
         if meta["server_failures"] >= 3:
@@ -3853,7 +3853,7 @@ def _history_overlap_compatible(cached, current):
 
 
 def _daily_cache_path(t, provider):
-    if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)) or provider not in ("traders", "yahoo", "sbi", "bottom"): raise ValueError("国内日足コード形式不正")
+    if not re.fullmatch(r"[0-9A-Za-z]{4,5}\.T", str(t)) or provider not in ("traders", "yahoo", "sbi", "bottom", "dividend"): raise ValueError("国内日足コード形式不正")
     root = os.environ.get("DAILY_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "jp_stock_daily_cache_v21")
     return os.path.join(root, t + "-" + provider + ".json")
 
@@ -3887,7 +3887,7 @@ def _daily_cache_write(t, provider, frame):
             except OSError: pass
 
 
-def _history_provider(t, cutoff, provider, target_bars=150, *, short_history=False):
+def _history_provider(t, cutoff, provider, target_bars=150, *, short_history=False, quick=False):
     cached = _daily_cache_read(t, provider)
     initial = _initial_jp_history().get(t)
     if initial is not None and (cached.empty or len(cached) < len(initial)):
@@ -3900,11 +3900,16 @@ def _history_provider(t, cutoff, provider, target_bars=150, *, short_history=Fal
     parts, seen, errors, overlapping = [], set(), [], False
     limit = 3 if provider == "traders" else min(15, int(math.ceil(target_bars / 20)))
     pages = 0
-    for page in range(1, limit+1):
+    for page in range(1, (1 if quick else limit) + 1):
         url = (f"https://www.traders.co.jp/stocks/61_{code(t)}/historical" + (f"/{page}" if page > 1 else "")
                if provider == "traders" else f"https://finance.yahoo.co.jp/quote/{t}/history?page={page}")
         try:
-            html = _fetch_free_finance_html(url)
+            if quick:
+                response = _finance_paced_get(url, timeout=(3, 5))
+                response.raise_for_status()
+                html = response.content.decode("utf-8", errors="replace")
+            else:
+                html = _fetch_free_finance_html(url)
             title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
             if not title or code(t).upper() not in _finance_plain(title.group(1)).upper(): raise ValueError("日足ページの銘柄コード未確認")
             part = _parse_history_provider(html, provider)
@@ -3932,7 +3937,7 @@ def _history_provider(t, cutoff, provider, target_bars=150, *, short_history=Fal
             if len(overlap_dates): current = current.loc[current.index >= overlap_dates[0]]
             current = pd.concat([cached, current]).loc[lambda x:~x.index.duplicated(keep="last")].sort_index()
         current.attrs["origin"] = origin
-        if not short_history:
+        if not short_history and not quick:
             _daily_cache_write(t, provider, current)
         return current, pages, " / ".join(errors), ("今回取得＋"+origin+"・重複照合済" if origin else "今回取得＋保存履歴") if overlapping else "今回取得"
     return cached, pages, " / ".join(errors), "過去保存値（最終日を確認）" if not cached.empty else "取得不可"
@@ -9422,47 +9427,102 @@ def _complete_dividend_history(frame, cutoff):
 
 
 def load_dividend_watch_prices(tickers, target, reusable=None):
-    """Reuse verified histories and only fetch tickers missing the confirmed date."""
+    """Use verified local histories, then fetch remaining tickers together."""
     from concurrent.futures import ThreadPoolExecutor
 
     cutoff = pd.Timestamp(target).normalize()
     reusable = reusable or {}
-    frames = {t: reusable[t] for t in tickers
-              if t in reusable and _complete_dividend_history(reusable[t], cutoff)}
+    frames, routes, details, domestic = {}, {}, {}, {}
+
+    def accept(ticker, frame, route):
+        if not _complete_dividend_history(frame, cutoff):
+            return False
+        frames[ticker], routes[ticker] = frame.tail(253), route
+        return True
+
+    started = time.perf_counter()
+    for t in tickers:
+        if accept(t, reusable.get(t), "確認済み履歴を再利用"):
+            continue
+        if accept(t, _daily_cache_read(t, "dividend"), "高配当専用キャッシュ"):
+            continue
+        domestic[t] = {provider: _daily_cache_read(t, provider) for provider in ("traders", "yahoo")}
+        for frame in domestic[t].values():
+            if accept(t, frame, "国内日足の保存履歴"):
+                break
+    timings = {"キャッシュ確認": time.perf_counter() - started}
+
     missing = [t for t in tickers if t not in frames]
-
-    def fetch(t):
-        try:
-            saved = {provider: _daily_cache_read(t, provider)
-                     for provider in ("traders", "yahoo")}
-            for frame in saved.values():
-                if _complete_dividend_history(frame, cutoff):
-                    return t, frame.tail(253), "保存履歴"
-
-            # A warm Yahoo history can usually be extended with a single overlap
-            # page. Avoid probing the short Traders history first in that case.
-            # The provider checks matching dates and price basis before joining.
-            if len(saved["yahoo"]) >= 252 and len(saved["traders"]) < 252:
-                raw, _, _, _ = _history_provider(t, cutoff, "yahoo", 252)
-                if _complete_dividend_history(raw, cutoff):
-                    return t, raw.tail(253), "Yahoo!ファイナンスの保存履歴を更新"
-
-            raw, _, _ = _download_domestic_history(t, cutoff, target_bars=252)
-            if (not raw.empty and raw.index[-1] == cutoff
-                    and not raw["Close"].pct_change().tail(60).abs().gt(.40).any()):
-                return t, raw.tail(253), "通常取得"
-        except Exception:
-            logging.getLogger(__name__).warning("高配当監視の日足確認に失敗: %s", t, exc_info=True)
-        return t, None, "未確認"
-
-    routes = {t: "確認済み履歴を再利用" for t in frames}
     if missing:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            for t, frame, route in pool.map(fetch, missing):
-                routes[t] = route
-                if frame is not None:
-                    frames[t] = frame
-    return frames, routes
+        started = time.perf_counter()
+        batch_error = ""
+        try:
+            raw = yf.download(
+                tickers=missing, start=(cutoff - pd.Timedelta(days=410)).date().isoformat(),
+                end=(cutoff + pd.Timedelta(days=1)).date().isoformat(),
+                interval="1d", auto_adjust=False, actions=False, group_by="ticker",
+                progress=False, threads=6, timeout=6,
+            )
+        except Exception as exc:
+            raw, batch_error = None, type(exc).__name__
+        for t in missing:
+            if raw is None or raw.empty:
+                details[t] = "一括取得失敗" + ("：" + batch_error if batch_error else "")
+                continue
+            if isinstance(raw.columns, pd.MultiIndex):
+                one = (raw[t] if t in raw.columns.get_level_values(0)
+                       else raw.xs(t, axis=1, level=1) if t in raw.columns.get_level_values(1)
+                       else None)
+            else:
+                one = raw if len(missing) == 1 else None
+            frame = _normalize_ohlcv(one)
+            frame = frame.loc[frame.index <= cutoff] if not frame.empty else frame
+            # 国内保存分と複数日の重複がある場合は、株式分割などの価格基準も照合する。
+            references = [saved for saved in domestic[t].values() if len(saved) >= 2
+                          and saved.index.max() == cutoff and len(saved.index.intersection(frame.index)) >= 2]
+            if references and not any(_history_overlap_compatible(saved, frame) for saved in references):
+                details[t] = "一括日足と国内保存値の価格基準が不一致"
+            elif accept(t, frame, "Yahoo Finance東証日足・一括取得"):
+                cached = frames[t].rename_axis("Date")
+                cached.attrs["origin"] = routes[t]
+                details[t] = _daily_cache_write(t, "dividend", cached)
+            else:
+                details[t] = f"一括日足の基準日・252本・価格整合を確認できず（{len(frame)}本）"
+        timings["東証日足一括取得・保存"] = time.perf_counter() - started
+
+    def fallback(t):
+        # 既存の国内保存値を優先。最新ページ1枚で更新できる場合だけ補完する。
+        providers = domestic[t]
+        provider = max(providers, key=lambda key: (len(providers[key]), key == "yahoo"))
+        try:
+            frame, _, message, _ = _history_provider(t, cutoff, provider, 252, quick=True)
+        except Exception as exc:
+            frame, message = pd.DataFrame(), type(exc).__name__
+        return t, frame, message
+
+    missing = [t for t in missing if t not in frames]
+    if missing:
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for t, frame, message in pool.map(fallback, missing):
+                details[t] += ("／国内補完：" + message) if message else ""
+                if accept(t, frame, "国内日足・最新ページで補完"):
+                    cached = frames[t].rename_axis("Date")
+                    cached.attrs["origin"] = routes[t]
+                    details[t] += "／" + _daily_cache_write(t, "dividend", cached)
+                    continue
+                # 確認できた短期日足は価格表示に使う。252日条件は判定側で保留する。
+                partial = max(
+                    (x for x in (frame, reusable.get(t), *domestic[t].values())
+                     if _usable_daily_cache(x, cutoff, 1, minimum_bars=1) and len(x) < 252),
+                    key=len, default=None,
+                )
+                if partial is not None:
+                    frames[t], routes[t] = partial, "国内日足・252本未満"
+                else:
+                    routes[t] = "未確認"
+        timings["国内日足の補完"] = time.perf_counter() - started
+    return frames, routes, details, timings
 
 
 def build_dividend_watch(prices, evidence, target, today, buying_power, holdings,
@@ -9538,7 +9598,7 @@ def build_dividend_watch(prices, evidence, target, today, buying_power, holdings
 
 with dividend_tab:
     st.subheader('暴落時・高配当10銘柄の監視')
-    st.caption('基準日が一致する確認済みの日足を再利用し、不足分だけ取得します。')
+    st.caption('確認済みの日足を再利用し、不足銘柄だけ東証日足を一括取得します。')
     with st.expander('監視条件・配当情報の入力', expanded=False):
         div_draw = st.number_input('高値からの下落率（%）以上', 5.0, 60.0, 15.0, 1.0, key='div_draw')
         div_yield = st.number_input('予想配当利回り（%）以上', 0.0, 15.0, 3.5, .1, key='div_yield')
@@ -9574,13 +9634,16 @@ with dividend_tab:
                     raise ValueError('直近取引日の確定を確認できません')
                 target = str(pd.Timestamp(session['session_date']).date())
                 reusable = previous.get('prices', {}) if previous.get('target') == target else {}
-                frames, routes = load_dividend_watch_prices(
+                session_seconds = time.perf_counter() - started
+                frames, routes, details, timings = load_dividend_watch_prices(
                     tuple(c + '.T' for c, _ in DIVIDEND_WATCH), target, reusable)
                 finished = tokyo_now()
                 if phase != (str(finished.date()), finished.hour >= 16):
                     raise ValueError('取得中に判定時間帯が変わりました。再更新してください')
                 st.session_state['div_snapshot'] = {'prices': frames, 'target': target,
-                    'phase': phase, 'routes': routes, 'seconds': time.perf_counter() - started}
+                    'phase': phase, 'routes': routes, 'details': details,
+                    'timings': {'東証基準日確認': session_seconds, **timings},
+                    'seconds': time.perf_counter() - started}
         except Exception as exc:
             export_notice('warning', '高配当日足の更新を保留しました：' + str(exc))
     snap = st.session_state.get('div_snapshot', {})
@@ -9590,10 +9653,12 @@ with dividend_tab:
         export_notice('info', '高配当日足を更新してください。古い保存結果から買い検討は出しません。')
     elif 'routes' in snap:
         routes = snap['routes'].values()
-        reused = sum(route in ('保存履歴', '確認済み履歴を再利用') for route in routes)
-        unconfirmed = sum(route == '未確認' for route in routes)
+        reused = sum(route in ('保存履歴', '確認済み履歴を再利用', '高配当専用キャッシュ',
+                               '国内日足の保存履歴') for route in routes)
+        full = sum(_complete_dividend_history(frame, pd.Timestamp(snap['target']))
+                   for frame in snap['prices'].values())
         st.caption(f"日足確認 {snap['seconds']:.1f}秒 ｜ 基準日 {snap['target']} ｜ "
-                   f"保存履歴の再利用 {reused}/{len(DIVIDEND_WATCH)}銘柄 ｜ 取得できなかった銘柄 {unconfirmed}")
+                   f"保存履歴の再利用 {reused}銘柄 ｜ 252日分確認 {full}/{len(DIVIDEND_WATCH)}銘柄")
     try:
         dividend_watch_df = build_dividend_watch(snap.get('prices', {}), div_evidence,
             snap.get('target') if phase_ok else None, tokyo_now().date(),
@@ -9754,9 +9819,17 @@ try:
         register_result_table("diagnostics/dividend_acquisition.csv", pd.DataFrame([
             {"コード": c, "銘柄名": label, "取得経路": snap.get("routes", {}).get(c + ".T", "未確認"),
              "日足基準日": snap.get("target", ""), "取得秒数（全銘柄）": snap.get("seconds"),
-             "今回の評価に使用": phase_ok and c + ".T" in snap.get("prices", {})}
+             "取得本数": len(snap.get("prices", {}).get(c + ".T", ())),
+             "252日分確認済": phase_ok and _complete_dividend_history(
+                 snap.get("prices", {}).get(c + ".T"), pd.Timestamp(snap["target"])),
+             "今回の評価に使用": phase_ok and c + ".T" in snap.get("prices", {}),
+             "詳細": snap.get("details", {}).get(c + ".T", "")}
             for c, label in DIVIDEND_WATCH
         ]))
+        register_result_table("diagnostics/dividend_processing_times.csv", pd.DataFrame(
+            [{"処理": stage, "秒": round(seconds, 3)} for stage, seconds in snap.get("timings", {}).items()],
+            columns=["処理", "秒"],
+        ))
         register_result_table("results/dividend_settings.csv", pd.DataFrame([{
             "高値からの下落率下限%": div_draw, "予想利回り下限%": div_yield, "配当性向上限%": div_payout,
         }]))

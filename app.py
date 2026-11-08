@@ -41,12 +41,12 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.7",
+    page_title="日本株 AI投資アシスタント Ver.17.25.8",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.7 TOP50・SBI自動評価"
+VERSION = "17.25.8 高配当監視の日足高速化"
 BUILD = "VER17-25-7-TOP50-SBI-AUTO-20261108"
 TOPIX_SCAN_LIMIT = 50
 
@@ -9457,25 +9457,57 @@ DIVIDEND_WATCH = (
 )
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_dividend_watch_prices(tickers, target):
-    """252日高値の計算に、共通キャッシュの指標計算前の日足を使う。"""
+def _complete_dividend_history(frame, cutoff):
+    """Retain the prior close used by the 252-session discontinuity check."""
+    if not isinstance(frame, pd.DataFrame):
+        return False
+    window = frame.tail(253)
+    return (_usable_daily_cache(window, cutoff, 252)
+            and not pd.to_numeric(window["Close"], errors="coerce").pct_change().tail(252).abs().gt(.40).any())
+
+
+def load_dividend_watch_prices(tickers, target, reusable=None):
+    """Reuse verified histories and only fetch tickers missing the confirmed date."""
     from concurrent.futures import ThreadPoolExecutor
 
-    cutoff = pd.Timestamp(target)
+    cutoff = pd.Timestamp(target).normalize()
+    reusable = reusable or {}
+    frames = {t: reusable[t] for t in tickers
+              if t in reusable and _complete_dividend_history(reusable[t], cutoff)}
+    missing = [t for t in tickers if t not in frames]
 
     def fetch(t):
         try:
+            saved = {provider: _daily_cache_read(t, provider)
+                     for provider in ("traders", "yahoo")}
+            for frame in saved.values():
+                if _complete_dividend_history(frame, cutoff):
+                    return t, frame.tail(253), "保存履歴"
+
+            # A warm Yahoo history can usually be extended with a single overlap
+            # page. Avoid probing the short Traders history first in that case.
+            # The provider checks matching dates and price basis before joining.
+            if len(saved["yahoo"]) >= 252 and len(saved["traders"]) < 252:
+                raw, _, _, _ = _history_provider(t, cutoff, "yahoo", 252)
+                if _complete_dividend_history(raw, cutoff):
+                    return t, raw.tail(253), "Yahoo!ファイナンスの保存履歴を更新"
+
             raw, _, _ = _download_domestic_history(t, cutoff, target_bars=252)
             if (not raw.empty and raw.index[-1] == cutoff
                     and not raw["Close"].pct_change().tail(60).abs().gt(.40).any()):
-                return t, raw
+                return t, raw.tail(253), "通常取得"
         except Exception:
             logging.getLogger(__name__).warning("高配当監視の日足確認に失敗: %s", t, exc_info=True)
-        return t, None
+        return t, None, "未確認"
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        return {t: frame for t, frame in pool.map(fetch, tickers) if frame is not None}
+    routes = {t: "確認済み履歴を再利用" for t in frames}
+    if missing:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for t, frame, route in pool.map(fetch, missing):
+                routes[t] = route
+                if frame is not None:
+                    frames[t] = frame
+    return frames, routes
 
 
 def build_dividend_watch(prices, evidence, target, today, buying_power, holdings,
@@ -9551,7 +9583,7 @@ def build_dividend_watch(prices, evidence, target, today, buying_power, holdings
 
 with dividend_tab:
     st.subheader('暴落時・高配当10銘柄の監視')
-    st.caption('高配当10銘柄は、基準日が一致する共通の日足キャッシュを優先します。252営業日分が足りない場合に追加取得します。')
+    st.caption('基準日が一致する確認済みの日足を再利用し、不足分だけ取得します。')
     with st.expander('監視条件・配当情報の入力', expanded=False):
         div_draw = st.number_input('高値からの下落率（%）以上', 5.0, 60.0, 15.0, 1.0, key='div_draw')
         div_yield = st.number_input('予想配当利回り（%）以上', 0.0, 15.0, 3.5, .1, key='div_yield')
@@ -9576,22 +9608,37 @@ with dividend_tab:
             div_evidence = pd.DataFrame()
     div_refresh = st.button('高配当10銘柄の日足を更新', key='div_refresh')
     if run_clicked or div_refresh:
-        st.session_state.pop('div_snapshot', None)
+        previous = st.session_state.pop('div_snapshot', {})
+        phase_now = tokyo_now()
+        phase = (str(phase_now.date()), phase_now.hour >= 16)
+        started = time.perf_counter()
         try:
             with st.spinner('高配当10銘柄の確定日足を確認中…'):
                 session = latest_tse_session_status()
                 if not session.get('confirmed') or pd.isna(session.get('session_date')):
                     raise ValueError('直近取引日の確定を確認できません')
                 target = str(pd.Timestamp(session['session_date']).date())
-                frames = load_dividend_watch_prices(tuple(c + '.T' for c, _ in DIVIDEND_WATCH), target)
+                reusable = previous.get('prices', {}) if previous.get('target') == target else {}
+                frames, routes = load_dividend_watch_prices(
+                    tuple(c + '.T' for c, _ in DIVIDEND_WATCH), target, reusable)
+                finished = tokyo_now()
+                if phase != (str(finished.date()), finished.hour >= 16):
+                    raise ValueError('取得中に判定時間帯が変わりました。再更新してください')
                 st.session_state['div_snapshot'] = {'prices': frames, 'target': target,
-                    'phase': (str(tokyo_now().date()), tokyo_now().hour >= 16)}
+                    'phase': phase, 'routes': routes, 'seconds': time.perf_counter() - started}
         except Exception as exc:
             st.warning('高配当日足の更新を保留しました：' + str(exc))
     snap = st.session_state.get('div_snapshot', {})
-    phase_ok = snap.get('phase') == (str(tokyo_now().date()), tokyo_now().hour >= 16)
+    div_now = tokyo_now()
+    phase_ok = snap.get('phase') == (str(div_now.date()), div_now.hour >= 16)
     if not phase_ok:
         st.info('高配当日足を更新してください。古い保存結果から買い検討は出しません。')
+    elif 'routes' in snap:
+        routes = snap['routes'].values()
+        reused = sum(route in ('保存履歴', '確認済み履歴を再利用') for route in routes)
+        unconfirmed = sum(route == '未確認' for route in routes)
+        st.caption(f"日足確認 {snap['seconds']:.1f}秒 ｜ 基準日 {snap['target']} ｜ "
+                   f"保存履歴の再利用 {reused}/{len(DIVIDEND_WATCH)}銘柄 ｜ 取得できなかった銘柄 {unconfirmed}")
     try:
         dividend_watch_df = build_dividend_watch(snap.get('prices', {}), div_evidence,
             snap.get('target') if phase_ok else None, tokyo_now().date(),

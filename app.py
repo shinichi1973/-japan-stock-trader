@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.8",
+    page_title="日本株 AI投資アシスタント Ver.17.25.9",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.8 高配当監視の日足高速化"
-BUILD = "VER17-25-7-TOP50-SBI-AUTO-20261108"
+VERSION = "17.25.9 全処理結果ZIP"
+BUILD = "VER17-25-9-COMPLETE-EXPORT-20261108"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -55,6 +55,70 @@ TRADINGVIEW_QUOTES_CACHE = {}
 JQUANTS_CALL_TIMES = []
 JQUANTS_CALL_LOCK = threading.Lock()
 
+
+
+
+# Collect generated outputs within this Streamlit run. Existing result state is
+# rendered again on reruns, and exporting never executes a separate analysis.
+_export_frames = {}
+_export_files = {}
+_export_messages = []
+_export_metrics = []
+
+
+def register_result_table(filename, data, *, include_index=False):
+    if isinstance(data, pd.DataFrame):
+        _export_frames[filename] = (data, include_index)
+
+
+def export_dataframe(data, *args, export_name="", **kwargs):
+    frame = data.data if isinstance(getattr(data, "data", None), pd.DataFrame) else data
+    register_result_table("tables/" + str(export_name) + ".csv", frame,
+                          include_index=kwargs.get("hide_index") is not True)
+    return st.dataframe(data, *args, **kwargs)
+
+
+def export_download_button(label, data, file_name=None, *args, **kwargs):
+    # Templates are inputs, so only capture generated downloads.
+    if file_name and "ひな形" not in label and "書式" not in label:
+        _export_files["results/" + file_name] = (data, label)
+    return st.download_button(label, data, file_name, *args, **kwargs)
+
+
+def export_notice(level, body, *args, **kwargs):
+    _export_messages.append({"種別": level, "内容": str(body)})
+    return getattr(st, level)(body, *args, **kwargs)
+
+
+def export_metric(container, label, value, *args, **kwargs):
+    _export_metrics.append({"項目": label, "値": value})
+    return container.metric(label, value, *args, **kwargs)
+
+
+def register_result_prices(filename, frames):
+    parts = []
+    for ticker, frame in frames.items():
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            parts.append(frame.rename_axis("日付").reset_index().assign(ティッカー=ticker))
+    if parts:
+        register_result_table(filename, pd.concat(parts, ignore_index=True))
+
+
+def write_registered_results(archive):
+    if _export_messages:
+        register_result_table("diagnostics/messages.csv", pd.DataFrame(_export_messages))
+    if _export_metrics:
+        register_result_table("diagnostics/metrics.csv", pd.DataFrame(_export_metrics))
+    manifest = {name: {"ファイル": name, "区分": "基本結果", "件数": ""}
+                for name in archive.namelist()}
+    for name, (frame, include_index) in _export_frames.items():
+        archive.writestr(name, frame.to_csv(index=include_index).encode("utf-8-sig"))
+        manifest[name] = {"ファイル": name, "区分": "一覧・診断", "件数": len(frame)}
+    for name, (payload, label) in _export_files.items():
+        archive.writestr(name, payload)
+        manifest[name] = {"ファイル": name, "区分": label, "件数": ""}
+    archive.writestr("export_manifest.csv", pd.DataFrame(manifest.values()).assign(
+        出力日時=tokyo_now().isoformat()).to_csv(index=False).encode("utf-8-sig"))
 
 
 def valuation_display_rank(value):
@@ -130,25 +194,25 @@ def annotate_reference_choice(data, context=None, candidates=None):
     return out
 
 
-def show_reference_choice_table(data, context=None, candidates=None, **kwargs):
+def show_reference_choice_table(data, context=None, candidates=None, *, export_name='', **kwargs):
     table = annotate_reference_choice(data, context, candidates)
     if isinstance(table, pd.DataFrame) and 'AI参考選択' in table:
         chosen = table[table['AI参考選択'].ne('')]
         if not chosen.empty:
             row = chosen.iloc[0]
-            st.info(f"★ AI参考候補：{row['コード']} {row.get('銘柄名', '')} ｜ {row['AI比較理由']}")
+            export_notice('info', f"★ AI参考候補：{row['コード']} {row.get('銘柄名', '')} ｜ {row['AI比較理由']}")
         else:
             st.caption('AI参考候補：比較対象なし')
         st.caption('黄色の1行は表内の相対比較です。取得済み指標による規則式で、買い条件の通過や上昇を保証しません。見送り理由・判定保留を優先して確認してください。')
         styled = table.style.apply(lambda row: ['background-color: #fff2b3; color: #17202a; font-weight: 700'
                                     if row['AI参考選択'] else '' for _ in row], axis=1)
-        return st.dataframe(styled, **kwargs)
-    return st.dataframe(table, **kwargs)
+        return export_dataframe(styled, **kwargs, export_name=export_name)
+    return export_dataframe(table, **kwargs, export_name=export_name)
 
 
-def show_stock_table(data, *args, **kwargs):
+def show_stock_table(data, *args, export_name='', **kwargs):
     """全タブで銘柄判定を先頭に、割安順を標準表示する。"""
-    return st.dataframe(prepare_stock_table(data), *args, **kwargs)
+    return export_dataframe(prepare_stock_table(data), *args, **kwargs, export_name=export_name)
 
 
 def tokyo_now():
@@ -3133,9 +3197,9 @@ def render_public_research_logic():
     with st.expander("🧪 公開研究ロジックの比較", expanded=False):
         st.caption("トレンド追随の着想を現行GCと比較します。この研究比較は旧条件の3銘柄上限・終値7%損切り・翌日始値で検証します（現在の実売買の上限解除は未反映）。資金・予算・注文方式は下で指定します。全方式に200日以上の日足を要求します。独立3案では売り判定と候補順位もStochを使いません。FinRLの期間分割・コスト評価の考え方を取り入れた検証で、学習済みAIモデルではありません。")
         st.caption("過去の構成銘柄と当時の財務判定を再現しない参考検証です。後半30%も既存検証で見た可能性があり、未使用データとは断定できません。結果による自動切替は行いません。")
-        st.info("保存済みの参考値では55日方式が有望でしたが、現在のTOPIX全体での優位性は未確認です。正式採用は行わず、初期設定は現行GCを維持します。")
+        export_notice('info', "保存済みの参考値では55日方式が有望でしたが、現在のTOPIX全体での優位性は未確認です。正式採用は行わず、初期設定は現行GCを維持します。")
         st.caption("保存済み結果：10/7の拡大対象履歴・有効344銘柄（6銘柄除外）、初期60万円・片道10bps。TOPIX全体の検証ではなく、現在の割高除外と候補順位も再現していません。")
-        show_stock_table(pd.DataFrame(PUBLIC_RESEARCH_RESULTS_20261012), use_container_width=True, hide_index=True)
+        show_stock_table(pd.DataFrame(PUBLIC_RESEARCH_RESULTS_20261012), use_container_width=True, hide_index=True, export_name='public_research_reference')
         upload = st.file_uploader("比較用5年日足ZIP / CSV", type=["zip", "csv"], key="v17246_research_upload")
         initial = st.number_input("ロジック比較の初期資金（円）", 10000, 200000000, 600000, 10000, key="v17248_initial")
         budget = st.selectbox("ロジック比較の1銘柄予算", ["10万円", "資産の3分の1（従来）", "15万円", "20万円"], key="v17248_budget")
@@ -3176,15 +3240,15 @@ def render_public_research_logic():
                             z.writestr(f"{i:02d}_{suffix}.csv", export.to_csv(index=False, encoding="utf-8-sig"))
                 st.session_state["v17248_research_result"] = {"params": params, "result": result, "exclusions": exclusions, "zip": buf.getvalue()}
             except Exception as exc:
-                st.error(f"研究比較を実行できませんでした：{exc}")
+                export_notice('error', f"研究比較を実行できませんでした：{exc}")
         saved = st.session_state.get("v17248_research_result")
         if saved and saved["params"] == params:
-            show_stock_table(saved["result"], use_container_width=True, hide_index=True)
+            show_stock_table(saved["result"], use_container_width=True, hide_index=True, export_name='public_research_comparison')
             if not saved["exclusions"].empty:
-                show_stock_table(saved["exclusions"], use_container_width=True, hide_index=True)
-            st.download_button("比較結果ZIP（条件・売買明細・資産推移）", saved["zip"], "public_logic_comparison.zip", "application/zip", key="v17248_download")
+                show_stock_table(saved["exclusions"], use_container_width=True, hide_index=True, export_name='public_research_exclusions')
+            export_download_button("比較結果ZIP（条件・売買明細・資産推移）", saved["zip"], "public_logic_comparison.zip", "application/zip", key="v17248_download")
         elif saved:
-            st.info("日足または比較条件が変わりました。比較を再実行してください。")
+            export_notice('info', "日足または比較条件が変わりました。比較を再実行してください。")
         st.markdown("研究元：[AQRのトレンド追随研究](https://www.aqr.com/insights/research/journal-article/a-century-of-evidence-on-trend-following-investing) / [FinRL論文](https://arxiv.org/abs/2011.09607)")
 
 
@@ -3196,7 +3260,7 @@ def render_allocation_research():
             with st.spinner("拡大対象と5年日足を取得中…"):
                 broad = discover_japan_stock_universe(int(n))
                 if broad.empty:
-                    st.error("拡大対象を取得できません。後で再実行してください。")
+                    export_notice('error', "拡大対象を取得できません。後で再実行してください。")
                 else:
                     fixed = pd.DataFrame([{"コード":c,"銘柄名":name(c),"ticker":c+".T"} for c in VERIFIED_45_CODES])
                     combined = pd.concat([broad,fixed], ignore_index=True).drop_duplicates("コード")
@@ -3206,13 +3270,13 @@ def render_allocation_research():
                         for filename,frame in [("backtest_history_5y.csv",hist),("backtest_universe.csv",combined),("expanded_universe.csv",broad),("backtest_history_failures.csv",failed)]:
                             z.writestr(filename,frame.to_csv(index=False,encoding="utf-8-sig"))
                     st.session_state["v1724_history_zip"] = buf.getvalue()
-                    st.success(f"取得：{hist['コード'].nunique() if not hist.empty else 0}銘柄 / 失敗：{len(failed)}件")
+                    export_notice('success', f"取得：{hist['コード'].nunique() if not hist.empty else 0}銘柄 / 失敗：{len(failed)}件")
         if st.session_state.get("v1724_history_zip"):
-            st.download_button("比較用5年日足ZIPを保存",st.session_state["v1724_history_zip"],"ver17_allocation_history_5y.zip","application/zip",key="v1724_history_dl")
+            export_download_button("比較用5年日足ZIPを保存",st.session_state["v1724_history_zip"],"ver17_allocation_history_5y.zip","application/zip",key="v1724_history_dl")
         uploaded = st.file_uploader("比較用5年日足ZIPまたはCSV",type=["zip","csv"],key="v1724_history_upload")
         payload = uploaded.getvalue() if uploaded else st.session_state.get("v1724_history_zip")
         if payload is None:
-            st.info("上の作成ボタン、または過去日足のアップロードで準備できます。")
+            export_notice('info', "上の作成ボタン、または過去日足のアップロードで準備できます。")
             return
         try:
             broad_codes = None
@@ -3228,8 +3292,8 @@ def render_allocation_research():
                 history = pd.read_csv(io.BytesIO(payload),dtype={"コード":str})
             frames, split_aware, history_exclusions = prepare_allocation_history(history)
             if not history_exclusions.empty:
-                st.warning(f"履歴の異常・不足で{len(history_exclusions)}銘柄を除外しています。")
-                show_stock_table(history_exclusions, use_container_width=True, hide_index=True)
+                export_notice('warning', f"履歴の異常・不足で{len(history_exclusions)}銘柄を除外しています。")
+                show_stock_table(history_exclusions, use_container_width=True, hide_index=True, export_name='allocation_research_history_exclusions')
             all_dates = sorted(set(d for x in frames.values() for d in x.index))
             first,last = all_dates[0].date(),all_dates[-1].date()
             start = st.date_input("比較開始日", min(last,first+timedelta(days=120)),min_value=first,max_value=last,key="v1724_start")
@@ -3239,21 +3303,21 @@ def render_allocation_research():
             bt_normal_cap = st.number_input("比較時の通常注文予算上限（円）",10000,2000000,100000,10000,key="v1724_bt_normal_cap")
             st.caption("この比較は旧条件です（現在の実売買の上限解除は未反映）。全案：最大3銘柄、終値判定→翌取引日始値。自動方式は通常注文の予算内で100株単位、不可ならS株最大99株。優先度は%Kの低い順→コード。5%の価格余裕と注文余力引当を適用。IFDOCOの日中利確・逆指値はこの比較に含めません。")
             if not split_aware:
-                st.warning("旧CSVには分割イベントがありません。株数・100株単位の比較には、上のボタンで新しく作成したZIPを使用してください。")
+                export_notice('warning', "旧CSVには分割イベントがありません。株数・100株単位の比較には、上のボタンで新しく作成したZIPを使用してください。")
                 return
             st.caption("Yahooの分割調整OHLCを分割イベントで当時価格へ近似復元します。配当現金収入、税金、併合端数の現金交付、売却余力の翌朝までの拘束は再現しません。欠損日による売却待ちは明細の件数で確認してください。")
             fixed_missing = sorted(set(VERIFIED_45_CODES)-set(frames))
             if fixed_missing:
-                st.error("固定45銘柄に日足不足があります："+", ".join(fixed_missing)+"。同じ条件で比較するため再取得してください。")
+                export_notice('error', "固定45銘柄に日足不足があります："+", ".join(fixed_missing)+"。同じ条件で比較するため再取得してください。")
                 return
             groups = [("固定45",set(VERIFIED_45_CODES))]
             expanded = (broad_codes if broad_codes is not None else set(frames)) | set(VERIFIED_45_CODES)
             if expanded-set(VERIFIED_45_CODES):
                 groups.append(("拡大対象＋45",expanded))
             else:
-                st.warning("この日足は固定45銘柄だけです。対象拡大の比較には拡大対象ZIPを作成してください。")
+                export_notice('warning', "この日足は固定45銘柄だけです。対象拡大の比較には拡大対象ZIPを作成してください。")
             if broad_codes and broad_codes-set(frames):
-                st.warning(f"拡大対象の日足不足：{len(broad_codes-set(frames))}銘柄。取得できた銘柄での参考比較になります。")
+                export_notice('warning', f"拡大対象の日足不足：{len(broad_codes-set(frames))}銘柄。取得できた銘柄での参考比較になります。")
             if st.button("同じ資金で比較を実行",key="v1724_compare"):
                 if start >= end:
                     raise ValueError("開始日は終了日より前にしてください")
@@ -3276,8 +3340,13 @@ def render_allocation_research():
             if results:
                 params=st.session_state["v1724_comparison_params"]
                 st.caption(f"表示中の結果：{params['開始']}～{params['終了']} / 初期資金{params['初期資金']:,}円 / 片道{params['片道bps']}bps。通常注文上限{params.get('通常注文予算', 100000):,}円。入力変更後は再実行してください。")
-                show_stock_table(pd.DataFrame([r[0] for r in results]),use_container_width=True,hide_index=True)
-                st.line_chart(pd.concat([r[2].set_index("日付")["総資産"].rename(r[0]["対象"]+" / "+r[0]["配分"]) for r in results],axis=1))
+                show_stock_table(pd.DataFrame([r[0] for r in results]),use_container_width=True,hide_index=True, export_name='allocation_comparison_summary')
+                equity_curves = pd.concat([
+                    r[2].set_index("日付")["総資産"].rename(r[0]["対象"] + " / " + r[0]["配分"])
+                    for r in results
+                ], axis=1)
+                register_result_table("results/allocation_equity_curves.csv", equity_curves, include_index=True)
+                st.line_chart(equity_curves)
                 buf=io.BytesIO()
                 with ZipFile(buf,"w") as z:
                     z.writestr("comparison.csv",pd.DataFrame([r[0] for r in results]).to_csv(index=False,encoding="utf-8-sig"))
@@ -3286,9 +3355,9 @@ def render_allocation_research():
                     for i,(summary,trades,curve,opened) in enumerate(results):
                         for key,frame in [("trades",trades),("equity",curve),("open_positions",opened)]:
                             z.writestr(f"scenario_{i:02d}_{key}.csv",frame.to_csv(index=False,encoding="utf-8-sig"))
-                st.download_button("配分比較の結果ZIP",buf.getvalue(),"ver17_allocation_comparison.zip","application/zip",key="v1724_results_dl")
+                export_download_button("配分比較の結果ZIP",buf.getvalue(),"ver17_allocation_comparison.zip","application/zip",key="v1724_results_dl")
         except Exception as exc:
-            st.error(f"比較データを処理できません：{exc}")
+            export_notice('error', f"比較データを処理できません：{exc}")
 
 
 def build_fixed45_purchase_plan(candidates, buying_power, current_assets, held_codes,
@@ -5507,7 +5576,7 @@ def render_current_holdings(rows):
     if not rows:
         show_stock_table(pd.DataFrame([{
             "銘柄コード": "", "銘柄名": "NO DATA", "保有株数": "", "判定": "", "銘柄判定": "",
-        }]), use_container_width=True, hide_index=True, height=120)
+        }]), use_container_width=True, hide_index=True, height=120, export_name='holdings_no_data')
         return
     sell_count = sum(row["判定"] == "売り" for row in rows)
     keep_count = sum(row["判定"] == "保有継続" for row in rows)
@@ -5593,7 +5662,7 @@ def admin_judgement_table(df, key, maximum=520):
                 ).index.to_numpy()]
         st.caption(f"{order}・{len(df)}件表示")
     show_stock_table(df, use_container_width=True, hide_index=True,
-                 height=admin_table_height(df, maximum))
+                 height=admin_table_height(df, maximum), export_name=key)
 
 
 
@@ -5615,6 +5684,8 @@ if _cache_url and st.session_state.get("precomputed_bundle_phase") != _cache_pha
         st.session_state["precomputed_bundle_phase"] = _cache_phase
     except Exception as _cache_error:
         st.warning("事前キャッシュを取得できません。通常取得へ切り替えます: " + str(_cache_error)[:160])
+        _export_messages.append({"種別": "warning", "内容": "事前キャッシュ取得失敗・通常取得へ切替",
+                                 "詳細": type(_cache_error).__name__})
 st.caption("日足・国内財務・共通指標：保存済みデータを優先。期限切れ・不足分は通常取得し、既存の鮮度判定を適用します。")
 
 # Validation captures outputs only; no extra network requests or account access.
@@ -5776,7 +5847,7 @@ if trade_files:
                 for _, r in holdings_auto_df.iterrows()
             }
     if parse_errors:
-        st.warning("一部CSVを読めませんでした：\n- " + "\n- ".join(parse_errors))
+        export_notice('warning', "一部CSVを読めませんでした：\n- " + "\n- ".join(parse_errors))
 all_held_codes = list(confirmed.keys())
 short_confirmed = confirmed
 held_codes = all_held_codes
@@ -5785,7 +5856,7 @@ short_buying_power = int(buying_power)
 order_inputs_ready = buying_power_input is not None
 holdings_verified = bool(not sbi_trades_df.empty and not parse_errors and sbi_warning_df.empty) if trade_files else False
 if not sbi_warning_df.empty:
-    st.error("履歴不足の可能性がある銘柄があります。警告対象は安全のため保有復元から除外しています。")
+    export_notice('error', "履歴不足の可能性がある銘柄があります。警告対象は安全のため保有復元から除外しています。")
 
 # ------------------------------------------------------------
 # 管理者設定は目立たせない
@@ -5805,7 +5876,7 @@ with admin_tab:
         replacement_live = live_trade_method == "55日高値更新＋MA200（試験採用）"
         st.caption("試験採用：買い＝前日までの55日高値を終値で更新＋終値>MA200、売り＝前日までの20日安値を終値で割る、または取得単価から終値7%損切り。候補は63日騰落率順。Stochは売買・順位に使いません。")
         if replacement_live:
-            st.warning("拡大344銘柄の過去比較では有望ですが、TOPIX全体と財務除外込みの成績は未検証です。保有銘柄の売り条件もこの方式へ切り替わります。")
+            export_notice('warning', "拡大344銘柄の過去比較では有望ですが、TOPIX全体と財務除外込みの成績は未検証です。保有銘柄の売り条件もこの方式へ切り替わります。")
         block_unrated = True
         st.caption("国内財務の判定不能は新規買いを見送ります。")
         min_turnover = st.number_input("買い候補の20日平均売買代金下限（円・最低1億円）", 100000000, 10000000000, 100000000, 10000000, key="v172416_liquidity", disabled=not signal_first)
@@ -5826,10 +5897,10 @@ with admin_tab:
         a1, a2, a3, a4 = st.columns(4)
         current_assets = a1.number_input("現在資産（円）", 10000, 200000000, 600000, 10000, key="v177_assets")
         maxbuy = "上限なし（買付余力内）"
-        a2.metric("1銘柄の購入予算", "上限なし")
+        export_metric(a2, "1銘柄の購入予算", "上限なし")
         sl = a3.slider("損切りセンサー（%）", 3.0, 15.0, 7.0, .5, key="v177_sl", disabled=True)
         maxpos = None
-        a4.metric("最大保有銘柄数", "上限なし")
+        export_metric(a4, "最大保有銘柄数", "上限なし")
         b1, b2, b3, b4 = st.columns(4)
         reserve_pct = b1.slider("現金温存率（%）", 0, 80, 0, 5, key="v177_reserve", disabled=True)
         daily_deploy_pct = b2.slider("1日使用上限（%）", 10, 100, 100, 5, key="v177_daily", disabled=True)
@@ -5841,7 +5912,7 @@ with admin_tab:
             universe_size = c1.number_input("日本株母集団（売買代金上位）", TOPIX_SCAN_LIMIT, 500,
                                             TOPIX_SCAN_LIMIT, 25, key="v172451_expanded_universe_n")
         else:
-            c1.metric("日足・財務を取得する新規監視対象", "45銘柄" if live_universe_mode == "固定45銘柄" else f"上位{TOPIX_SCAN_LIMIT}銘柄")
+            export_metric(c1, "日足・財務を取得する新規監視対象", "45銘柄" if live_universe_mode == "固定45銘柄" else f"上位{TOPIX_SCAN_LIMIT}銘柄")
         c2.caption("保有銘柄は監視対象外でも売り判定のため取得します。")
         st.caption(f"標準選定：TOPIX＋グロース → 国内売買代金上位{TOPIX_SCAN_LIMIT} → 値動き・買いサイン・流動性・安値切上げ・国内財務を確認。AI選定モードも売買代金で先に絞り込みます。")
         st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
@@ -5903,11 +5974,11 @@ if run_clicked:
         universe_error = str(exc)
     st.session_state["v1724_loaded_mode"] = live_universe_mode
     if universe_df.empty:
-        st.error("対象銘柄の取得に失敗しました。保有銘柄のみ確認します。" + universe_error)
+        export_notice('error', "対象銘柄の取得に失敗しました。保有銘柄のみ確認します。" + universe_error)
     else:
         STOCK_NAMES.update(dict(zip(universe_df["コード"].astype(str), universe_df["銘柄名"].astype(str))))
         if universe_df.attrs.get("universe_notice"):
-            st.warning(universe_df.attrs["universe_notice"])
+            export_notice('warning', universe_df.attrs["universe_notice"])
         if "対象指数" in universe_df.columns:
             index_tags = universe_df["対象指数"].astype(str)
             st.caption(f"監視対象：TOPIX {index_tags.str.contains('TOPIX').sum()}銘柄／日経225 {index_tags.str.contains('日経225').sum()}銘柄／グロース {index_tags.str.contains('グロース').sum()}銘柄／重複除外後 {len(universe_df)}銘柄")
@@ -6036,11 +6107,11 @@ if not run_clicked and short_confirmed:
         for _message in sync_post_input_holdings(st.session_state, short_confirmed,
                                                 signal_first, replacement_live,
                                                 tokyo_now(), time.time()):
-            st.warning(_message)
+            export_notice('warning', _message)
 
 if st.session_state.get("v172429_update_times"):
     with st.expander("更新処理の所要時間", expanded=False):
-        show_stock_table(pd.DataFrame([{"処理": k, "秒": v} for k, v in st.session_state["v172429_update_times"].items()]), hide_index=True)
+        show_stock_table(pd.DataFrame([{"処理": k, "秒": v} for k, v in st.session_state["v172429_update_times"].items()]), hide_index=True, export_name='processing_times')
         st.caption("通信と一次選抜の実測値です。この後の売買表作成・画面描画時間は含みません。短時間の再更新は保存結果を再利用します。")
 
 universe_df = st.session_state.get("v177_universe_df", pd.DataFrame())
@@ -6061,9 +6132,9 @@ if not daily_acquisition_df.empty:
     _scan_complete_for_buy = bool(_required_codes) and not _missing_scan
     _unconfirmed_holdings = set(map(str, all_held_codes)) - _confirmed_codes
     if _unconfirmed_holdings:
-        st.warning("保有銘柄の日足未確認：" + "、".join(sorted(_unconfirmed_holdings)) + "。該当銘柄の売買判定は保留します。")
+        export_notice('warning', "保有銘柄の日足未確認：" + "、".join(sorted(_unconfirmed_holdings)) + "。該当銘柄の売買判定は保留します。")
     if _missing_scan:
-        st.warning(f"銘柄選定は未完了です：TOP{len(_required_codes)}中{len(_required_codes & _confirmed_codes)}銘柄のみ日足確認済。未確認{len(_missing_scan)}銘柄は個別に判定保留とし、確認済み銘柄は判定を継続します。全対象の確認は未完了です。")
+        export_notice('warning', f"銘柄選定は未完了です：TOP{len(_required_codes)}中{len(_required_codes & _confirmed_codes)}銘柄のみ日足確認済。未確認{len(_missing_scan)}銘柄は個別に判定保留とし、確認済み銘柄は判定を継続します。全対象の確認は未完了です。")
 
 
 # ------------------------------------------------------------
@@ -6230,13 +6301,13 @@ if not signal_audit_df.empty:
                        ("クロス反転検査", "DCが")]
             _breakdown = [{"条件": label, "買いサイン内の除外数": int(signal_first_audit_df["抽出除外理由"].str.contains(pattern, regex=False, na=False).sum())}
                           for label, pattern in _checks]
-            st.dataframe(pd.DataFrame(_breakdown), hide_index=True, use_container_width=True)
+            export_dataframe(pd.DataFrame(_breakdown), hide_index=True, use_container_width=True, export_name='buy_exclusion_breakdown')
             st.caption("同じ銘柄が複数条件に該当するため、除外数は重複します。財務条件は各銘柄の見送り理由を確認してください。")
 
 if signal_first and not signal_first_audit_df.empty:
     with st.expander("TOPIX＋日経225＋グロース買いシグナルの抽出・見送り理由", expanded=False):
         st.caption(f"買いシグナル抽出 {len(signal_first_audit_df)}銘柄 / 財務判定不能による見送り {value_unrated_count}銘柄。" + ("通過候補はATR比率の大きい順。" if replacement_live else "通過候補はATR比率の大きい順。入口変更後の収益性は未検証。"))
-        show_stock_table(signal_audit_df[signal_audit_df["現行買い"].eq(True)], use_container_width=True, hide_index=True)
+        show_stock_table(signal_audit_df[signal_audit_df["現行買い"].eq(True)], use_container_width=True, hide_index=True, export_name='current_buy_signals')
 
 if not signal_audit_df.empty and "買い見送り理由" in signal_audit_df.columns:
     overvalued_buy_exclusions_df = signal_audit_df[
@@ -6587,13 +6658,13 @@ def _fl_backtest(prices, events, discount=0.25, fee_bps=10.0, improved=False):
 def render_fundamental_lab():
     st.subheader("🧪 ファンダメンタル単独・2年バックテスト")
     st.caption("研究専用です。今日の買い・売り判定には反映しません。ストキャスティクスは使いません。")
-    st.info("無料プランは過去2年・12週間遅延です。財務履歴の取得には対象銘柄数に応じて時間がかかります。")
+    export_notice('info', "無料プランは過去2年・12週間遅延です。財務履歴の取得には対象銘柄数に応じて時間がかかります。")
     st.caption("元の条件と改善案を同じ日足・財務履歴・手数料で比較します。改善案はROE 8%以上、50日・200日線が20営業日前より上、損切り後30日間は同銘柄を再購入しない、翌寄付が前日終値から5%以上下落したら見送ります。現行売買画面には反映しません。")
     source = st.file_uploader("5年日足ZIP（管理者タブで出力したファイル）", type="zip", key="fl_zip")
     history_upload = st.file_uploader("保存済み財務履歴CSV（再取得せず比較する場合）", type="csv", key="fl_history_upload")
     key = jquants_api_key()
     if not key and history_upload is None:
-        st.error("JQUANTS_API_KEY がSecretsにありません。")
+        export_notice('error', "JQUANTS_API_KEY がSecretsにありません。")
         return
     if source is None:
         st.caption("管理者 → 企業価値 → バックテスト用5年日足データからZIPを保存して読み込んでください。")
@@ -6602,7 +6673,7 @@ def render_fundamental_lab():
         raw = source.getvalue()
         prices = _fl_history_from_zip(raw)
     except Exception as exc:
-        st.error(f"日足ZIPを読めません: {exc}")
+        export_notice('error', f"日足ZIPを読めません: {exc}")
         return
     codes = sorted(prices["code"].unique())
     st.caption(f"日足: {len(codes)}銘柄。現時点の母集団を遡る検証であり、過去に上場廃止した銘柄は含まれません。")
@@ -6630,10 +6701,10 @@ def render_fundamental_lab():
         st.caption("この画面を開いたまま待ち、進捗を確認する場合は『進捗を更新』を押してください。")
         st.button("進捗を更新", key="fl_refresh")
     if state["fatal"]:
-        st.error(state["fatal"])
+        export_notice('error', state["fatal"])
     if state["errors"]:
         with st.expander(f"取得エラー {len(state['errors'])}銘柄"):
-            show_stock_table(pd.DataFrame([{"コード":c,"理由":v} for c,v in state["errors"].items()]))
+            show_stock_table(pd.DataFrame([{"コード":c,"理由":v} for c,v in state["errors"].items()]), export_name='fundamental_lab_errors')
     if history_upload is not None:
         try:
             events = pd.read_csv(io.BytesIO(history_upload.getvalue()), dtype={"code":str})
@@ -6649,7 +6720,7 @@ def render_fundamental_lab():
             complete_input = set(codes).issubset(set(events["code"]))
             st.caption(f"保存済み履歴: {events['code'].nunique()}銘柄。CSVから再計算します。")
         except Exception as exc:
-            st.error(f"財務履歴CSVを読めません: {exc}")
+            export_notice('error', f"財務履歴CSVを読めません: {exc}")
             return
     else:
         if not state["rows"]:
@@ -6657,7 +6728,7 @@ def render_fundamental_lab():
         events = _fl_events(state)
         complete_input = len(state["done"]) == len(codes) and not state["errors"]
     if not events.empty:
-        st.download_button("取得済み財務履歴CSVを保存", events.to_csv(index=False).encode("utf-8-sig"),
+        export_download_button("取得済み財務履歴CSVを保存", events.to_csv(index=False).encode("utf-8-sig"),
                            "fundamental_history_observed.csv", "text/csv", key="fl_export")
     discount = st.slider("買い時の必要割安率", 10, 50, 25, 5, format="%d%%", key="fl_discount")
     fee_bps = st.number_input("片道の売買コスト（bps）", 0., 100., 10., 1., key="fl_fee")
@@ -6671,19 +6742,19 @@ def render_fundamental_lab():
                 results.append((summary, trades, curve, open_positions))
             st.session_state.fl_result = (results, complete_input)
         except Exception as exc:
-            st.error(f"バックテストを実行できません: {exc}")
+            export_notice('error', f"バックテストを実行できません: {exc}")
     if "fl_result" in st.session_state:
         results, complete = st.session_state.fl_result
-        st.warning("一部銘柄のみの途中結果です。全銘柄の比較には使わないでください。" if not complete else
+        export_notice('warning', "一部銘柄のみの途中結果です。全銘柄の比較には使わないでください。" if not complete else
                    "現在の母集団による研究結果です。上場廃止銘柄の欠落と株式分割の近似調整に注意してください。")
-        show_stock_table(pd.DataFrame([r[0] for r in results]), use_container_width=True, hide_index=True)
+        show_stock_table(pd.DataFrame([r[0] for r in results]), use_container_width=True, hide_index=True, export_name='fundamental_lab_summary')
         st.line_chart(pd.concat([r[2].set_index("日付")["総資産"].rename(r[0]["条件"])
                                  for r in results], axis=1))
         for summary, trades, curve, open_positions in results:
             with st.expander(f"{summary['条件']}：決済と未決済の内訳"):
-                show_stock_table(trades, use_container_width=True, hide_index=True)
+                show_stock_table(trades, use_container_width=True, hide_index=True, export_name='fundamental_lab_trades')
                 st.caption("最終評価値は売却時の手数料を差し引く前の評価です。")
-                show_stock_table(open_positions, use_container_width=True, hide_index=True)
+                show_stock_table(open_positions, use_container_width=True, hide_index=True, export_name='fundamental_lab_open_positions')
         buf = io.BytesIO()
         with ZipFile(buf, "w") as zf:
             zf.writestr("comparison.csv", pd.DataFrame([r[0] for r in results]).to_csv(index=False, encoding="utf-8-sig"))
@@ -6692,7 +6763,7 @@ def render_fundamental_lab():
                 for name, frame in (("trades", trades), ("equity", curve), ("open_positions", open_positions)):
                     zf.writestr(f"{suffix}_{name}.csv", frame.to_csv(index=False, encoding="utf-8-sig"))
             zf.writestr("fundamentals.csv", events.to_csv(index=False, encoding="utf-8-sig"))
-        st.download_button("比較結果ZIP", buf.getvalue(), "fundamental_lab_comparison_2y.zip", "application/zip", key="fl_results")
+        export_download_button("比較結果ZIP", buf.getvalue(), "fundamental_lab_comparison_2y.zip", "application/zip", key="fl_results")
 
 
 # ------------------------------------------------------------
@@ -6938,7 +7009,7 @@ def render_triple_news_pick(compare, freshness, price_data, held_codes, values, 
     if not candidates:
         status = "最新確定日足・割高除外後に3指標一致の対象がありません。"
     if result and result.get("取得失敗件数", 0):
-        st.warning(f"ニュース取得失敗：{result['取得失敗件数']}銘柄。一推しは取得できた対象の中での暫定評価です。")
+        export_notice('warning', f"ニュース取得失敗：{result['取得失敗件数']}銘柄。一推しは取得できた対象の中での暫定評価です。")
     if selected:
         st.write(f"**{selected['code']}　{selected['name']}**")
         st.write("**選定理由：** " + selected["reason"])
@@ -6947,27 +7018,27 @@ def render_triple_news_pick(compare, freshness, price_data, held_codes, values, 
         reasons, plan = triple_news_purchase_status(selected, buy_view, signal_audit, held_codes, buying_power, block_unrated)
         if reasons:
             if "株数未計算" in str(plan.get("買付可否", "")):
-                st.info("買い候補・株数未計算：余力を下部で入力してください。" + " / ".join(reasons))
+                export_notice('info', "買い候補・株数未計算：余力を下部で入力してください。" + " / ".join(reasons))
             else:
-                st.warning("注文条件の確認：" + " / ".join(reasons))
+                export_notice('warning', "注文条件の確認：" + " / ".join(reasons))
         else:
-            st.success(f"現行システムの買い条件・注文計画も一致：参考{int(plan.get('参考購入株数', 0))}株 / {plan.get('注文区分', '')}")
+            export_notice('success', f"現行システムの買い条件・注文計画も一致：参考{int(plan.get('参考購入株数', 0))}株 / {plan.get('注文区分', '')}")
             st.caption("上の株数は既存の買いTOP3内の注文です。追加で重複注文しないでください。")
         for e in selected["evidence"][:3]:
             st.link_button(f"{e['published_date']}｜{e['title'] or e['publisher']}", e["url"])
             st.write(e.get("detected", e["fact"]))
         st.caption("日時はRSSの公開時刻です。見出しのみの評価で、材料の発生日や本文は未確認です。")
     else:
-        st.info("今日の一推し：該当なし。" + ("出典付きの有力材料を確認できませんでした。" if status == "完了" else status))
+        export_notice('info', "今日の一推し：該当なし。" + ("出典付きの有力材料を確認できませんでした。" if status == "完了" else status))
     if result:
         st.caption(f"調査時刻 {result.get('generated_at', '')} / 比較対象 {len(candidates)}銘柄 / 評価方式 {result.get('model') or model}")
     st.caption("3つの点灯は独立した3つの証拠ではありません。無料材料評価の選定効果は未検証です。売り・損切りと買付余力による注文計画を適用します。")
     with st.expander("一推しの比較・見送り理由", expanded=False):
         if result and result.get("assessments"):
             audit = pd.DataFrame([{ "コード": a["code"], "銘柄名": a["name"], "無料材料評価（勝率ではない）": a["assessment"], "銘柄判定": a["value_status"], "理由": a["reason"], "注意点": a["risk"], "見送り理由": a["skip_reason"]} for a in result["assessments"]])
-            show_stock_table(audit, use_container_width=True, hide_index=True)
+            show_stock_table(audit, use_container_width=True, hide_index=True, export_name='triple_news_pick_audit')
         if not exclusions.empty:
-            show_stock_table(exclusions, use_container_width=True, hide_index=True)
+            show_stock_table(exclusions, use_container_width=True, hide_index=True, export_name='triple_news_pick_exclusions')
     return result, exclusions, signature
 
 
@@ -7326,7 +7397,7 @@ def annotate_multibagger_choice(audit):
 
 def render_multibagger_choice(frame):
     if frame.empty:
-        st.info("AI参考選択：該当なし。主要条件を満たす候補がないため、選定を見送ります。")
+        export_notice('info', "AI参考選択：該当なし。主要条件を満たす候補がないため、選定を見送ります。")
         return
     row = frame.sort_values("AI参考順位").iloc[0]
     st.markdown(f"**AIならこの候補：{row['コード']} {row['銘柄名']}**")
@@ -7337,13 +7408,13 @@ def render_multibagger_choice(frame):
 
 def render_multibagger_cards(frame, limit=3):
     if frame.empty:
-        st.info("大化け候補の条件を満たす銘柄はありません。評価保留の理由は大化け候補タブで確認できます。")
+        export_notice('info', "大化け候補の条件を満たす銘柄はありません。評価保留の理由は大化け候補タブで確認できます。")
     for r in frame.head(limit).to_dict("records"):
         st.markdown(f"**{r['コード']} {r['銘柄名']}**　研究点 {r['研究点']:.1f} / 100")
         st.write(f"{r['研究判定']} ／ AI参考順位 {r['AI参考順位']}")
         st.write(f"今日の買いと一致：{r['今日の買いと一致']} ／ 銘柄判定：{r['銘柄判定']}")
         if r["未確認項目数"]:
-            st.warning("未確認のリスク：" + r["財務健全性確認"])
+            export_notice('warning', "未確認のリスク：" + r["財務健全性確認"])
         st.caption("根拠：" + r["選定根拠"])
         st.caption("確認：" + r["確認するリスク"])
 
@@ -7665,10 +7736,10 @@ def render_bottom_trade_decisions(result, valuations, holdings, verified):
         for c in selected:
             registrations[c] = st.date_input(c + ' の購入日', value=None, key='bottom_entry_day_' + c)
         if not verified:
-            st.warning('保有CSVの照合が完了していません。売り判定は保留します。')
+            export_notice('warning', '保有CSVの照合が完了していません。売り判定は保留します。')
     frames = result.get('prices', {})
     if not frames:
-        st.info('独立判定用の日足を取得するため、研究ランキングを更新してください。')
+        export_notice('info', '独立判定用の日足を取得するため、研究ランキングを更新してください。')
         return
     table = build_bottom_trade_decisions(result['audit'], frames, result['target'], valuations,
                                         holdings, registrations if verified else {})
@@ -7680,7 +7751,7 @@ def render_bottom_trade_decisions(result, valuations, holdings, verified):
         table['保存時判定'] = table['独立売買判定']
         table['独立売買判定'] = '判定保留'
         table['判定理由'] = '研究結果の基準日が最新確定日と一致しないか、営業日未確認。研究ランキングを更新してください'
-        st.warning('保存結果の鮮度を確認できないため、売買判定を保留しています。')
+        export_notice('warning', '保存結果の鮮度を確認できないため、売買判定を保留しています。')
     if not table.empty:
         audit = result.get('audit', pd.DataFrame())
         condition_cols = [c for c in audit.columns if c.startswith('条件_')]
@@ -7700,7 +7771,7 @@ def render_bottom_trade_decisions(result, valuations, holdings, verified):
         table['見送り理由'] = table['判定理由'].where(table['独立売買判定'].isin(['見送り', '判定保留', '対象外']), '')
     result['trades'] = table
     if table.empty:
-        st.info('判定対象がありません。日足取得状況を確認してください。')
+        export_notice('info', '判定対象がありません。日足取得状況を確認してください。')
         return
     leading = ['コード', '銘柄名', '独立売買判定', '判定理由', '現在株価', '買い指値_参考',
                '買付上限_参考', '利確指値_参考', '損切り逆指値_参考', '損切り幅%', '損益比', '銘柄判定']
@@ -7709,21 +7780,21 @@ def render_bottom_trade_decisions(result, valuations, holdings, verified):
         st.markdown('**' + title + '**')
         part = table[table['独立売買判定'].isin(statuses)]
         if part.empty:
-            st.info('該当なし')
+            export_notice('info', '該当なし')
         else:
-            show_stock_table(part[[c for c in columns + ['保有株数', '取得単価', '損益率%', '参考売却株数'] if c in part]], use_container_width=True, hide_index=True)
+            show_stock_table(part[[c for c in columns + ['保有株数', '取得単価', '損益率%', '参考売却株数'] if c in part]], use_container_width=True, hide_index=True, export_name='bottom_trade_' + ('buy' if title == '買い候補' else 'holdings'))
     st.markdown('**全件の条件判定・買い待ち・見送り理由**')
     detail_cols = ['銘柄判定', 'コード', '銘柄名', '独立売買判定', '買い待ち理由', '見送り理由', '判定理由']
     detail_cols += [c for c in table if c.startswith('条件_')]
     detail_cols += [c for c in table if c not in detail_cols]
-    show_reference_choice_table(table[detail_cols], candidates=table.loc[table['独立売買判定'].isin(['買い待ち', '見送り']), 'コード'], use_container_width=True, hide_index=True)
+    show_reference_choice_table(table[detail_cols], candidates=table.loc[table['独立売買判定'].isin(['買い待ち', '見送り']), 'コード'], use_container_width=True, hide_index=True, export_name='bottom_trade_decision_details')
     st.caption('翌営業日の参考指値です。買付上限を超える場合は見送り、買い指値で約定しなければ追いかけません。利確2R・損切り最大7%の価格を示します。購入後はCSVの取得単価と購入日前の日足で再計算します。上値余地条件と価格の丸め後に買い可否を再確認します。')
     st.caption('売りは確定終値で判定します。場中に既存OCOが約定したかは日足では判別しません。逆指値後は成行の参考案で、窓開け時の損失は7%を超える場合があります。S株にはIFDOCOを使えません。自動発注は行いません。')
     with st.expander('独立判定の初期ルール'):
         st.write('買い：上昇転換確認＋研究点75以上＋出来高1.2倍以上＋底から12%以内＋割安/適正＋損切り幅1〜7%＋観測上値まで2R以上。研究点にはRSI改善を含みます。')
         st.write('損切り：購入前20日安値−0.25ATRと取得単価×93%の高い方。利確：取得単価＋損切り幅の2倍。売り：終値が損切り/固定底値を割る、利確目標到達、または購入後に10日線を終値で2日連続下回る。購入前データだけで決済ラインを固定し、後日の安値更新では引き下げません。')
         st.write('上値余地：直近60日の取得価格を上回る最高値と取得価格＋3ATRの低い方。閾値は初期案で、過去時点の構成銘柄・財務・翌日約定・費用を含む成績検証は未実施です。')
-    st.download_button('独立売買判定CSV', table.to_csv(index=False).encode('utf-8-sig'),
+    export_download_button('独立売買判定CSV', table.to_csv(index=False).encode('utf-8-sig'),
                        'bottom_independent_trades.csv', 'text/csv', key='bottom_independent_csv')
 
 
@@ -7764,39 +7835,39 @@ def render_bottom_research(valuations, holdings=None, verified=False):
                     'seconds': round(time.perf_counter() - started, 1), 'universe_count': len(universe),
                     'prices': {t: f for t, f in frames.items() if t == '1306.T' or t[:-2] in set(audit.get('コード', pd.Series(dtype=str)).astype(str)) | set(holdings or {})}}
         except Exception as exc:
-            st.error('研究ランキングを更新できませんでした：' + str(exc))
+            export_notice('error', '研究ランキングを更新できませんでした：' + str(exc))
     result = st.session_state.get('v172451_bottom_result')
     if not result:
-        st.info('専用ボタンで研究を実行します。通常の判定更新・余力入力では追加取得しません。')
+        export_notice('info', '専用ボタンで研究を実行します。通常の判定更新・余力入力では追加取得しません。')
         return
     st.caption(f"日足基準日 {result['target']} ／ 実行日時 {result['created']} ／ 取得処理 {result['seconds']}秒")
     if result['target'] != str(tokyo_now().date()):
         st.caption('保存された研究結果です。基準日を確認してください。朝は前営業日の日足が判定対象です。')
     if not result['complete']:
         good = int(result['coverage']['状態'].eq('確認済').sum())
-        st.warning(f"事前選抜{result['universe_count']}銘柄中、日足確認済み{good}銘柄。確認済みの範囲で暫定表示します。" if good else "確定日足を確認できる研究対象がありません。")
+        export_notice('warning', f"事前選抜{result['universe_count']}銘柄中、日足確認済み{good}銘柄。確認済みの範囲で暫定表示します。" if good else "確定日足を確認できる研究対象がありません。")
     render_bottom_trade_decisions(result, valuations, holdings or {}, verified)
     if result['ranking'].empty and not result['audit'].empty:
-        st.info('上昇転換と財務条件をすべて満たす研究候補は0件です。')
+        export_notice('info', '上昇転換と財務条件をすべて満たす研究候補は0件です。')
     elif not result['ranking'].empty:
-        show_stock_table(result['ranking'], use_container_width=True, hide_index=True)
+        show_stock_table(result['ranking'], use_container_width=True, hide_index=True, export_name='bottom_research_ranking')
     if not result['audit'].empty and '対TOPIX連動ETF20日超過率%' in result['audit'] and result['audit']['対TOPIX連動ETF20日超過率%'].isna().all():
-        st.warning('比較用ETFの日足未確認のため、相対強さ10点は未算定です。')
+        export_notice('warning', '比較用ETFの日足未確認のため、相対強さ10点は未算定です。')
     with st.expander('TOP50全件・監視銘柄・見送り理由', expanded=False):
         audit = result.get('audit')
         if not isinstance(audit, pd.DataFrame) or audit.empty:
-            st.info('研究対象の一覧はありません。取得状況を確認して研究ランキングを更新してください。')
+            export_notice('info', '研究対象の一覧はありません。取得状況を確認して研究ランキングを更新してください。')
         elif not {'研究判定', 'コード'}.issubset(audit.columns):
-            st.warning('研究結果に必要な項目が不足しています。研究ランキングを更新してください。AI参考候補は選択できません。')
-            show_stock_table(audit, use_container_width=True, hide_index=True)
+            export_notice('warning', '研究結果に必要な項目が不足しています。研究ランキングを更新してください。AI参考候補は選択できません。')
+            show_stock_table(audit, use_container_width=True, hide_index=True, export_name='bottom_research_audit')
         else:
             candidates = audit.loc[~audit['研究判定'].eq('上昇転換確認'), 'コード']
-            show_reference_choice_table(audit, candidates=candidates, use_container_width=True, hide_index=True)
+            show_reference_choice_table(audit, candidates=candidates, use_container_width=True, hide_index=True, export_name='bottom_research_ai_reference')
     with st.expander('構成銘柄の日足取得状況', expanded=False):
-        show_stock_table(result['coverage'], use_container_width=True, hide_index=True)
+        show_stock_table(result['coverage'], use_container_width=True, hide_index=True, export_name='bottom_research_coverage')
     st.caption('財務は通常更新の取得済み評価を照合。研究対象にしかない銘柄は財務未確認として保留します。')
     for key in ['ranking', 'audit', 'coverage']:
-        st.download_button('研究CSV：' + key, result[key].to_csv(index=False).encode('utf-8-sig'), 'bottom_research_' + key + '.csv', 'text/csv', key='bottom_dl_' + key)
+        export_download_button('研究CSV：' + key, result[key].to_csv(index=False).encode('utf-8-sig'), 'bottom_research_' + key + '.csv', 'text/csv', key='bottom_dl_' + key)
     with st.expander('判定ルール・本番採用前の確認', expanded=False):
         st.write('底の形40点（安値更新停止20・安値切上げ20）、上昇転換30点（高値突破15・5日線改善10・RSI改善5）、出来高20点、対ETF強さ10点。')
         st.write('安値切上げは底から6営業日以上経過後、直近3日安値がその前3日安値を上回る条件。底から12%超上昇は購入検討保留。数値は未検証の初期設定です。')
@@ -8010,7 +8081,8 @@ def render_sbi_buy_signals(data, held_codes, refresh, value_by_code, buying_powe
     snapshot, error = st.session_state[state_key]
     st.markdown("[SBIトレードチャンスを開く](" + SBI_BUY_URL + ")")
     if snapshot is None:
-        st.warning("SBIシグナルを取得できませんでした。提供元をご確認ください。（" + error + "）")
+        register_result_table("diagnostics/sbi_signal_status.csv", pd.DataFrame([{"状態": "取得失敗", "詳細": error}]))
+        export_notice('warning', "SBIシグナルを取得できませんでした。提供元をご確認ください。（" + error + "）")
         return
 
     signal_day, signals = snapshot
@@ -8021,10 +8093,14 @@ def render_sbi_buy_signals(data, held_codes, refresh, value_by_code, buying_powe
     evening_due = (now.hour, now.minute) >= (18, 20)
     if (signal_day > now.date() or (now.date() - signal_day).days > 10
             or (latest_day and signal_day < latest_day and (latest_day != now.date() or evening_due))):
-        st.warning("SBI掲載日が現在の基準日と合わないため、候補表示を保留します。")
+        register_result_table("diagnostics/sbi_signal_status.csv", pd.DataFrame([{"状態": "基準日不一致", "SBI基準日": signal_day, "通常判定日": latest_day}]))
+        export_notice('warning', "SBI掲載日が現在の基準日と合わないため、候補表示を保留します。")
         return
+    register_result_table("diagnostics/sbi_signal_status.csv", pd.DataFrame([
+        {"状態": "取得済", "SBI基準日": signal_day, "シグナル件数": len(signals)}
+    ]))
     if not signals:
-        st.info("SBIの買いシグナル点灯銘柄はありません。")
+        export_notice('info', "SBIの買いシグナル点灯銘柄はありません。")
         return
 
     scores = {}
@@ -8073,7 +8149,7 @@ def render_sbi_buy_signals(data, held_codes, refresh, value_by_code, buying_powe
     top3 = table.loc[evaluated & table["状態"].ne("保有中")].head(3)
     st.markdown("#### SBI買いシグナル TOP3（参考）")
     if top3.empty:
-        st.info("AI評価済みの未保有銘柄はありません。")
+        export_notice('info', "AI評価済みの未保有銘柄はありません。")
     purchase_by_code = {}
     if buying_power is not None and not top3.empty:
         plan = build_fixed45_purchase_plan(
@@ -8083,11 +8159,15 @@ def render_sbi_buy_signals(data, held_codes, refresh, value_by_code, buying_powe
         purchase_by_code = plan.set_index("コード").to_dict("index")
     if not top3.empty:
         st.caption("株価はSBI基準日の確定終値。参考株数は、入力余力をSBI TOP3内だけで均等配分した場合の目安です。")
+    top3_export = []
     for rank, row in enumerate(top3.to_dict("records"), 1):
         c, status, price = row["コード"], row["状態"], row["現在株価"]
         valuation = value_by_code.get(c) or valuation_at_price(c + ".T", price)
         price_text = _mobile_number(price, 0 if float(price).is_integer() else 1, "円")
         purchase = purchase_by_code.get(c)
+        top3_export.append({"順位": rank, "SBI基準日": signal_day, **row, "銘柄判定": valuation,
+                            "参考購入株数": purchase["購入株数"] if purchase is not None else None,
+                            "注文区分": purchase["注文区分"] if purchase is not None else ""})
         shares_text = ""
         if purchase is not None:
             shares = int(purchase["購入株数"])
@@ -8106,10 +8186,13 @@ def render_sbi_buy_signals(data, held_codes, refresh, value_by_code, buying_powe
             f'AI {row["AIおすすめ度"]:.0f}%', detail,
         )
 
+    top3_columns = ["順位", "SBI基準日", *table.columns, "銘柄判定", "参考購入株数", "注文区分"]
+    register_result_table("results/sbi_buy_signal_top3.csv", pd.DataFrame(top3_export, columns=top3_columns))
+    register_result_table("results/sbi_buy_signal_all.csv", table.assign(SBI基準日=signal_day))
     st.markdown("#### SBI買いシグナル一覧")
     table["SBI勝率"] = table["SBI勝率"].map(lambda value: f"{value:.1%}")
     table["AIおすすめ度"] = table["AIおすすめ度"].map(lambda value: f"{value:.0f}%" if pd.notna(value) else "―")
-    st.dataframe(table.drop(columns="現在株価"), use_container_width=True, hide_index=True)
+    export_dataframe(table.drop(columns="現在株価"), use_container_width=True, hide_index=True, export_name='sbi_buy_signals_display')
     st.caption("5条件は安値更新停止・安値切上げ・5日高値突破・5日線改善・出来高増加。80%以上で安値切上げと5日高値突破を満たせば買い検討。日足を確認できない銘柄は未評価と理由を表示します。")
 
 
@@ -8118,19 +8201,19 @@ with main_tab:
     st.subheader("通常売買の買い候補")
     st.caption("既存の売買条件・均等配分・終値7%損切りを使用。高配当監視・底打ち研究は通常注文へ自動追加しません。")
     if buy_view.empty:
-        st.info("監視対象に、現在の買い条件を満たす銘柄はありません。")
+        export_notice('info', "監視対象に、現在の買い条件を満たす銘柄はありません。")
     else:
         render_mobile_trade_cards(buy_view, "buy", trend_by_code)
         simple_buy_cols=[c for c in ["急騰予兆判定","割安判定","順位","コード","銘柄名","現在株価","均等配分予算","参考購入株数","注文区分","通常注文参考株数","通常注文概算額","%K","%D","買付可否"] if c in buy_view.columns]
         with st.expander("買い候補の詳細表", expanded=False):
             buy_display = buy_view[simple_buy_cols].rename(columns={"割安判定": "銘柄判定"}).copy()
-            show_stock_table(buy_display, use_container_width=True, hide_index=True)
+            show_stock_table(buy_display, use_container_width=True, hide_index=True, export_name='buy_display')
             st.caption("100株単位・参考IFDOCO")
             ifd_table = build_reference_ifdoco(buy_view, ifd_take_profit, 7.0)
             if ifd_table.empty:
-                st.info("余力入力後に参考IFDOCOを計算します。" if not order_inputs_ready else "予算・注文余力内で100株買える正式買い候補はありません。")
+                export_notice('info', "余力入力後に参考IFDOCOを計算します。" if not order_inputs_ready else "予算・注文余力内で100株買える正式買い候補はありません。")
             else:
-                show_stock_table(ifd_table, use_container_width=True, hide_index=True)
+                show_stock_table(ifd_table, use_container_width=True, hide_index=True, export_name='ifd_table')
                 st.caption("買い指値は最新終値の参考値。約定しない場合があります。呼値・値幅・SBIの注文受付を確認し、実際の約定価格に応じて売り条件を見直してください。逆指値売却は成行の参考案で、価格は保証されません。")
     sbi_started = time.perf_counter()
     render_sbi_buy_signals(
@@ -8150,21 +8233,23 @@ with main_tab:
         excluded_buy_df = build_buy_exclusions(signal_audit_df, buy_view, held_codes,
                                                st.session_state.get('v172437_previous_buys', []))
         if excluded_buy_df.empty:
-            st.info("今回の買いサインから見送った銘柄はありません。")
+            export_notice('info', "今回の買いサインから見送った銘柄はありません。")
         else:
-            show_reference_choice_table(excluded_buy_df, context=signal_audit_df, use_container_width=True, hide_index=True)
+            show_reference_choice_table(excluded_buy_df, context=signal_audit_df, use_container_width=True, hide_index=True, export_name='excluded_buy_df')
         st.caption("今回の買いサインの見送り、およびこの起動中に直前の買い候補から外れた銘柄です。再起動前の候補履歴は含みません。")
     st.subheader("🔻 売り")
     if sell_view.empty:
-        st.success("売り候補はありません。")
+        export_notice('success', "売り候補はありません。")
     else:
         render_mobile_trade_cards(sell_view, "sell", trend_by_code)
         with st.expander("売り候補の詳細表", expanded=False):
             sell_display = sell_view.rename(columns={"割安判定": "銘柄判定"})
-            show_stock_table(sell_display, use_container_width=True, hide_index=True)
-    render_current_holdings(current_holdings_rows(
+            show_stock_table(sell_display, use_container_width=True, hide_index=True, export_name='sell_display')
+    holding_rows = current_holdings_rows(
         short_confirmed, sell_view, signal_audit_rows, valuation_master_df, data
-    ))
+    )
+    register_result_table("results/current_holdings_judgements.csv", pd.DataFrame(holding_rows))
+    render_current_holdings(holding_rows)
 with admin_tab:
     st.subheader("参考株数の計算（候補確認後に入力）")
     st.caption("余力を候補数で均等に分けて参考株数を計算します。入力確定後に自動再計算します。CSVは保有照合に使用します。")
@@ -8178,14 +8263,14 @@ with admin_tab:
     if st.button("参考株数を再計算", key="v172434_recalculate"):
         st.rerun()
     if not order_inputs_ready:
-        st.info("余力を入力すると参考株数を計算します。未入力は買い条件の不成立を意味しません。")
+        export_notice('info', "余力を入力すると参考株数を計算します。未入力は買い条件の不成立を意味しません。")
     if order_inputs_ready and not holdings_verified:
-        st.warning("参考株数は保有照合前の暫定値です。CSV未入力・読込エラー・履歴不足の場合、保有株を新規候補から除外できない場合があります。注文前に確認してください。")
+        export_notice('warning', "参考株数は保有照合前の暫定値です。CSV未入力・読込エラー・履歴不足の場合、保有株を新規候補から除外できない場合があります。注文前に確認してください。")
 
 with main_tab:
     loaded_codes = {code(t) for t in data}
     if set(held_codes) - loaded_codes:
-        st.warning("追加取得後も保有銘柄の日足を確認できません。該当銘柄の売り判定は未確認です。『今日の判定を更新』で再確認してください。")
+        export_notice('warning', "追加取得後も保有銘柄の日足を確認できません。該当銘柄の売り判定は未確認です。『今日の判定を更新』で再確認してください。")
 
     news_pick_result, news_pick_exclusions, news_pick_signature = None, pd.DataFrame(), None
     if show_legacy_research:
@@ -8199,8 +8284,8 @@ with main_tab:
                 st.caption("数年の成長を調べる候補です。購入株数・売買指示には反映しません。")
                 render_multibagger_cards(multibagger_candidates)
     m1, m2 = st.columns(2)
-    m1.metric("保有", f"{len(held_codes)}銘柄")
-    m2.metric("買付余力", "未入力" if buying_power_input is None else f"¥{int(short_buying_power):,}")
+    export_metric(m1, "保有", f"{len(held_codes)}銘柄")
+    export_metric(m2, "買付余力", "未入力" if buying_power_input is None else f"¥{int(short_buying_power):,}")
     if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
         current_count = int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum())
         total_count = len(daily_bar_status_df)
@@ -8209,15 +8294,15 @@ with main_tab:
         ]
         target_label = target_dates.mode().iloc[0] if not target_dates.empty else "確認不可"
         if current_count == total_count:
-            st.success(f"日足データ：{target_label} 確定（{current_count}/{total_count}銘柄）")
+            export_notice('success', f"日足データ：{target_label} 確定（{current_count}/{total_count}銘柄）")
         elif current_count > 0:
-            st.warning(f"日足データ：{target_label} 確定 {current_count}/{total_count}銘柄。更新待ち銘柄は判定に注意してください。")
+            export_notice('warning', f"日足データ：{target_label} 確定 {current_count}/{total_count}銘柄。更新待ち銘柄は判定に注意してください。")
         else:
-            st.warning("最新日足は取引中または更新待ちです。確定後にもう一度『今日の判定を更新』を押してください。")
+            export_notice('warning', "最新日足は取引中または更新待ちです。確定後にもう一度『今日の判定を更新』を押してください。")
     if run_error:
-        st.error(run_error)
+        export_notice('error', run_error)
     elif not data:
-        st.info("「今日の判定を更新」を押してください。")
+        export_notice('info', "「今日の判定を更新」を押してください。")
 
 
 def build_single_profit_research(price_data, live_audit, budget=500000, costs=0):
@@ -8282,24 +8367,24 @@ def render_single_profit_research(price_data, live_audit):
     table = build_single_profit_research(price_data, live_audit, 500000, int(costs))
     st.caption("取得済み日足のみを使用。通常の『今日の判定を更新』で更新されます。50万円は研究用の固定予算で、実際の買付余力とは連動しません。")
     if table.empty:
-        st.info("全条件を満たす銘柄はありません。通常の判定更新と日足・財務の取得状況を確認してください。")
+        export_notice('info', "全条件を満たす銘柄はありません。通常の判定更新と日足・財務の取得状況を確認してください。")
         return
     picks = table[table["到達距離条件"]]
     if picks.empty:
-        st.info("目標までの上昇幅がATR14の2倍以内となる候補がないため、今回の推奨IFDOCOは見送ります。")
+        export_notice('info', "目標までの上昇幅がATR14の2倍以内となる候補がないため、今回の推奨IFDOCOは見送ります。")
     else:
         r = picks.iloc[0]
-        st.success(f"AI参考おすすめ：{r['コード']} {r['銘柄名']}（1銘柄のみ）")
+        export_notice('success', f"AI参考おすすめ：{r['コード']} {r['銘柄名']}（1銘柄のみ）")
         st.write(f"IFD：買い指値 {r['IFD買い指値']:,.0f}円 × {int(r['参考株数']):,}株")
         st.write(f"OCO：利確指値 {r['OCO利確指値']:,.0f}円 ／ 逆指値 {r['OCO逆指値発動']:,.0f}円以下で成行売り（全株）")
         st.write(f"買い概算 {r['買い概算額']:,.0f}円 ／ 費用控除後の目標利益 {r['費用控除後利益（税引前）']:,.0f}円 ／ 想定損失 {r['想定損失（費用込）']:,.0f}円 ／ 損益比 {r['損益比']:.2f}")
         st.caption(f"選定根拠：目標までATR {r['目標までATR倍率']:.2f}倍、出来高 {r['出来高倍率']:.2f}倍、5日騰落率 {r['5日騰落率%']:.2f}%。日足日 {r['日足日']}。損切りは買い指値からATR14約1本分。")
         if r["損益比"] < 1:
-            st.warning("想定損失が目標利益を上回る案です。期待値・勝率は未検証です。")
-    show_stock_table(table, use_container_width=True, hide_index=True)
+            export_notice('warning', "想定損失が目標利益を上回る案です。期待値・勝率は未検証です。")
+    show_stock_table(table, use_container_width=True, hide_index=True, export_name='single_profit_ifdoco')
     st.caption("AI参考スコア＝目標への近さ40点・損益比30点・出来高20点・5日上昇率10点の規則式。勝率や利益保証ではありません。到達時期は予測しません。")
-    st.warning("利益1万円は税引前です。逆指値の成行売りは窓開けで想定損失を超える場合があります。呼値・制限値幅・実余力・注文期限はSBI画面で確認してください。通常タブの注文と重複させず、約定価格が変わった場合は決済価格を再計算してください。研究タブのATR損切りは本番の終値7%損切りとは別の参考案です。自動発注はしません。")
-    st.download_button("1銘柄研究CSV", table.to_csv(index=False).encode("utf-8-sig"),
+    export_notice('warning', "利益1万円は税引前です。逆指値の成行売りは窓開けで想定損失を超える場合があります。呼値・制限値幅・実余力・注文期限はSBI画面で確認してください。通常タブの注文と重複させず、約定価格が変わった場合は決済価格を再計算してください。研究タブのATR損切りは本番の終値7%損切りとは別の参考案です。自動発注はしません。")
+    export_download_button("1銘柄研究CSV", table.to_csv(index=False).encode("utf-8-sig"),
                        "single_profit_research.csv", "text/csv", key="single_profit_csv")
 
 
@@ -8503,13 +8588,13 @@ def annotate_video_leaders(table):
     return out
 
 
-def show_video_leader_table(frame):
+def show_video_leader_table(frame, export_name):
     display = prepare_stock_table(frame)
     cols = ["銘柄判定", "有力銘柄", "コード", "銘柄名", "選定根拠"]
     display = display[[c for c in cols if c in display] + [c for c in display if c not in cols]]
     styled = display.style.apply(
         lambda row: ["background-color: #fff2b3; color: #17202a; font-weight: 700" if row.get("有力銘柄", "") else ""] * len(row), axis=1)
-    st.dataframe(styled, hide_index=True, use_container_width=True)
+    export_dataframe(styled, hide_index=True, use_container_width=True, export_name=export_name)
 
 
 def video_position_plan(row, cash, risk):
@@ -8523,9 +8608,9 @@ def video_position_plan(row, cash, risk):
 def render_video_research():
     st.subheader("動画式AI投資研究")
     st.caption("元動画の3手法と追加動画の業績・資金管理を、取得済みデータで比較します。生成AIの予測や動画手法の完全再現ではなく、条件に基づく研究です。")
-    st.info("朝の運用向けに前営業日までの確定日足を使います。候補は本番の買い候補・配分へ自動追加されません。過去成績は未検証です。")
+    export_notice('info', "朝の運用向けに前営業日までの確定日足を使います。候補は本番の買い候補・配分へ自動追加されません。過去成績は未検証です。")
     with st.expander("動画の要点・補完条件・運用の違い"):
-        show_stock_table(VIDEO_RESEARCH_RULES,hide_index=True,use_container_width=True)
+        show_stock_table(VIDEO_RESEARCH_RULES,hide_index=True,use_container_width=True, export_name='video_research_rules')
         st.link_button("元動画", "https://youtu.be/TR0rURA4ySo")
         st.caption("週足は取得範囲から作成し金曜日ラベルが基準日以下の確定週のみ使用。動画の2年以上の長期確認は履歴不足の場合未実施です。")
     research_freshness=daily_bar_status_df.copy()
@@ -8534,39 +8619,39 @@ def render_video_research():
     while expected.weekday()>=5: expected-=pd.Timedelta(days=1)
     target=video_reference_day(research_freshness)
     if pd.notna(target) and target!=expected:
-        st.warning("保存日足の基準日が現在の営業日目安と一致しません。『今日の判定を更新』を実行してください。祝日等で確認できない場合も研究候補は保留します。")
+        export_notice('warning', "保存日足の基準日が現在の営業日目安と一致しません。『今日の判定を更新』を実行してください。祝日等で確認できない場合も研究候補は保留します。")
         research_freshness["直近東証取引日"]=str(expected.date())
         research_freshness["状態"]="更新確認待ち"
         target=expected
     if st.button("研究用の日経平均を確認・更新",key="video_market_refresh"):
-        if pd.isna(target): st.warning("先に『今日の判定を更新』で確定日足の基準日を取得してください。")
+        if pd.isna(target): export_notice('warning', "先に『今日の判定を更新』で確定日足の基準日を取得してください。")
         else:
             try:
                 with st.spinner("研究用の日経平均を確認中…"):
                     st.session_state["video_market_frame"]=market_data(target)
             except Exception as exc:
                 st.session_state.pop("video_market_frame",None)
-                st.warning("市場データを確認できません："+type(exc).__name__)
+                export_notice('warning', "市場データを確認できません："+type(exc).__name__)
     with st.expander("暴落時の配当・IR確認CSV（任意）"):
         st.caption("根拠URLと7日以内の確認日を記録。配当利回りは%単位。最新の減配・下方修正・個別悪材料と長期業績・財務を公式IRで確認した場合のみ指定語を記入してください。URLの内容を自動検証する機能ではありません。")
         template=pd.DataFrame([{"コード":"", "確認日":"", "配当利回り%":"", "長期業績・財務健全性":"未確認", "個別悪材料":"未確認", "根拠URL":""}])
         st.code("長期業績・財務健全性：確認済\n個別悪材料：問題なし確認済\n確認日：YYYY-MM-DD")
-        st.download_button("IR確認CSVひな形",template.to_csv(index=False).encode("utf-8-sig"),"video_ir_template.csv",key="video_ir_template")
+        export_download_button("IR確認CSVひな形",template.to_csv(index=False).encode("utf-8-sig"),"video_ir_template.csv",key="video_ir_template")
         upload=st.file_uploader("IR確認CSV",type=["csv"],key="video_ir_csv")
         evidence=pd.DataFrame()
         if upload is not None:
             try:
                 evidence=pd.read_csv(upload,dtype={"コード":str},encoding="utf-8-sig").fillna("")
                 if not set(template.columns).issubset(evidence.columns):
-                    st.warning("ひな形の列が不足しています。IR情報は採用しません。")
+                    export_notice('warning', "ひな形の列が不足しています。IR情報は採用しません。")
                     evidence=pd.DataFrame()
             except Exception:
-                st.warning("IR確認CSVを読み込めません。UTF-8のひな形を使ってください。")
+                export_notice('warning', "IR確認CSVを読み込めません。UTF-8のひな形を使ってください。")
     table,context=build_video_research(data,research_freshness,valuation_master_df,mb_finance,st.session_state.get("video_market_frame"),short_confirmed,evidence,tokyo_now().date())
     st.write("市場："+context["状態"]+" ／ 基準日："+(context["日付"] or "未確認"))
     if context["確認日数"]: st.caption(f"市場の高値比較は取得済み{context['確認日数']}日。下落率 {context['下落率%']:.2f}%")
     if table.empty:
-        st.info("NO DATA：先に今日の判定を更新してください。")
+        export_notice('info', "NO DATA：先に今日の判定を更新してください。")
         return
     st.caption(f"調査範囲 {table['コード'].nunique()}銘柄。現在取得済みの範囲のみで、日本株全体を網羅した結果ではありません。")
     table=annotate_video_leaders(table)
@@ -8577,24 +8662,24 @@ def render_video_research():
             part=table[table["手法"].eq(strategy)].copy()
             candidates=part[part["研究判定"].eq("研究候補（注文前IR確認）")]
             st.write(f"研究候補 {len(candidates)}銘柄")
-            if candidates.empty: st.info("最有力：該当なし。条件を満たす候補がありません。下の一覧で待ち条件を確認できます。")
+            if candidates.empty: export_notice('info', "最有力：該当なし。条件を満たす候補がありません。下の一覧で待ち条件を確認できます。")
             else:
                 leader=candidates[candidates["有力銘柄"].ne("")]
                 if not leader.empty:
                     row=leader.iloc[0]
-                    st.info(f"★ 最有力：{row['銘柄名']}（{row['コード']}）")
+                    export_notice('info', f"★ 最有力：{row['銘柄名']}（{row['コード']}）")
                     st.write("選定根拠："+row["選定根拠"])
-                show_video_leader_table(candidates)
+                show_video_leader_table(candidates, f"video_{strategy}_candidates")
             held=part[part["研究判定"].str.startswith("保有")]
             if not held.empty:
                 st.caption("現在保有をこの手法で比較した参考結果。購入時の採用手法を記録したものではありません。")
-                show_stock_table(held,hide_index=True,use_container_width=True)
+                show_stock_table(held,hide_index=True,use_container_width=True, export_name=f"video_{strategy}_holdings")
             with st.expander("全銘柄の条件・見送り理由"):
-                show_video_leader_table(part)
+                show_video_leader_table(part, f"video_{strategy}_all")
     with tabs[3]:
-        st.info("この欄の最有力選定は保留：四半期増収増益・進捗率が未確認で、動画の全12条件も公開されていません。3手法の最有力は各タブで確認できます。")
+        export_notice('info', "この欄の最有力選定は保留：四半期増収増益・進捗率が未確認で、動画の全12条件も公開されていません。3手法の最有力は各タブで確認できます。")
         cols=["銘柄判定","コード","銘柄名","年間増収増益","四半期増収増益","進捗率","予想PER","MA5/25当日GC","出来高倍率","財務基準日","財務情報鮮度","財務出典"]
-        show_stock_table(table.drop_duplicates("コード")[cols],hide_index=True,use_container_width=True)
+        show_stock_table(table.drop_duplicates("コード")[cols],hide_index=True,use_container_width=True, export_name='video_research_fundamental_checks')
         st.caption("年間成長率は比較期が12か月差の場合だけ表示判定。財務取得の鮮度は別列で確認。PERの絶対値だけで割安とはせず共通銘柄判定を参照。四半期と進捗は現在のパイプラインに十分な情報がないため未確認。")
         st.code("選んだ銘柄の最新公式IR・適時開示を確認し、出典URL・発表日を付けて、総合判定／根拠／見通し／注目点を整理してください。売上と利益の前年同期比、通期進捗、利益の使途、下方修正・減配・希薄化を確認し、事実と推論を分け、不明は未確認としてください。ニュースは一時的要因と構造的問題を区別してください。")
     st.caption("候補の資金管理：余力と許容損失から100株単位で逆算。各案は単独での計算です。複数案を同時に注文しないでください。")
@@ -8602,16 +8687,16 @@ def render_video_research():
     risk=st.number_input("1取引の許容損失（円）",min_value=0,value=0,step=1000,key="video_risk")
     picks=table[table["研究判定"].eq("研究候補（注文前IR確認）")]
     plans=[plan for row in picks.to_dict("records") if (plan:=video_position_plan(row,cash,risk)) is not None]
-    if plans: show_stock_table(pd.DataFrame(plans),hide_index=True,use_container_width=True)
-    elif len(picks): st.info("余力・許容損失を設定し、100株を買える範囲か確認してください。")
-    st.warning("参考価格は直近終値で、翌朝の約定価格・注文可能価格ではありません。窓開けや滑りで許容損失を超えます。注文前にIR、実余力、呼値・制限値幅を確認し、買値が変わった場合は再計算してください。S株では同じ決済注文を使えるとは限りません。本番の売り指示・終値7%損切りを優先します。")
+    if plans: show_stock_table(pd.DataFrame(plans),hide_index=True,use_container_width=True, export_name='video_research_position_plans')
+    elif len(picks): export_notice('info', "余力・許容損失を設定し、100株を買える範囲か確認してください。")
+    export_notice('warning', "参考価格は直近終値で、翌朝の約定価格・注文可能価格ではありません。窓開けや滑りで許容損失を超えます。注文前にIR、実余力、呼値・制限値幅を確認し、買値が変わった場合は再計算してください。S株では同じ決済注文を使えるとは限りません。本番の売り指示・終値7%損切りを優先します。")
     buf=io.BytesIO()
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         z.writestr("video_research_audit.csv",table.to_csv(index=False,encoding="utf-8-sig"))
         z.writestr("video_research_rules.csv",VIDEO_RESEARCH_RULES.to_csv(index=False,encoding="utf-8-sig"))
         z.writestr("video_research_market.csv",pd.DataFrame([context]).to_csv(index=False,encoding="utf-8-sig"))
         z.writestr("video_research_position_plans.csv",pd.DataFrame(plans).to_csv(index=False,encoding="utf-8-sig"))
-    st.download_button("動画研究CSV一括ZIP",buf.getvalue(),"video_research.zip","application/zip",key="video_export")
+    export_download_button("動画研究CSV一括ZIP",buf.getvalue(),"video_research.zip","application/zip",key="video_export")
 
 
 # 資金流入初期研究：公開済み確定日足の代理指標。実際の資金流入・AI利用を測定しない。
@@ -8720,7 +8805,7 @@ def build_flow_research(prices, freshness, valuations, evidence, today):
 
 def render_flow_research():
     st.subheader('資金流入の初期候補（研究）')
-    st.info('確定日足の出来高と価格から注目の集まり始めを探す研究です。AI投資家の注文や実際の資金流入は識別しません。候補は正式な買い・配分へ自動追加されません。')
+    export_notice('info', '確定日足の出来高と価格から注目の集まり始めを探す研究です。AI投資家の注文や実際の資金流入は識別しません。候補は正式な買い・配分へ自動追加されません。')
     st.caption('取得済み銘柄のみを比較し追加の株価通信は行いません。場中の板・同時刻出来高・SNSは未使用。後場のリアルタイム判定とは別です。')
     with st.expander('条件と判定の読み方'):
         st.write('前20日比出来高1.5倍以上／前20日平均売買代金1億円以上／前20日高安幅15%以内／5日騰落−3～8%・20日騰落−5～15%／直近5日安値の切上げと5日平均終値回復／前10日高値の−2～＋3%／有効な取得母集団の5日騰落中央値比＋2%以上。この7条件は研究仮説で、上昇確率ではありません。')
@@ -8729,37 +8814,37 @@ def render_flow_research():
     with st.expander('業種・テーマと公式IR確認CSV（任意）'):
         st.caption('公式IRを実際に確認した場合だけ確認結果に「確認済」を記入。確認日7日以内・https URL・裏付け内容が必要です。URLの内容・発表日を自動検証する機能ではありません。同一テーマ名で波及を比較します。')
         template = pd.DataFrame(columns=['コード','業種・テーマ','確認日','確認結果','公式IR_URL','裏付け内容'])
-        st.download_button('資金流入研究・確認CSVひな形', template.to_csv(index=False).encode('utf-8-sig'), 'flow_evidence_template.csv', key='flow_template')
+        export_download_button('資金流入研究・確認CSVひな形', template.to_csv(index=False).encode('utf-8-sig'), 'flow_evidence_template.csv', key='flow_template')
         upload = st.file_uploader('資金流入研究の確認CSV', type=['csv'], key='flow_evidence')
         evidence = pd.DataFrame()
         if upload is not None:
             try:
                 evidence = pd.read_csv(upload, dtype=str, encoding='utf-8-sig').fillna('')
                 if not set(template.columns).issubset(evidence.columns):
-                    st.warning('ひな形の列が不足しています。確認情報を採用しません。')
+                    export_notice('warning', 'ひな形の列が不足しています。確認情報を採用しません。')
                     evidence = pd.DataFrame()
             except Exception:
-                st.warning('CSVを読み込めません。UTF-8のひな形を使用してください。')
+                export_notice('warning', 'CSVを読み込めません。UTF-8のひな形を使用してください。')
     result = build_flow_research(data, daily_bar_status_df, valuation_master_df, evidence, tokyo_now())
     if result.empty:
-        st.info('NO DATA：今日の判定を更新してください。')
+        export_notice('info', 'NO DATA：今日の判定を更新してください。')
         return
     st.caption(f'取得済み{len(result)}銘柄を確認。データ鮮度・母集団の偏りにより候補が変わります。')
     candidates = result[result['研究判定'].eq('初期候補（注文前確認）')]
     if candidates.empty:
-        st.info('初期候補：該当なし。技術条件通過でもIR・企業価値未確認なら確認待ちです。')
+        export_notice('info', '初期候補：該当なし。技術条件通過でもIR・企業価値未確認なら確認待ちです。')
     else:
         leader = candidates[candidates['注目'].fillna('').ne('')].iloc[0]
-        st.success(f"★ {leader['銘柄名']}（{leader['コード']}）：7条件通過。出来高 {leader['出来高倍率']:.2f}倍／母集団比 {leader['取得母集団比5日超過率%']:+.2f}%")
+        export_notice('success', f"★ {leader['銘柄名']}（{leader['コード']}）：7条件通過。出来高 {leader['出来高倍率']:.2f}倍／母集団比 {leader['取得母集団比5日超過率%']:+.2f}%")
         st.caption('同条件では出来高倍率→コード順で1銘柄を強調。急騰の予測や注文指示ではありません。')
-        st.dataframe(candidates.style.apply(lambda r: ['background-color: #fff2b3; color: #17202a' if r.get('注目') else '']*len(r), axis=1), hide_index=True, use_container_width=True)
+        export_dataframe(candidates.style.apply(lambda r: ['background-color: #fff2b3; color: #17202a' if r.get('注目') else '']*len(r), axis=1), hide_index=True, use_container_width=True, export_name='flow_research_candidates')
     waiting = result[result['研究判定'].eq('技術条件通過・確認待ち')]
     if not waiting.empty:
         st.write('技術条件通過・確認待ち')
-        st.dataframe(waiting, hide_index=True, use_container_width=True)
+        export_dataframe(waiting, hide_index=True, use_container_width=True, export_name='flow_research_waiting')
     with st.expander('全銘柄の条件・見送り理由'):
-        st.dataframe(result, hide_index=True, use_container_width=True)
-    st.download_button('資金流入研究・全件CSV', result.to_csv(index=False).encode('utf-8-sig'), 'flow_research_audit.csv', key='flow_audit_download')
+        export_dataframe(result, hide_index=True, use_container_width=True, export_name='flow_research_result')
+    export_download_button('資金流入研究・全件CSV', result.to_csv(index=False).encode('utf-8-sig'), 'flow_research_audit.csv', key='flow_audit_download')
     st.caption('直近5日安値は研究の否定目安です。利確・IFDOCOは本機能では作成しません。値幅・支持抵抗と公式情報を再確認し、既存の売買ルールを優先してください。')
 
 
@@ -8777,13 +8862,13 @@ if show_legacy_research:
     with multibagger_tab:
         st.subheader("🌱 大化け候補（研究）")
         st.caption("数年で大きく成長する企業を探す入口です。研究点は上昇確率・予想倍率ではありません。成績未検証の独立条件です。")
-        st.info("注文判断は『今日の売買』で確認してください。候補入りだけでは買い指示になりません。既存の利確・終値7%損切りは引き続き適用します。")
+        export_notice('info', "注文判断は『今日の売買』で確認してください。候補入りだけでは買い指示になりません。既存の利確・終値7%損切りは引き続き適用します。")
         st.write(f"調査対象 {len(multibagger_audit)}銘柄 ／ 大化け候補 {len(multibagger_candidates)}銘柄")
         if not multibagger_audit.empty:
             complete_count = int(multibagger_audit[["売上成長率%", "利益成長率%"]].notna().all(axis=1).sum())
             st.caption(f"成長率2項目の取得 {complete_count}/{len(multibagger_audit)}銘柄。未取得は低成長と区別して保留します。")
         if multibagger_sources_paused():
-            st.warning("業績取得先がアクセス制限中です。追加通信を停止しています。時間を空けて追加確認してください。未試行分は次回へ残します。")
+            export_notice('warning', "業績取得先がアクセス制限中です。追加通信を停止しています。時間を空けて追加確認してください。未試行分は次回へ残します。")
         st.caption("主要条件を満たし、FCF・D/E・営業利益率に欠損がある場合は暫定候補として表示します。企業価値・主要データ未確認は評価保留、取得済みの健全性指標が除外条件に該当すれば条件外です。")
         render_multibagger_choice(multibagger_candidates)
         render_multibagger_cards(multibagger_candidates)
@@ -8791,7 +8876,7 @@ if show_legacy_research:
         st.caption("通常の売買更新では研究用の追加通信を行いません。下の追加確認ボタンで取得し、結果を保存・復元します。サーバー再構築で保存が消えた場合は追加取得結果CSVを読み込めます。過去の取得日は書き換えず、鮮度条件を満たさないデータは保留します。")
         save_status = st.session_state.get("v172427_growth_save", "")
         if str(save_status).startswith("保存失敗"):
-            st.warning("成長実績を保存できませんでした。追加取得結果CSVをダウンロードしてください。" + save_status)
+            export_notice('warning', "成長実績を保存できませんでした。追加取得結果CSVをダウンロードしてください。" + save_status)
         imported_growth = st.file_uploader("成長実績の追加取得結果CSVを復元", type=["csv"], key="v172427_growth_import")
         if imported_growth is not None and st.button("CSVの成長実績を読み込む", key="v172427_growth_import_apply"):
             try:
@@ -8804,14 +8889,14 @@ if show_legacy_research:
                 st.session_state["v172423_growth_extra"] = restored
                 st.session_state["v172427_growth_save"] = save_multibagger_growth(restored)
             except (ValueError, TypeError, pd.errors.ParserError) as exc:
-                st.error("CSVを読み込めませんでした: " + str(exc))
+                export_notice('error', "CSVを読み込めませんでした: " + str(exc))
             else:
                 st.rerun()
         growth_limit = st.number_input("1回に成長実績を追加確認する件数", 5, 20, 10, 5, key="v172423_growth_limit")
         if st.button("成長実績を追加確認", key="v172423_growth_fetch", disabled=not mb_scope):
             targets = multibagger_fetch_targets(mb_scope, mb_extra, growth_limit, tokyo_now().date())
             if not targets:
-                st.info("追加確認の対象がないか、再試行の待機中です。失敗分は15分以上空けて再確認してください。")
+                export_notice('info', "追加確認の対象がないか、再試行の待機中です。失敗分は15分以上空けて再確認してください。")
             else:
                 with st.spinner("国内無料公開の連続する年度実績を確認中…"):
                     combined_growth = collect_multibagger_growth(mb_finance, mb_extra, mb_scope, growth_limit, tokyo_now().date())
@@ -8824,16 +8909,16 @@ if show_legacy_research:
             st.session_state["v172427_growth_save"] = save_multibagger_growth(pd.DataFrame())
             st.rerun()
         if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
-            st.download_button("成長実績の追加取得結果CSV", mb_extra.to_csv(index=False).encode("utf-8-sig"), "multibagger_growth_fetch.csv", "text/csv", key="v172425_growth_csv")
+            export_download_button("成長実績の追加取得結果CSV", mb_extra.to_csv(index=False).encode("utf-8-sig"), "multibagger_growth_fetch.csv", "text/csv", key="v172425_growth_csv")
         if not multibagger_audit.empty:
             with st.expander("全件の判定・評価保留・条件外理由", expanded=False):
-                show_stock_table(multibagger_audit, use_container_width=True, hide_index=True)
-            st.download_button("大化け候補の全件CSV", multibagger_audit.to_csv(index=False).encode("utf-8-sig"), "multibagger_research_audit.csv", "text/csv", key="v172423_mb_csv")
+                show_stock_table(multibagger_audit, use_container_width=True, hide_index=True, export_name='multibagger_audit')
+            export_download_button("大化け候補の全件CSV", multibagger_audit.to_csv(index=False).encode("utf-8-sig"), "multibagger_research_audit.csv", "text/csv", key="v172423_mb_csv")
         if isinstance(mb_extra, pd.DataFrame) and not mb_extra.empty:
             with st.expander("成長実績の追加取得結果", expanded=False):
-                show_stock_table(mb_extra[[c for c in ("コード", "銘柄名", "成長追加確認", "成長取得経路", "財務参照URL", "財務取得日時") if c in mb_extra]], use_container_width=True, hide_index=True)
+                show_stock_table(mb_extra[[c for c in ("コード", "銘柄名", "成長追加確認", "成長取得経路", "財務参照URL", "財務取得日時") if c in mb_extra]], use_container_width=True, hide_index=True, export_name='multibagger_growth_acquisition')
         with st.expander("選定条件と確認すべき点", expanded=False):
-            show_stock_table(MULTIBAGGER_RULES, use_container_width=True, hide_index=True)
+            show_stock_table(MULTIBAGGER_RULES, use_container_width=True, hide_index=True, export_name='multibagger_rules')
             st.write("決算説明資料で、売上・利益が伸びた理由、翌期も続く根拠、顧客集中、増資予定を確認してください。減収・減益や資金繰り悪化は成長シナリオの再確認が必要です。")
 
 def run_final_decision_parity(live):
@@ -8990,14 +9075,14 @@ def render_final_decision_parity(live):
         st.markdown('## ' + ('◯' if result['ok'] else '✖️'))
         st.caption('前回検証日時：' + result['meta']['検証日時'] + '（入力・設定変更後は再実行してください）')
         if result['ok']:
-            st.success('一致しました。今回の入力での検証結果です。利益や他の日の正常動作を保証するものではありません。')
+            export_notice('success', '一致しました。今回の入力での検証結果です。利益や他の日の正常動作を保証するものではありません。')
         else:
-            st.error('差分または検証未完了です。診断結果を確認してください。')
+            export_notice('error', '差分または検証未完了です。診断結果を確認してください。')
             with st.expander('修正のための診断', expanded=True):
-                if result['diffs']: st.dataframe(pd.DataFrame(result['diffs']), hide_index=True, use_container_width=True)
+                if result['diffs']: export_dataframe(pd.DataFrame(result['diffs']), hide_index=True, use_container_width=True, export_name='final_decision_differences')
                 if result['errors']: st.code('\n'.join(result['errors']))
                 st.write('下の診断ZIPを添えて修正を依頼できます。コードの自動書換えは行いません。')
-        st.download_button('診断結果をダウンロード', result['bundle'],
+        export_download_button('診断結果をダウンロード', result['bundle'],
                            'final_decision_check.zip', 'application/zip', key='v172451_download')
 
 
@@ -9008,27 +9093,27 @@ with admin_tab:
     dcnt = len([1 for t in data if code(t) not in held_code_set]) if data else 0
     tcnt = len(value_top50_df) if isinstance(value_top50_df, pd.DataFrame) else 0
     c1,c2,c3,c4=st.columns(4)
-    c1.metric("母集団", f"{ucnt}銘柄")
-    c2.metric("日足取得", f"{dcnt}銘柄")
-    c3.metric("新規買い監視", f"{len(true_top50_codes)}銘柄")
-    c4.metric("保有", f"{len(held_codes)}銘柄")
+    export_metric(c1, "母集団", f"{ucnt}銘柄")
+    export_metric(c2, "日足取得", f"{dcnt}銘柄")
+    export_metric(c3, "新規買い監視", f"{len(true_top50_codes)}銘柄")
+    export_metric(c4, "保有", f"{len(held_codes)}銘柄")
 
     with st.expander("🔎 TOP50選定前の短期反転チェック", expanded=False):
         if isinstance(churn_audit_df, pd.DataFrame) and not churn_audit_df.empty:
             excluded = churn_audit_df[churn_audit_df["判定"].eq("新規買い除外")]
             st.caption(f"新規買い除外：{len(excluded)} / 検査対象：{len(churn_audit_df)}。閾値は試験設定で、成績改善は未検証です。")
             show_stock_table(excluded, use_container_width=True, hide_index=True,
-                         height=admin_table_height(excluded, 480))
+                         height=admin_table_height(excluded, 480), export_name='excluded')
         else:
-            st.info("『今日の判定を更新』後に除外理由を表示します。")
+            export_notice('info', "『今日の判定を更新』後に除外理由を表示します。")
 
     with st.expander("🕒 日足データの鮮度", expanded=False):
         if isinstance(daily_bar_status_df, pd.DataFrame) and not daily_bar_status_df.empty:
             show_stock_table(daily_bar_status_df, use_container_width=True, hide_index=True,
-                         height=admin_table_height(daily_bar_status_df, 520))
+                         height=admin_table_height(daily_bar_status_df, 520), export_name='daily_bar_status_df')
             st.caption("16:00以降は直近東証取引日のOHLCVを確認し、履歴が遅れている銘柄だけ当日分を補完します。")
         else:
-            st.info("『今日の判定を更新』後に日足最終日と取得元を表示します。")
+            export_notice('info', "『今日の判定を更新』後に日足最終日と取得元を表示します。")
 
     value_tab, surge_tab, compare_tab, holdings_tab = st.tabs([
         "企業価値", "急騰予兆", "3指標比較", "保有銘柄"
@@ -9041,35 +9126,35 @@ with admin_tab:
         if not finance_acquisition_df.empty:
             _ok = int(finance_acquisition_df["財務取得状態"].eq("取得済").sum())
             st.caption(f"必要指標・鮮度条件を満たす財務 {_ok} / {len(finance_acquisition_df)}銘柄。予想値の未提供と通信失敗を分けて表示します。")
-            show_stock_table(finance_acquisition_df, use_container_width=True, hide_index=True)
+            show_stock_table(finance_acquisition_df, use_container_width=True, hide_index=True, export_name='finance_acquisition_df')
         else:
-            st.info("『今日の判定を更新』で財務を直接取得します。空欄は財務取得失敗を意味しません。")
+            export_notice('info', "『今日の判定を更新』で財務を直接取得します。空欄は財務取得失敗を意味しません。")
         with st.expander("日足取得の診断（失敗銘柄を含む）", expanded=False):
             if not daily_acquisition_df.empty:
-                show_stock_table(daily_acquisition_df, use_container_width=True, hide_index=True)
+                show_stock_table(daily_acquisition_df, use_container_width=True, hide_index=True, export_name='daily_acquisition_df')
             else:
-                st.info("判定更新後に表示します。")
+                export_notice('info', "判定更新後に表示します。")
         render_allocation_research()
         render_public_research_logic()
         if isinstance(signal_value_df, pd.DataFrame) and not signal_value_df.empty:
             missing_finance = signal_value_df[~signal_value_df["ファンダ取得状態"].eq("OK")]
             if not missing_finance.empty:
-                st.warning(f"財務指標を取得できない銘柄：{len(missing_finance)} / {len(signal_value_df)}。日足の鮮度とは別です。判定不能除外が有効なら新規買いを見送ります。")
+                export_notice('warning', f"財務指標を取得できない銘柄：{len(missing_finance)} / {len(signal_value_df)}。日足の鮮度とは別です。判定不能除外が有効なら新規買いを見送ります。")
                 with st.expander("財務取得不可の詳細", expanded=False):
-                    show_stock_table(missing_finance[["コード", "銘柄名", "ファンダ取得状態", "Yahoo取得状態", "財務情報鮮度", "財務取得日時"]], use_container_width=True, hide_index=True)
+                    show_stock_table(missing_finance[["コード", "銘柄名", "ファンダ取得状態", "Yahoo取得状態", "財務情報鮮度", "財務取得日時"]], use_container_width=True, hide_index=True, export_name='unavailable_financials')
         with st.expander("無料財務データの取得状況・情報源", expanded=False):
             _finance_frames = [f for f in (signal_value_df, value_top50_df) if isinstance(f, pd.DataFrame) and not f.empty]
             if _finance_frames:
                 _finance_audit = pd.concat(_finance_frames, ignore_index=True).drop_duplicates("コード", keep="first")
                 _audit_cols = ["コード", "銘柄名", "割安判定", "ファンダ取得状態", "財務情報源", "財務情報鮮度", "参考指標基準日", "予想EPS対象期", "業績発表日", "実績EPS対象期", "財務取得日時", "財務参照URL", "財務取得経路", "財務データ区分"]
-                show_stock_table(_finance_audit[[c for c in _audit_cols if c in _finance_audit]], use_container_width=True, hide_index=True)
+                show_stock_table(_finance_audit[[c for c in _audit_cols if c in _finance_audit]], use_container_width=True, hide_index=True, export_name='domestic_finance_audit')
             else:
-                st.info("判定更新後に財務の取得状況を表示します。")
+                export_notice('info', "判定更新後に財務の取得状況を表示します。")
         st.caption("全監視対象で共通マスターの企業価値判定を新規買いに使用します。割高・赤字予想・未算定・鮮度未確認は見送ります。保有銘柄は従来の売り条件で判定します。")
         st.caption("会社予想EPS未提供・赤字予想は通信失敗と区別します。EPS×予想PERが株価と整合する場合、参考理論株価との価格差だけでは異常値にしません。理論株価は業種PER仮定に依存します。")
         st.caption("財務はYahoo!ファイナンス日本版を優先し、トレーダーズ・ウェブ、株探の無料公開データへ順に切り替えます。取得サイト・指標基準日・EPS対象期・株探業績発表日・取得経路を表示します。サイトをまたいでEPSとPERを混ぜません。欠損をゼロや推測値で補わず、最新性・算定不能は新規買い対象外です。J-Quants遅延財務・有料APIは使用しません。")
         if not isinstance(value_top50_df, pd.DataFrame) or value_top50_df.empty:
-            st.info("先に『今日の判定を更新』で監視対象のデータを取得してください。")
+            export_notice('info', "先に『今日の判定を更新』で監視対象のデータを取得してください。")
         else:
             value_show = add_research_judgements_first(value_top50_df, surge_top50_df, valuation_master_df)
             show_cols=[
@@ -9102,7 +9187,7 @@ with admin_tab:
 
         with st.expander("🧪 バックテスト用5年日足データ", expanded=False):
             st.caption("この出力は検証専用です。売買判定には使いません。現在の大規模母集団の5年OHLCVを取得します。")
-            st.warning("企業価値AIを過去時点で完全再現するには、当時のファンダメンタル/目標株価データが別途必要です。このデータだけでできるのは347銘柄ストキャス検証と、現TOP50を固定した参考検証です。")
+            export_notice('warning', "企業価値AIを過去時点で完全再現するには、当時のファンダメンタル/目標株価データが別途必要です。このデータだけでできるのは347銘柄ストキャス検証と、現TOP50を固定した参考検証です。")
             if isinstance(universe_df, pd.DataFrame) and not universe_df.empty:
                 bt_tickers = tuple(universe_df["ticker"].astype(str).tolist()) if "ticker" in universe_df.columns else tuple(tickers(",".join(universe_df["コード"].astype(str).tolist())))
                 if st.button("5年日足バックテストデータを作成", key="v178_make_btdata"):
@@ -9125,14 +9210,19 @@ with admin_tab:
                         }])
                         bzf.writestr("backtest_manifest.csv", manifest.to_csv(index=False, encoding="utf-8-sig"))
                     bbuf.seek(0)
-                    st.success(f"5年日足：{bt_hist['コード'].nunique() if not bt_hist.empty and 'コード' in bt_hist.columns else 0}銘柄 / {len(bt_hist):,}行")
-                    st.download_button("📦 バックテスト用5年日足ZIP", data=bbuf.getvalue(), file_name="ver17_backtest_history_5y.zip", mime="application/zip", use_container_width=True, key="v178_btzip")
+                    export_notice('success', f"5年日足：{bt_hist['コード'].nunique() if not bt_hist.empty and 'コード' in bt_hist.columns else 0}銘柄 / {len(bt_hist):,}行")
+                    st.session_state["v178_backtest_history_zip"] = bbuf.getvalue()
             else:
-                st.info("先に『今日の判定を更新』で大規模母集団を作成してください。")
+                export_notice('info', "先に『今日の判定を更新』で大規模母集団を作成してください。")
+            if "v178_backtest_history_zip" in st.session_state:
+                export_download_button("📦 バックテスト用5年日足ZIP",
+                                       data=st.session_state["v178_backtest_history_zip"],
+                                       file_name="ver17_backtest_history_5y.zip", mime="application/zip",
+                                       use_container_width=True, key="v178_btzip")
 
         with st.expander("🧪 ストキャス振り回され対策の比較バックテスト", expanded=False):
             st.caption("上で作成した5年日足ZIP、または backtest_history_5y.csv をアップロード。現行GC/DCとトレンド＋振れ幅判定を同じ日足で比較します。")
-            st.warning("銘柄別に独立した1ポジションの検証です。TOP50を現在の銘柄で固定する選択は過去の選定を再現しません。企業価値、買付余力、実際の約定・手数料・税金は再現していません。")
+            export_notice('warning', "銘柄別に独立した1ポジションの検証です。TOP50を現在の銘柄で固定する選択は過去の選定を再現しません。企業価値、買付余力、実際の約定・手数料・税金は再現していません。")
             bt_input = st.file_uploader("5年日足ZIPまたはCSV", type=["zip", "csv"], key="v1717_bt_input")
             bt_fixed_top = st.checkbox("現在のTOP50だけに限定（参考検証）", value=False, key="v1717_bt_top")
             if st.button("現行版と改善版を比較", key="v1717_bt_run", disabled=bt_input is None):
@@ -9157,22 +9247,22 @@ with admin_tab:
                     summary, trades, unrealized = compare_stoch_backtest(hist, sl, codes)
                     st.session_state["v1717_bt_result"] = (summary, trades, unrealized)
                 except Exception as e:
-                    st.error(f"比較バックテストを実行できません: {e}")
+                    export_notice('error', f"比較バックテストを実行できません: {e}")
             if "v1717_bt_result" in st.session_state:
                 summary, trades, unrealized = st.session_state["v1717_bt_result"]
-                show_stock_table(summary, use_container_width=True, hide_index=True)
+                show_stock_table(summary, use_container_width=True, hide_index=True, export_name='stoch_backtest_summary')
                 st.caption("終値で判定し、翌営業日の始値で約定。最終日の未決済は集計から分離。PFは取引騰落率の単純合算比で、ポートフォリオの資産推移・最大DDを示すものではありません。")
                 for label, frame, filename in [("決済明細CSV", trades, "stoch_backtest_trades.csv"),
                                                ("未決済明細CSV", unrealized, "stoch_backtest_open.csv")]:
-                    st.download_button(label, data=frame.to_csv(index=False).encode("utf-8-sig"),
+                    export_download_button(label, data=frame.to_csv(index=False).encode("utf-8-sig"),
                                        file_name=filename, mime="text/csv", key="v1717_" + filename)
 
         with st.expander("🧪 割高除外・保有買い増しの比較バックテスト", expanded=False):
             st.caption("過去の研究用比較です。主ロジックでは買い増しを行いません。判定日の終値で判断し、翌営業日の始値で約定します。")
-            st.warning("割高除外の過去検証には、各評価日当時に公表・取得できたAI参考価値が必要です。現在のTOP50や現在の参考価値を過去へ流用しません。過去評価CSVがない場合は買い増しだけを比較します。")
+            export_notice('warning', "割高除外の過去検証には、各評価日当時に公表・取得できたAI参考価値が必要です。現在のTOP50や現在の参考価値を過去へ流用しません。過去評価CSVがない場合は買い増しだけを比較します。")
             new_history_file = st.file_uploader("5年日足ZIPまたはCSV", type=["zip", "csv"], key="v1718_history")
             new_value_file = st.file_uploader("過去時点の企業価値CSV（任意）", type=["csv"], key="v1718_values")
-            st.download_button("過去評価CSVの書式をダウンロード",
+            export_download_button("過去評価CSVの書式をダウンロード",
                                data="コード,評価日,AI参考価値\n".encode("utf-8-sig"),
                                file_name="historical_value_template.csv", mime="text/csv",
                                key="v1718_template")
@@ -9213,10 +9303,10 @@ with admin_tab:
                     st.session_state["v1718_result"] = result
                 except Exception as e:
                     st.session_state.pop("v1718_result", None)
-                    st.error(f"比較バックテストを実行できません: {e}")
+                    export_notice('error', f"比較バックテストを実行できません: {e}")
             if "v1718_result" in st.session_state:
                 summary, trades, unrealized, audit = st.session_state["v1718_result"]
-                show_stock_table(summary, use_container_width=True, hide_index=True)
+                show_stock_table(summary, use_container_width=True, hide_index=True, export_name='value_addon_backtest_summary')
                 st.caption("買い増しは初回の約定から2営業日以上経過し、売り・損切りがなく、%Kが%Dより上で上昇中・%K≤50・終値が平均取得額を上回る場合に1回だけ。追加量は初回の指定比率。損切りは追加後の平均取得額で判定します。")
                 st.caption("銘柄別の独立検証です。過去のTOP50、実際の買付余力、ポートフォリオ収益・最大DD、手数料、税金は再現しません。PFは決済した取引騰落率の単純合算比です。未決済は別表に分離します。")
                 for label, frame, filename in [
@@ -9224,14 +9314,14 @@ with admin_tab:
                     ("未決済明細CSV", unrealized, "value_addon_open.csv"),
                     ("判定・見送り理由CSV", audit, "value_addon_audit.csv"),
                 ]:
-                    st.download_button(label, data=frame.to_csv(index=False).encode("utf-8-sig"),
+                    export_download_button(label, data=frame.to_csv(index=False).encode("utf-8-sig"),
                                        file_name=filename, mime="text/csv", key="v1718_" + filename)
 
     with surge_tab:
         st.caption("旧Ver.5.5系の観察センサーです。正式なBUY/SELLには影響しません。")
         st.write("70点以上＝強い予兆、55点以上＝急騰予兆、40点以上＝変化検知")
         if surge_top50_df.empty:
-            st.info("先に『今日の判定を更新』で企業価値AI TOP50を作成してください。")
+            export_notice('info', "先に『今日の判定を更新』で企業価値AI TOP50を作成してください。")
         else:
             surge_score = pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce")
             strong_n = int((surge_score >= 70).sum())
@@ -9239,10 +9329,10 @@ with admin_tab:
             change_n = int((surge_score >= 40).sum())
             stoch_match_n = int(((surge_score >= 55) & surge_top50_df["Stoch_BUY"].fillna(False).astype(bool)).sum())
             s1,s2,s3,s4 = st.columns(4)
-            s1.metric("強予兆", strong_n)
-            s2.metric("予兆以上", alert_n)
-            s3.metric("変化以上", change_n)
-            s4.metric("予兆＋Stoch", stoch_match_n)
+            export_metric(s1, "強予兆", strong_n)
+            export_metric(s2, "予兆以上", alert_n)
+            export_metric(s3, "変化以上", change_n)
+            export_metric(s4, "予兆＋Stoch", stoch_match_n)
 
             surge_display_cols = [
                 "急騰予兆判定","割安判定","急騰順位","TOP50順位","コード","銘柄名",
@@ -9269,14 +9359,14 @@ with admin_tab:
         st.caption("この欄は研究専用。実売買方式は管理者設定で選択します。")
         st.write("RSI5＝15以下から15上抜け / BB20＝-2σ外から内側復帰")
         if indicator_compare_df.empty:
-            st.info("現在、TOP50内で3方式のいずれかがBUY点灯している銘柄はありません。")
+            export_notice('info', "現在、TOP50内で3方式のいずれかがBUY点灯している銘柄はありません。")
         else:
             raw_compare = indicator_compare_df.copy()
             c1,c2,c3,c4 = st.columns(4)
-            c1.metric("Stoch", int(raw_compare["Stoch_BUY"].fillna(False).astype(bool).sum()) if "Stoch_BUY" in raw_compare else 0)
-            c2.metric("RSI5", int(raw_compare["RSI5_BUY"].fillna(False).astype(bool).sum()) if "RSI5_BUY" in raw_compare else 0)
-            c3.metric("BB20", int(raw_compare["BB20_BUY"].fillna(False).astype(bool).sum()) if "BB20_BUY" in raw_compare else 0)
-            c4.metric("2方式以上", int((pd.to_numeric(raw_compare.get("一致数", 0), errors="coerce") >= 2).sum()))
+            export_metric(c1, "Stoch", int(raw_compare["Stoch_BUY"].fillna(False).astype(bool).sum()) if "Stoch_BUY" in raw_compare else 0)
+            export_metric(c2, "RSI5", int(raw_compare["RSI5_BUY"].fillna(False).astype(bool).sum()) if "RSI5_BUY" in raw_compare else 0)
+            export_metric(c3, "BB20", int(raw_compare["BB20_BUY"].fillna(False).astype(bool).sum()) if "BB20_BUY" in raw_compare else 0)
+            export_metric(c4, "2方式以上", int((pd.to_numeric(raw_compare.get("一致数", 0), errors="coerce") >= 2).sum()))
 
             comp_full = prepare_admin_display(raw_compare)
             comp_cols = [
@@ -9311,142 +9401,7 @@ with admin_tab:
             with st.expander("保有銘柄の詳細列", expanded=False):
                 admin_judgement_table(held_full, "v7_held_full", 500)
         else:
-            st.info("保有情報はありません。SBI約定履歴CSVを読み込んでください。")
-
-# ------------------------------------------------------------
-# ZIP — メイン画面の最下部に1ボタンだけ
-# ------------------------------------------------------------
-st.divider()
-try:
-    zip_buf=io.BytesIO()
-    with ZipFile(zip_buf,"w") as zf:
-        settings_df=pd.DataFrame([{
-            "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
-            "買付余力（短期）":short_buying_power,"保有件数":len(held_codes),
-            "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
-            "詳細企業価値評価件数設定":int(universe_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" else 0,
-            "固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
-            "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "売買ロジック":live_trade_method, "Stoch不使用の試験採用":bool(replacement_live), "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(filter_downtrend), "クロス多発除外":bool(filter_churn), "購入予算方式":cap_mode,
-            "最大保有銘柄数":"上限なし", "1銘柄購入予算":maxbuy, "通常注文予算":"上限なし（買付余力内）", "注文方式":execution_mode,
-            "IFDOCO参考利確率":ifd_take_profit,"BUY条件":live_trade_method + "＋全モード共通財務・日足確認" + ("＋クロス多発除外" if not replacement_live else ""),"管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
-            "割高の新規BUY除外":True,
-            "SELL条件":("全保有銘柄 / 前日までの20日安値を終値で割る または終値で含み損 -7.0%" if replacement_live else "全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%"),
-            "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":live_universe_mode == "固定45銘柄",
-            "短期反転フィルター":bool(churn_filter),
-            "トレンド振れ幅フィルター実売買":bool(quality_mode),
-        }])
-        zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
-        sbi_diagnostics = st.session_state.get("sbi_buy_signal_diagnostics")
-        if isinstance(sbi_diagnostics, pd.DataFrame):
-            zf.writestr("sbi_buy_signal_diagnostics.csv", sbi_diagnostics.to_csv(index=False, encoding="utf-8-sig"))
-        update_times = dict(st.session_state.get("v172429_update_times", {}))
-        update_times["SBI欄の処理（今回の表示）"] = sbi_elapsed
-        zf.writestr("update_processing_times.csv", pd.DataFrame([{"処理": k, "秒": v} for k, v in update_times.items()]).to_csv(index=False, encoding="utf-8-sig"))
-        zf.writestr("finance_acquisition_status.csv",finance_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
-        for mb_filename, mb_frame in (("multibagger_candidates.csv", multibagger_candidates),
-                                     ("multibagger_research_audit.csv", multibagger_audit),
-                                     ("multibagger_rules.csv", MULTIBAGGER_RULES),
-                                     ("multibagger_growth_fetch.csv", mb_extra)):
-            zf.writestr(mb_filename, mb_frame.to_csv(index=False, encoding="utf-8-sig"))
-        zf.writestr("daily_acquisition_diagnostics.csv",daily_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
-        if isinstance(universe_df,pd.DataFrame):
-            zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
-        if isinstance(value_top50_df,pd.DataFrame):
-            zf.writestr("value_ai_top50.csv",value_top50_df.to_csv(index=False,encoding="utf-8-sig"))
-        if signal_first:
-            zf.writestr("signal_first_candidates.csv",signal_first_audit_df.to_csv(index=False,encoding="utf-8-sig"))
-            zf.writestr("signal_first_values.csv",signal_value_df.to_csv(index=False,encoding="utf-8-sig"))
-        if isinstance(churn_audit_df,pd.DataFrame):
-            zf.writestr("stoch_churn_audit.csv",churn_audit_df.to_csv(index=False,encoding="utf-8-sig"))
-        zf.writestr("stoch_signal_quality_audit.csv", signal_audit_df.to_csv(index=False,encoding="utf-8-sig"))
-        zf.writestr("overvalued_buy_exclusions.csv", overvalued_buy_exclusions_df.to_csv(index=False,encoding="utf-8-sig"))
-        if isinstance(daily_bar_status_df,pd.DataFrame):
-            zf.writestr("daily_bar_freshness.csv",daily_bar_status_df.to_csv(index=False,encoding="utf-8-sig"))
-        if not sbi_trades_df.empty:
-            zf.writestr("sbi_execution_history.csv",sbi_trades_df.to_csv(index=False,encoding="utf-8-sig"))
-        if confirmed:
-            zf.writestr("current_holdings.csv",pd.DataFrame([{
-                "コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"],
-            } for c,v in confirmed.items()]).to_csv(index=False,encoding="utf-8-sig"))
-        if not sbi_warning_df.empty:
-            zf.writestr("sbi_history_warnings.csv",sbi_warning_df.to_csv(index=False,encoding="utf-8-sig"))
-        buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","ロジック","63日騰落率%","%K","%D","候補スコア","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","均等配分予算","見送り理由"]
-        if isinstance(buy_view, pd.DataFrame) and not buy_view.empty:
-            buy_export = buy_view.copy()
-        else:
-            buy_export = pd.DataFrame(columns=buy_cols_default)
-        zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
-        zf.writestr("buy_candidate_exclusions.csv", excluded_buy_df.to_csv(index=False, encoding="utf-8-sig"))
-        _bottom_saved = st.session_state.get('v172451_bottom_result')
-        if _bottom_saved:
-            if isinstance(_bottom_saved.get('trades'), pd.DataFrame):
-                zf.writestr('bottom_independent_trades.csv', _bottom_saved['trades'].to_csv(index=False, encoding='utf-8-sig'))
-            for _key in ['ranking', 'audit', 'coverage']:
-                zf.writestr('bottom_research_' + _key + '.csv', _bottom_saved[_key].to_csv(index=False, encoding='utf-8-sig'))
-            zf.writestr('bottom_research_metadata.csv', pd.DataFrame([{k: v for k, v in _bottom_saved.items() if k not in ['ranking', 'audit', 'coverage', 'prices', 'trades']}]).to_csv(index=False, encoding='utf-8-sig'))
-        zf.writestr("reference_ifdoco.csv",build_reference_ifdoco(buy_view, ifd_take_profit, 7.0).to_csv(index=False,encoding="utf-8-sig"))
-        zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
-        compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()
-        zf.writestr("indicator_compare_candidates.csv", compare_export.to_csv(index=False,encoding="utf-8-sig"))
-        # Public research only. Never export credentials, requests or account headers.
-        if news_pick_result:
-            zf.writestr("triple_news_pick.json", json.dumps(news_pick_result, ensure_ascii=False, indent=2))
-        zf.writestr("triple_news_candidate_exclusions.csv", news_pick_exclusions.to_csv(index=False, encoding="utf-8-sig"))
-        surge_export = surge_top50_df.copy() if isinstance(surge_top50_df, pd.DataFrame) else pd.DataFrame()
-        zf.writestr("surge_prediction_top50.csv", surge_export.to_csv(index=False,encoding="utf-8-sig"))
-        surge_summary = pd.DataFrame([{
-            "生成日時": st.session_state.get("v177_generated_at",""),
-            "対象": live_universe_mode + "（参考センサー）",
-            "強い急騰予兆_70点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 70).sum()),
-            "急騰予兆_55点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55).sum()),
-            "変化検知_40点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 40).sum()),
-            "予兆55点以上かつStoch_BUY": int(((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55) & surge_export.get("Stoch_BUY", pd.Series(False, index=surge_export.index)).fillna(False).astype(bool)).sum()),
-            "株価2000円以上除外": False,
-            "ニュース加点": False,
-            "実売買へ影響": False,
-        }])
-        zf.writestr("surge_prediction_summary.csv", surge_summary.to_csv(index=False,encoding="utf-8-sig"))
-        compare_summary_row = {
-            "生成日時": st.session_state.get("v177_generated_at",""),
-            "実売買方式": live_trade_method,
-            "研究_RSI5": "RSI(5) 15以下から15上抜け",
-            "研究_BB20": "BB20 -2σ外から内側復帰",
-            "Stoch_BUY件数": int(compare_export["Stoch_BUY"].sum()) if not compare_export.empty and "Stoch_BUY" in compare_export else 0,
-            "RSI5_BUY件数": int(compare_export["RSI5_BUY"].sum()) if not compare_export.empty and "RSI5_BUY" in compare_export else 0,
-            "BB20_BUY件数": int(compare_export["BB20_BUY"].sum()) if not compare_export.empty and "BB20_BUY" in compare_export else 0,
-            "2方式以上一致件数": int((pd.to_numeric(compare_export["一致数"], errors="coerce") >= 2).sum()) if not compare_export.empty and "一致数" in compare_export else 0,
-            "実売買へ影響": False,
-        }
-        compare_summary = pd.DataFrame([compare_summary_row])
-        zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
-        status_df=pd.DataFrame([{
-            "本物TOP50モード":live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50","母集団最低200銘柄ガード":False,
-            "固定45銘柄モード":live_universe_mode == "固定45銘柄","固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
-            "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
-            "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
-            "当日確定日足件数":int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum()) if isinstance(daily_bar_status_df,pd.DataFrame) and not daily_bar_status_df.empty else 0,
-            "TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" else 0,
-            "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
-            "一次選抜_流動性重み":np.nan,"一次選抜_トレンド重み":np.nan,"一次選抜_安定性重み":np.nan,
-            "OOS検証済み":False,"OOS_PF参考":np.nan,"5年通算PF参考":np.nan,
-            "BUY候補件数":len(buy_export),"割高除外件数":len(overvalued_buy_exclusions_df),
-            "企業価値未算定件数":int((~value_top50_df["企業価値算定済"].fillna(False)).sum()) if "企業価値算定済" in value_top50_df else 0,
-            "財務直接取得対象件数":len(finance_acquisition_df),
-            "財務直接取得済件数":int(finance_acquisition_df["財務取得状態"].eq("取得済").sum()) if not finance_acquisition_df.empty else 0,
-            "財務直接取得不可件数":int(finance_acquisition_df["財務取得状態"].str.startswith("取得不可").sum()) if not finance_acquisition_df.empty else 0,
-            "財務指標データ取得件数":int(finance_acquisition_df["財務取得状態"].str.startswith("取得済").sum()) if not finance_acquisition_df.empty else 0,
-            "日足診断件数":len(daily_acquisition_df),
-            "SELL候補件数":len(sell_view),"エラー":run_error,
-            "生成日時":st.session_state.get("v177_generated_at","")
-        }])
-        zf.writestr("value_ai_status.csv",status_df.to_csv(index=False,encoding="utf-8-sig"))
-    zip_buf.seek(0)
-    st.download_button("📦 全処理結果ZIP",data=zip_buf.getvalue(),file_name="ver17_all_analysis.zip",mime="application/zip",use_container_width=True,key="v177_zip")
-except Exception as e:
-    st.warning(f"ZIP作成エラー: {e}")
-
-st.caption("売買判断補助です。自動発注は行いません。")
+            export_notice('info', "保有情報はありません。SBI約定履歴CSVを読み込んでください。")
 
 # 高配当監視は通常売買の候補・配分・保有の売り判定を変更しない。
 DIVIDEND_WATCH = (
@@ -9592,7 +9547,7 @@ with dividend_tab:
         template = pd.DataFrame([{'コード': c, '確認日': '', '予想対象期': '',
             '年間予想配当円': '', '予想EPS円': '', '配当・EPSの株式数基準': '未確認',
             '業績・配当確認': '未確認', '根拠URL': ''} for c, _ in DIVIDEND_WATCH])
-        st.download_button('配当・IR確認CSVひな形', template.to_csv(index=False).encode('utf-8-sig'),
+        export_download_button('配当・IR確認CSVひな形', template.to_csv(index=False).encode('utf-8-sig'),
                            'dividend_ir_template.csv', key='div_template')
         st.caption('公式IRで最新予想・減配・下方修正・配当の持続性を確認して入力。配当とEPSは同じ予想期・現在の株式数基準にそろえ、確認日と公式IRのHTTPS URLを記録します。URL内容の自動確認は行いません。')
         st.code('配当・EPSの株式数基準：現在株式数で確認済\n業績・配当確認：維持可能確認済\n確認日：YYYY-MM-DD')
@@ -9604,7 +9559,7 @@ with dividend_tab:
             if not set(template.columns).issubset(div_evidence.columns):
                 raise ValueError('ひな形の列が不足しています')
         except Exception as exc:
-            st.warning('配当情報を採用できません：' + str(exc))
+            export_notice('warning', '配当情報を採用できません：' + str(exc))
             div_evidence = pd.DataFrame()
     div_refresh = st.button('高配当10銘柄の日足を更新', key='div_refresh')
     if run_clicked or div_refresh:
@@ -9627,12 +9582,12 @@ with dividend_tab:
                 st.session_state['div_snapshot'] = {'prices': frames, 'target': target,
                     'phase': phase, 'routes': routes, 'seconds': time.perf_counter() - started}
         except Exception as exc:
-            st.warning('高配当日足の更新を保留しました：' + str(exc))
+            export_notice('warning', '高配当日足の更新を保留しました：' + str(exc))
     snap = st.session_state.get('div_snapshot', {})
     div_now = tokyo_now()
     phase_ok = snap.get('phase') == (str(div_now.date()), div_now.hour >= 16)
     if not phase_ok:
-        st.info('高配当日足を更新してください。古い保存結果から買い検討は出しません。')
+        export_notice('info', '高配当日足を更新してください。古い保存結果から買い検討は出しません。')
     elif 'routes' in snap:
         routes = snap['routes'].values()
         reused = sum(route in ('保存履歴', '確認済み履歴を再利用') for route in routes)
@@ -9644,19 +9599,172 @@ with dividend_tab:
             snap.get('target') if phase_ok else None, tokyo_now().date(),
             buying_power_input, short_confirmed, div_draw, div_yield, div_payout)
     except ValueError as exc:
-        st.warning(str(exc))
+        export_notice('warning', str(exc))
         dividend_watch_df = build_dividend_watch({}, pd.DataFrame(), None, tokyo_now().date(), None, {})
-    st.dataframe(dividend_watch_df, hide_index=True, use_container_width=True)
-    st.download_button('高配当監視CSV', dividend_watch_df.to_csv(index=False).encode('utf-8-sig'),
+    export_dataframe(dividend_watch_df, hide_index=True, use_container_width=True, export_name='dividend_watch')
+    export_download_button('高配当監視CSV', dividend_watch_df.to_csv(index=False).encode('utf-8-sig'),
                        'dividend_watch.csv', key='div_watch_csv')
     st.caption('100株予算には5%の余裕を計上。実際の注文拘束額はSBIで確認。高配当枠の売り条件・成績は未検証のため、本版では監視と買い検討までとします。既存保有の売り条件は現在の通常売買設定を使います。')
 
 with main_tab:
     st.subheader('高配当・暴落時の買い待ち')
     div_candidates = dividend_watch_df[dividend_watch_df['判定'].eq('買い検討')]
+    register_result_table("results/dividend_buy_candidates.csv", div_candidates)
     if div_candidates.empty:
-        st.info('高配当枠：買い検討条件を満たす銘柄はありません。監視リストで不足条件を確認できます。')
+        export_notice('info', '高配当枠：買い検討条件を満たす銘柄はありません。監視リストで不足条件を確認できます。')
     else:
-        st.dataframe(div_candidates[['コード', '銘柄名', '終値', '100株概算円', '予想利回り%']],
-                     hide_index=True, use_container_width=True)
+        export_dataframe(div_candidates[['コード', '銘柄名', '終値', '100株概算円', '予想利回り%']],
+                     hide_index=True, use_container_width=True, export_name='dividend_buy_candidates_display')
         st.caption('通常売買とは別の監視候補です。注文・利確・撤退条件を確認してから判断してください。')
+
+
+# ------------------------------------------------------------
+# ZIP — 監視・検証を含む全処理結果の出力
+# ------------------------------------------------------------
+st.divider()
+try:
+    zip_buf=io.BytesIO()
+    with ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        settings_df=pd.DataFrame([{
+            "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
+            "買付余力（短期）":short_buying_power,"保有件数":len(held_codes),
+            "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
+            "詳細企業価値評価件数設定":int(universe_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" else 0,
+            "固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
+            "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
+            "売買ロジック":live_trade_method, "Stoch不使用の試験採用":bool(replacement_live), "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(filter_downtrend), "クロス多発除外":bool(filter_churn), "購入予算方式":cap_mode,
+            "最大保有銘柄数":"上限なし", "1銘柄購入予算":maxbuy, "通常注文予算":"上限なし（買付余力内）", "注文方式":execution_mode,
+            "IFDOCO参考利確率":ifd_take_profit,"BUY条件":live_trade_method + "＋全モード共通財務・日足確認" + ("＋クロス多発除外" if not replacement_live else ""),"管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
+            "割高の新規BUY除外":True,
+            "SELL条件":("全保有銘柄 / 前日までの20日安値を終値で割る または終値で含み損 -7.0%" if replacement_live else "全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%"),
+            "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":live_universe_mode == "固定45銘柄",
+            "短期反転フィルター":bool(churn_filter),
+            "トレンド振れ幅フィルター実売買":bool(quality_mode),
+        }])
+        zf.writestr("ver17_settings.csv",settings_df.to_csv(index=False,encoding="utf-8-sig"))
+        sbi_diagnostics = st.session_state.get("sbi_buy_signal_diagnostics")
+        if isinstance(sbi_diagnostics, pd.DataFrame):
+            zf.writestr("sbi_buy_signal_diagnostics.csv", sbi_diagnostics.to_csv(index=False, encoding="utf-8-sig"))
+        update_times = dict(st.session_state.get("v172429_update_times", {}))
+        update_times["SBI欄の処理（今回の表示）"] = sbi_elapsed
+        zf.writestr("update_processing_times.csv", pd.DataFrame([{"処理": k, "秒": v} for k, v in update_times.items()]).to_csv(index=False, encoding="utf-8-sig"))
+        zf.writestr("finance_acquisition_status.csv",finance_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
+        for mb_filename, mb_frame in (("multibagger_candidates.csv", multibagger_candidates),
+                                     ("multibagger_research_audit.csv", multibagger_audit),
+                                     ("multibagger_rules.csv", MULTIBAGGER_RULES),
+                                     ("multibagger_growth_fetch.csv", mb_extra)):
+            zf.writestr(mb_filename, mb_frame.to_csv(index=False, encoding="utf-8-sig"))
+        zf.writestr("daily_acquisition_diagnostics.csv",daily_acquisition_df.to_csv(index=False,encoding="utf-8-sig"))
+        if isinstance(universe_df,pd.DataFrame):
+            zf.writestr("japan_large_universe.csv",universe_df.to_csv(index=False,encoding="utf-8-sig"))
+        if isinstance(value_top50_df,pd.DataFrame):
+            zf.writestr("value_ai_top50.csv",value_top50_df.to_csv(index=False,encoding="utf-8-sig"))
+        if signal_first:
+            zf.writestr("signal_first_candidates.csv",signal_first_audit_df.to_csv(index=False,encoding="utf-8-sig"))
+            zf.writestr("signal_first_values.csv",signal_value_df.to_csv(index=False,encoding="utf-8-sig"))
+        if isinstance(churn_audit_df,pd.DataFrame):
+            zf.writestr("stoch_churn_audit.csv",churn_audit_df.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("stoch_signal_quality_audit.csv", signal_audit_df.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("overvalued_buy_exclusions.csv", overvalued_buy_exclusions_df.to_csv(index=False,encoding="utf-8-sig"))
+        if isinstance(daily_bar_status_df,pd.DataFrame):
+            zf.writestr("daily_bar_freshness.csv",daily_bar_status_df.to_csv(index=False,encoding="utf-8-sig"))
+        if not sbi_trades_df.empty:
+            zf.writestr("sbi_execution_history.csv",sbi_trades_df.to_csv(index=False,encoding="utf-8-sig"))
+        if confirmed:
+            zf.writestr("current_holdings.csv",pd.DataFrame([{
+                "コード":c,"銘柄名":name(c),"株数":v["shares"],"取得単価":v["avg_price"],
+            } for c,v in confirmed.items()]).to_csv(index=False,encoding="utf-8-sig"))
+        if not sbi_warning_df.empty:
+            zf.writestr("sbi_history_warnings.csv",sbi_warning_df.to_csv(index=False,encoding="utf-8-sig"))
+        buy_cols_default=["購入優先度","順位","コード","銘柄名","現在株価","参考S株数","概算購入額","ロジック","63日騰落率%","%K","%D","候補スコア","AI_TOP50スコア","割安判定","買付可否","参考購入株数","S株注文参考株数","注文区分","通常注文参考株数","通常注文概算額","余力引当額","均等配分予算","見送り理由"]
+        if isinstance(buy_view, pd.DataFrame) and not buy_view.empty:
+            buy_export = buy_view.copy()
+        else:
+            buy_export = pd.DataFrame(columns=buy_cols_default)
+        zf.writestr("stoch_buy_candidates.csv",buy_export.to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("buy_candidate_exclusions.csv", excluded_buy_df.to_csv(index=False, encoding="utf-8-sig"))
+        _bottom_saved = st.session_state.get('v172451_bottom_result')
+        if _bottom_saved:
+            if isinstance(_bottom_saved.get('trades'), pd.DataFrame):
+                zf.writestr('bottom_independent_trades.csv', _bottom_saved['trades'].to_csv(index=False, encoding='utf-8-sig'))
+            for _key in ['ranking', 'audit', 'coverage']:
+                zf.writestr('bottom_research_' + _key + '.csv', _bottom_saved[_key].to_csv(index=False, encoding='utf-8-sig'))
+            zf.writestr('bottom_research_metadata.csv', pd.DataFrame([{k: v for k, v in _bottom_saved.items() if k not in ['ranking', 'audit', 'coverage', 'prices', 'trades']}]).to_csv(index=False, encoding='utf-8-sig'))
+        zf.writestr("reference_ifdoco.csv",build_reference_ifdoco(buy_view, ifd_take_profit, 7.0).to_csv(index=False,encoding="utf-8-sig"))
+        zf.writestr("stoch_sell_candidates.csv",sell_view.to_csv(index=False,encoding="utf-8-sig"))
+        compare_export = indicator_compare_df.copy() if isinstance(indicator_compare_df, pd.DataFrame) else pd.DataFrame()
+        zf.writestr("indicator_compare_candidates.csv", compare_export.to_csv(index=False,encoding="utf-8-sig"))
+        # Public research only. Never export credentials, requests or account headers.
+        if news_pick_result:
+            zf.writestr("triple_news_pick.json", json.dumps(news_pick_result, ensure_ascii=False, indent=2))
+        zf.writestr("triple_news_candidate_exclusions.csv", news_pick_exclusions.to_csv(index=False, encoding="utf-8-sig"))
+        surge_export = surge_top50_df.copy() if isinstance(surge_top50_df, pd.DataFrame) else pd.DataFrame()
+        zf.writestr("surge_prediction_top50.csv", surge_export.to_csv(index=False,encoding="utf-8-sig"))
+        surge_summary = pd.DataFrame([{
+            "生成日時": st.session_state.get("v177_generated_at",""),
+            "対象": live_universe_mode + "（参考センサー）",
+            "強い急騰予兆_70点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 70).sum()),
+            "急騰予兆_55点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55).sum()),
+            "変化検知_40点以上": int((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 40).sum()),
+            "予兆55点以上かつStoch_BUY": int(((pd.to_numeric(surge_export.get("急騰予兆スコア", pd.Series(dtype=float)), errors="coerce") >= 55) & surge_export.get("Stoch_BUY", pd.Series(False, index=surge_export.index)).fillna(False).astype(bool)).sum()),
+            "株価2000円以上除外": False,
+            "ニュース加点": False,
+            "実売買へ影響": False,
+        }])
+        zf.writestr("surge_prediction_summary.csv", surge_summary.to_csv(index=False,encoding="utf-8-sig"))
+        compare_summary_row = {
+            "生成日時": st.session_state.get("v177_generated_at",""),
+            "実売買方式": live_trade_method,
+            "研究_RSI5": "RSI(5) 15以下から15上抜け",
+            "研究_BB20": "BB20 -2σ外から内側復帰",
+            "Stoch_BUY件数": int(compare_export["Stoch_BUY"].sum()) if not compare_export.empty and "Stoch_BUY" in compare_export else 0,
+            "RSI5_BUY件数": int(compare_export["RSI5_BUY"].sum()) if not compare_export.empty and "RSI5_BUY" in compare_export else 0,
+            "BB20_BUY件数": int(compare_export["BB20_BUY"].sum()) if not compare_export.empty and "BB20_BUY" in compare_export else 0,
+            "2方式以上一致件数": int((pd.to_numeric(compare_export["一致数"], errors="coerce") >= 2).sum()) if not compare_export.empty and "一致数" in compare_export else 0,
+            "実売買へ影響": False,
+        }
+        compare_summary = pd.DataFrame([compare_summary_row])
+        zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
+        status_df=pd.DataFrame([{
+            "本物TOP50モード":live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50","母集団最低200銘柄ガード":False,
+            "固定45銘柄モード":live_universe_mode == "固定45銘柄","固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
+            "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
+            "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
+            "当日確定日足件数":int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum()) if isinstance(daily_bar_status_df,pd.DataFrame) and not daily_bar_status_df.empty else 0,
+            "TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" else 0,
+            "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
+            "一次選抜_流動性重み":np.nan,"一次選抜_トレンド重み":np.nan,"一次選抜_安定性重み":np.nan,
+            "OOS検証済み":False,"OOS_PF参考":np.nan,"5年通算PF参考":np.nan,
+            "BUY候補件数":len(buy_export),"割高除外件数":len(overvalued_buy_exclusions_df),
+            "企業価値未算定件数":int((~value_top50_df["企業価値算定済"].fillna(False)).sum()) if "企業価値算定済" in value_top50_df else 0,
+            "財務直接取得対象件数":len(finance_acquisition_df),
+            "財務直接取得済件数":int(finance_acquisition_df["財務取得状態"].eq("取得済").sum()) if not finance_acquisition_df.empty else 0,
+            "財務直接取得不可件数":int(finance_acquisition_df["財務取得状態"].str.startswith("取得不可").sum()) if not finance_acquisition_df.empty else 0,
+            "財務指標データ取得件数":int(finance_acquisition_df["財務取得状態"].str.startswith("取得済").sum()) if not finance_acquisition_df.empty else 0,
+            "日足診断件数":len(daily_acquisition_df),
+            "SELL候補件数":len(sell_view),"エラー":run_error,
+            "生成日時":st.session_state.get("v177_generated_at","")
+        }])
+        zf.writestr("value_ai_status.csv",status_df.to_csv(index=False,encoding="utf-8-sig"))
+        register_result_prices("results/live_daily_prices.csv", data)
+        if _bottom_saved:
+            register_result_prices("results/bottom_daily_prices.csv", _bottom_saved.get("prices", {}))
+        if snap:
+            register_result_prices("results/dividend_daily_prices.csv", snap.get("prices", {}))
+        register_result_table("diagnostics/dividend_acquisition.csv", pd.DataFrame([
+            {"コード": c, "銘柄名": label, "取得経路": snap.get("routes", {}).get(c + ".T", "未確認"),
+             "日足基準日": snap.get("target", ""), "取得秒数（全銘柄）": snap.get("seconds"),
+             "今回の評価に使用": phase_ok and c + ".T" in snap.get("prices", {})}
+            for c, label in DIVIDEND_WATCH
+        ]))
+        register_result_table("results/dividend_settings.csv", pd.DataFrame([{
+            "高値からの下落率下限%": div_draw, "予想利回り下限%": div_yield, "配当性向上限%": div_payout,
+        }]))
+        write_registered_results(zf)
+    zip_buf.seek(0)
+    st.download_button("📦 全処理結果ZIP",data=zip_buf.getvalue(),file_name="ver17_all_analysis.zip",mime="application/zip",use_container_width=True,key="v177_zip")
+except Exception as e:
+    st.warning(f"ZIP作成エラー: {e}")
+
+st.caption("売買判断補助です。自動発注は行いません。")
+

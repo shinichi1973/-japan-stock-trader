@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.24.47
-# BUILD: VER17-24-47-FLOW-RESEARCH-20261026
+# 日本株 AI投資アシスタント Ver.17.25.11
+# BUILD: VER17-25-11-STOCH-GC-20261110
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.10",
+    page_title="日本株 AI投資アシスタント Ver.17.25.11",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.10 高配当監視の日足一括取得"
-BUILD = "VER17-25-10-DIVIDEND-DAILY-BATCH-20261108"
+VERSION = "17.25.11 Stoch新規買い条件の見直し"
+BUILD = "VER17-25-11-STOCH-GC-20261110"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -4147,7 +4147,8 @@ def signal_first_candidates(data, held_codes, min_turnover=0, filter_downtrend=F
         metrics = selection_range_metrics(df)
         if metrics["値幅区分"] != "値動きが大きい":
             reasons.append("値動きが大きい条件未達（ATR14/終値3%未満または不明）")
-        if not metrics["安値切上げ"]:
+        # Stochでは反発初動を拾えるよう、安値切上げを参考表示に留める。
+        if replacement and not metrics["安値切上げ"]:
             reasons.append("安値切上げ未確認")
         if df.attrs.get("daily_bar_status") != "🟢 当日確定":
             reasons.append("最新確定日足を確認できず")
@@ -5888,7 +5889,12 @@ with admin_tab:
         filter_downtrend = False  # 下降トレンドによる新規買い除外を解除
         filter_churn = not replacement_live
         st.caption("全監視対象で割高・赤字予想・財務未確認・日足未確定を新規買いから除外します。Stochでは短期クロス多発も除外します。下降トレンドは新規買い除外に使用しません。成績改善は未検証です。")
-        st.caption("値幅：ATR14/終値が3%以上＝大、1.5%以上＝中、それ未満＝小。大のみ新規対象。安値切上げ：直近3つの10営業日安値が順に上昇し、終値が25日平均より上。20日平均売買代金は最低1億円。国内財務の判定不能は除外。")
+        if signal_first:
+            st.caption("値幅：ATR14/終値が3%以上＝大、1.5%以上＝中、それ未満＝小。大のみ新規対象。20日平均売買代金は最低1億円。")
+            if replacement_live:
+                st.caption("試験方式の安値切上げ条件：直近3区間（各10営業日）の安値が順に上がり、終値が25日平均より上。")
+            else:
+                st.caption("Stochの新規買いでは、安値切上げと終値が25日平均より上かどうかは除外条件にしません。")
         cap_mode = "上限なし（買付余力を候補へ均等配分）"
         purchase_cap = None
         lot_cap = None
@@ -5919,7 +5925,7 @@ with admin_tab:
         else:
             export_metric(c1, "日足・財務を取得する新規監視対象", "45銘柄" if live_universe_mode == "固定45銘柄" else f"上位{TOPIX_SCAN_LIMIT}銘柄")
         c2.caption("保有銘柄は監視対象外でも売り判定のため取得します。")
-        st.caption(f"標準選定：TOPIX＋グロース → 国内売買代金上位{TOPIX_SCAN_LIMIT} → 値動き・買いサイン・流動性・安値切上げ・国内財務を確認。AI選定モードも売買代金で先に絞り込みます。")
+        st.caption(f"標準選定：TOPIX＋グロース → 国内売買代金上位{TOPIX_SCAN_LIMIT} → 値動き・買いサイン・流動性・国内財務を確認。AI選定モードも売買代金で先に絞り込みます。")
         st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
         churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
         st.caption("今回の主ロジックでは短期反転除外を使用しません。")
@@ -6301,9 +6307,10 @@ if not signal_audit_df.empty:
     if signal_first and not signal_first_audit_df.empty:
         with st.expander("買い条件ごとの通過・除外数", expanded=False):
             _checks = [("値幅ATR3%以上", "値動きが大きい条件未達"),
-                       ("30営業日安値切上げ", "安値切上げ未確認"),
                        ("日足確認", "最新確定日足"), ("流動性", "流動性不足"),
                        ("クロス反転検査", "DCが")]
+            if replacement_live:
+                _checks.insert(1, ("30営業日安値切上げ", "安値切上げ未確認"))
             _breakdown = [{"条件": label, "買いサイン内の除外数": int(signal_first_audit_df["抽出除外理由"].str.contains(pattern, regex=False, na=False).sum())}
                           for label, pattern in _checks]
             export_dataframe(pd.DataFrame(_breakdown), hide_index=True, use_container_width=True, export_name='buy_exclusion_breakdown')
@@ -9700,6 +9707,7 @@ try:
             "売買ロジック":live_trade_method, "Stoch不使用の試験採用":bool(replacement_live), "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(filter_downtrend), "クロス多発除外":bool(filter_churn), "購入予算方式":cap_mode,
             "最大保有銘柄数":"上限なし", "1銘柄購入予算":maxbuy, "通常注文予算":"上限なし（買付余力内）", "注文方式":execution_mode,
             "IFDOCO参考利確率":ifd_take_profit,"BUY条件":live_trade_method + "＋全モード共通財務・日足確認" + ("＋クロス多発除外" if not replacement_live else ""),"管理者比較":"RSI5 / BB20 / 急騰予兆（すべて実売買には不使用）",
+            "安値切上げを新規BUYに使用":bool(signal_first and replacement_live),
             "割高の新規BUY除外":True,
             "SELL条件":("全保有銘柄 / 前日までの20日安値を終値で割る または終値で含み損 -7.0%" if replacement_live else "全保有銘柄 / Slow Stoch DC または終値で含み損 -7.0%"),
             "旧49銘柄固定ユニバース使用":False,"検証済み45銘柄固定ユニバース使用":live_universe_mode == "固定45銘柄",

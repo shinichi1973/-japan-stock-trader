@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.25.14
-# BUILD: VER17-25-14-REBOUND-RANK-20261114
+# 日本株 AI投資アシスタント Ver.17.25.15
+# BUILD: VER17-25-15-REBOUND-UI-20261114
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.14",
+    page_title="日本株 AI投資アシスタント Ver.17.25.15",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.14 急落反発研究"
-BUILD = "VER17-25-14-REBOUND-RANK-20261114"
+VERSION = "17.25.15 急落反発研究"
+BUILD = "VER17-25-15-REBOUND-UI-20261114"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -248,7 +248,7 @@ STOCK_NAMES = {
     "3444":"菊池製作所","5885":"ジーデップ・アドバンス",
     "6324":"ハーモニック・ドライブ・システムズ","6506":"安川電機",
     "6629":"テクノホライゾン","6954":"ファナック","6965":"浜松ホトニクス",
-    "7012":"川崎重工業","6085":"アーキテクツ・スタジオ・ジャパン",
+    "7012":"川崎重工業","7011":"三菱重工業","7936":"アシックス","6085":"アーキテクツ・スタジオ・ジャパン",
 }
 
 # 検証ZIPで5年間の日足が揃った旧固定リストの45銘柄。
@@ -8722,6 +8722,20 @@ def rebound_auto_inputs(data, threshold, diagnostic):
     return prices, ranks, evidence, pd.Timestamp(target), ranking_diagnostics
 
 
+def rebound_candidate_display(recent):
+    # A stock can meet several stages. Show its highest stage in the summary.
+    stage_order = {stage: index for index, stage in enumerate(REBOUND_STAGES)}
+    strongest = (recent.assign(段階=recent["条件"].map(stage_order))
+                 .sort_values(["段階", "急落率%", "コード"], ascending=[False, True, True])
+                 .drop_duplicates("コード").copy())
+    strongest["銘柄名"] = strongest.apply(
+        lambda row: f'{row["銘柄名"]}（{row["コード"]}）'
+        if row["銘柄名"] != row["コード"] else row["コード"], axis=1)
+    strongest["確認状況"] = strongest["条件"].map(dict(zip(
+        REBOUND_STAGES, ("急落を検出", "業績・開示を確認", "下げ止まりを確認"))))
+    return strongest[["判定", "銘柄名", "急落率%", "確認状況"]]
+
+
 def render_rebound_research(data, buying_power):
     threshold = st.number_input("急落率の下限（%）", 3.0, 30.0, 7.0, .5, key="rebound_threshold")
     st.caption("東証の売買代金TOP50と確定日足を自動取得します。")
@@ -8766,49 +8780,58 @@ def render_rebound_research(data, buying_power):
     if prices.empty or ranks.empty:
         st.info("日足と確定順位を用意してください。")
         return
-    st.subheader(f"買い判定（{latest:%Y-%m-%d} 入力データ）")
+    st.subheader(f"急落反発の判定（{latest:%m/%d}）")
     if latest in excluded or not ranks["日付"].eq(latest).any():
-        st.info("最新入力日の確定順位と全50銘柄の日足が揃っていません。")
+        st.info("東証TOP50の確定日足が揃うまで判定を保留します。")
     elif signals.empty or not signals["日付"].eq(latest).any():
-        st.info("最新入力日に条件を満たす候補はありません。")
+        st.info("条件に該当する銘柄はありません。")
     else:
         recent = signals.loc[signals["日付"].eq(latest)].copy()
+        recent["銘柄名"] = recent["コード"].map(name)
         recent["判定"] = np.where(recent["条件"].eq(REBOUND_STAGES[2]), "研究買い", "比較候補")
         recent["100株参考額"] = recent["終値"] * 100
         if buying_power:
             recent["100株参考余力"] = buying_power - recent["100株参考額"]
-        show_stock_table(recent, hide_index=True, use_container_width=True, export_name="rebound_buy_signals")
+        simple = rebound_candidate_display(recent)
+        ready = int(simple["判定"].eq("研究買い").sum())
+        st.write(f"研究買い {ready}銘柄 ｜ 比較候補 {len(simple) - ready}銘柄")
+        st.dataframe(simple, hide_index=True, use_container_width=True)
+        with st.expander("判定の詳細・100株参考額"):
+            show_stock_table(recent, hide_index=True, use_container_width=True,
+                             export_name="rebound_buy_signals")
     recent_ir = evidence.loc[evidence["日付"].eq(latest)].copy()
     if not recent_ir.empty:
         recent_ir = recent_ir.assign(
+            銘柄名=recent_ir["コード"].map(name),
             確認状況=np.select([recent_ir[REBOUND_IR[2:5]].eq("0").any(axis=1),
                         recent_ir[REBOUND_IR[2:5]].eq("1").all(axis=1)],
                        ["条件外", "確認済み"], default="確認待ち"))
-        show_stock_table(recent_ir.replace("", "未確認"), hide_index=True,
-                         use_container_width=True, export_name="rebound_ir_review")
-    st.subheader("バックテスト")
-    st.caption(f"確定TOP50の保存日数 {ranks['日付'].nunique()}日。公開情報から確認できた項目を記録します。"
-               "開示の見出しだけでは重要悪材料なしと判定できないため、確認待ちになります。")
-    if evidence.empty:
-        st.info("業績・開示の確認記録はまだありません。")
-    else:
-        st.caption("業績・開示の記録がない銘柄・日付は、その条件の集計から外れます。")
-    st.caption("翌営業日始値で買い、3日目・5日目の終値で手仕舞い。往復コスト0.20%。"
-               "値動きのない売買日と欠損は除外。取引別集計で、板の約定可否・資金配分は未反映です。")
-    summary = []
-    for days in (3, 5):
-        for stage in REBOUND_STAGES:
-            sample = (trades.loc[trades["条件"].eq(stage) & trades["保有日数"].eq(days), "損益率%"]
-                      if not trades.empty else pd.Series(dtype=float))
-            valid = sample.dropna()
-            summary.append({"条件": stage, "保有日数": days, "集計件数": len(valid),
-                            "除外件数": int(sample.isna().sum()), "平均損益率%": round(valid.mean(), 2),
-                            "勝率%": round(valid.gt(0).mean()*100, 2), "最悪損益率%": round(valid.min(), 2),
-                            "損益−7%以下の件数": int(valid.le(-7).sum())})
-    show_stock_table(pd.DataFrame(summary), hide_index=True, use_container_width=True,
-                     export_name="rebound_backtest_summary")
-    if not trades.empty:
-        register_result_table("results/rebound_backtest_trades.csv", trades)
+        with st.expander("業績・開示の確認状況"):
+            show_stock_table(recent_ir.replace("", "未確認"), hide_index=True,
+                             use_container_width=True, export_name="rebound_ir_review")
+    with st.expander("バックテスト"):
+        st.caption(f"確定TOP50の保存日数 {ranks['日付'].nunique()}日。公開情報から確認できた項目を記録します。"
+                   "開示の見出しだけでは重要悪材料なしと判定できないため、確認待ちになります。")
+        if evidence.empty:
+            st.info("業績・開示の確認記録はまだありません。")
+        else:
+            st.caption("業績・開示の記録がない銘柄・日付は、その条件の集計から外れます。")
+        st.caption("翌営業日始値で買い、3日目・5日目の終値で手仕舞い。往復コスト0.20%。"
+                   "値動きのない売買日と欠損は除外。取引別集計で、板の約定可否・資金配分は未反映です。")
+        summary = []
+        for days in (3, 5):
+            for stage in REBOUND_STAGES:
+                sample = (trades.loc[trades["条件"].eq(stage) & trades["保有日数"].eq(days), "損益率%"]
+                          if not trades.empty else pd.Series(dtype=float))
+                valid = sample.dropna()
+                summary.append({"条件": stage, "保有日数": days, "集計件数": len(valid),
+                                "除外件数": int(sample.isna().sum()), "平均損益率%": round(valid.mean(), 2),
+                                "勝率%": round(valid.gt(0).mean()*100, 2), "最悪損益率%": round(valid.min(), 2),
+                                "損益−7%以下の件数": int(valid.le(-7).sum())})
+        show_stock_table(pd.DataFrame(summary), hide_index=True, use_container_width=True,
+                         export_name="rebound_backtest_summary")
+        if not trades.empty:
+            register_result_table("results/rebound_backtest_trades.csv", trades)
 
 
 with rebound_tab:

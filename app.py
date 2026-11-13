@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.25.13
-# BUILD: VER17-25-13-REBOUND-AUTO-20261113
+# 日本株 AI投資アシスタント Ver.17.25.14
+# BUILD: VER17-25-14-REBOUND-RANK-20261114
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.13",
+    page_title="日本株 AI投資アシスタント Ver.17.25.14",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.13 急落反発研究"
-BUILD = "VER17-25-13-REBOUND-AUTO-20261113"
+VERSION = "17.25.14 急落反発研究"
+BUILD = "VER17-25-14-REBOUND-RANK-20261114"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -8489,31 +8489,80 @@ def rebound_research(prices, ranks, evidence, threshold):
     return pd.DataFrame(signals), pd.DataFrame(trades), excluded
 
 
-REBOUND_RANK_URL = "https://finance.yahoo.co.jp/stocks/ranking/tradingValueHigh?market=tokyoAll"
+REBOUND_RANK_URL = "https://finance.yahoo.co.jp/stocks/ranking/tradingValueHigh"
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+def rebound_rank_complete(rows, target):
+    return (len(rows) == 50 and all(row[0] == target for row in rows)
+            and {row[2] for row in rows} == set(range(1, 51))
+            and len({row[1] for row in rows if re.fullmatch(r"[0-9A-Z]{4}", row[1])}) == 50)
+
+
+def rebound_parse_rank_page(html):
+    plain = _finance_plain(html)
+    stamp = re.search(r"更新日時[：:](20\d{2}/\d{1,2}/\d{1,2})(\d{1,2}:\d{2})", plain)
+    updated = pd.Timestamp(" ".join(stamp.groups())) if stamp else None
+    rows = []
+    for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", html, re.S | re.I):
+        first = re.match(r"\s*<t[dh]\b[^>]*>(.*?)</t[dh]>", row, re.S | re.I)
+        if not first:
+            continue
+        rank = _finance_plain(first.group(1))
+        if not rank.isdecimal():
+            continue
+        ticker = re.search(r"/quote/([0-9A-Z]{4})\.([A-Z])(?=[^0-9A-Za-z]|$)", row)
+        rows.append((int(rank), ticker.groups() if ticker else None))
+    return updated, rows
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def rebound_market_rank(target):
-    response = requests.get(REBOUND_RANK_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-    response.raise_for_status()
-    plain = _finance_plain(response.text)
-    stamp = re.search(r"更新日時[：:](20\d{2}/\d{1,2}/\d{1,2})\s*(\d{1,2}:\d{2})", plain)
-    if not stamp:
-        raise ValueError("ランキングの更新日時を確認できません")
-    updated = pd.Timestamp(" ".join(stamp.groups()))
-    if updated.normalize() != pd.Timestamp(target) or updated.time() < datetime.strptime("15:30", "%H:%M").time():
-        raise ValueError("対象日大引け後の順位がまだ確認できません")
-    rows = {}
-    for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", response.text, re.S | re.I):
-        first = re.search(r"<td\b[^>]*>(.*?)</td>", row, re.S | re.I)
-        ticker = re.search(r'/quote/([0-9A-Z]{4})\.T(?:["\x27/?#])', row)
-        if first and ticker:
-            rank = _finance_plain(first.group(1)).strip()
-            if rank.isdecimal():
-                rows[int(rank)] = ticker.group(1)
-    if set(rows) != set(range(1, 51)) or len(set(rows.values())) != 50:
-        raise ValueError("東証の売買代金1〜50位を確認できません")
-    return [[target, rows[rank], rank] for rank in range(1, 51)]
+    rows, diagnostics = [], []
+    seen_ranks = set()
+    previous_rank = 0
+    first_updated = None
+    for page in range(1, 11):
+        url = f"{REBOUND_RANK_URL}?market=all&page={page}"
+        attempt = {"取得元": url, "対象取引日": target, "基準日": "", "取得元更新日時": "",
+                   "取得件数": 0, "失敗理由": ""}
+        diagnostics.append(attempt)
+        try:
+            response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            response.raise_for_status()
+            updated, entries = rebound_parse_rank_page(response.text)
+            attempt["取得件数"] = sum(ticker is not None and ticker[1] == "T" for _, ticker in entries)
+            if updated is None:
+                raise ValueError("ランキングの更新日時を確認できません")
+            attempt["基準日"] = str(updated.date())
+            attempt["取得元更新日時"] = str(updated)
+            if str(updated.date()) != target or (updated.hour, updated.minute) < (15, 30):
+                raise ValueError("対象日の大引け後のランキングを確認できません")
+            if first_updated is None:
+                first_updated = updated
+            elif updated != first_updated:
+                raise ValueError("ページ間でランキングの更新日時が一致しません")
+            if not entries:
+                raise ValueError("順位表の行を読み取れません")
+            for rank, ticker in entries:
+                if rank != previous_rank + 1:
+                    raise ValueError(f"順位が連続していません（{previous_rank}位の次が{rank}位）")
+                previous_rank = rank
+                if ticker is None:
+                    raise ValueError(f"{rank}位の銘柄コード・市場を読み取れません")
+                ticker, market = ticker
+                if market != "T":
+                    continue
+                if ticker in seen_ranks:
+                    raise ValueError(f"銘柄コードが重複しています（{ticker}）")
+                seen_ranks.add(ticker)
+                rows.append([target, ticker, len(rows) + 1])
+                if len(rows) == 50:
+                    return rows, diagnostics
+        except (requests.RequestException, ValueError) as exc:
+            attempt["失敗理由"] = str(exc)
+            return [], diagnostics
+    diagnostics[-1]["失敗理由"] = f"東証銘柄50件に未達（{len(rows)}件）"
+    return [], diagnostics
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -8552,13 +8601,13 @@ def rebound_snapshot_path():
     return os.path.join(root, "rebound_research")
 
 
-def rebound_save_snapshot(target, rows, evidence):
+def rebound_save_snapshot(target, rows, evidence, ranking_diagnostics):
     root = rebound_snapshot_path()
     os.makedirs(root, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, delete=False) as handle:
         temp = handle.name
         try:
-            json.dump({"ranks": rows, "evidence": evidence}, handle, ensure_ascii=False)
+            json.dump({"ranks": rows, "evidence": evidence, "ranking_diagnostics": ranking_diagnostics}, handle, ensure_ascii=False)
             handle.flush()
             os.replace(temp, os.path.join(root, target + ".json"))
         finally:
@@ -8574,8 +8623,9 @@ def rebound_load_snapshots(target):
             continue
         try:
             saved = json.loads(path.read_text(encoding="utf-8"))
-            ranks.extend(saved["ranks"])
-            evidence.extend(saved["evidence"])
+            if rebound_rank_complete(saved["ranks"], path.stem):
+                ranks.extend(saved["ranks"])
+                evidence.extend(saved["evidence"])
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return ranks, evidence
@@ -8596,7 +8646,7 @@ def rebound_price_frame(data, target):
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=REBOUND_BARS)
 
 
-def rebound_auto_inputs(data, threshold):
+def rebound_auto_inputs(data, threshold, diagnostic):
     from concurrent.futures import ThreadPoolExecutor
     now = tokyo_now()
     status = latest_tse_session_status()
@@ -8606,8 +8656,25 @@ def rebound_auto_inputs(data, threshold):
     session_key = (str(now.date()), now.hour >= 16)
     saved_ranks, saved_evidence = rebound_load_snapshots(target)
     ranks_today = [row for row in saved_ranks if row[0] == target]
+    diagnostic["対象取引日"] = target
+    if ranks_today:
+        snapshot_file = os.path.join(rebound_snapshot_path(), target + ".json")
+        with open(snapshot_file, encoding="utf-8") as handle:
+            ranking_diagnostics = json.load(handle).get("ranking_diagnostics", [])
+        diagnostic.update({"取得元": "保存済み / " + REBOUND_RANK_URL,
+                           "基準日": target, "取得件数": len(ranks_today)})
+    else:
+        ranks_today, ranking_diagnostics = rebound_market_rank(target)
+        diagnostic.update({"取得元": REBOUND_RANK_URL,
+                           "基準日": ranking_diagnostics[-1]["基準日"],
+                           "取得件数": len(ranks_today) or sum(row["取得件数"] for row in ranking_diagnostics)})
+    register_result_table("diagnostics/rebound_rank_attempts.csv", pd.DataFrame(ranking_diagnostics,
+                          columns=["取得元", "対象取引日", "基準日", "取得元更新日時", "取得件数", "失敗理由"]))
     if not ranks_today:
-        ranks_today = rebound_market_rank(target)
+        raise ValueError(ranking_diagnostics[-1]["失敗理由"])
+    register_result_table("results/rebound_tse_top50.csv", pd.DataFrame(ranks_today, columns=REBOUND_RANK))
+    if not any(row[0] == target for row in saved_ranks):
+        rebound_save_snapshot(target, ranks_today, [], ranking_diagnostics)
         saved_ranks.extend(ranks_today)
     tracked = tuple(sorted({row[1] + ".T" for row in saved_ranks if row[0] == target}))
     usable = {t: f for t, f in data.items() if not f.empty and
@@ -8648,17 +8715,21 @@ def rebound_auto_inputs(data, threshold):
             if key not in updates or (row[-1] and not all(str(flag) == "1" for flag in updates[key][2:5])):
                 updates[key] = row
         saved_evidence = [row for row in saved_evidence if row[0] != target] + list(updates.values())
-    rebound_save_snapshot(target, ranks_today, [row for row in saved_evidence if row[0] == target])
+    if auto_rows:
+        rebound_save_snapshot(target, ranks_today, [row for row in saved_evidence if row[0] == target],
+                              ranking_diagnostics)
     evidence = rebound_input(None, REBOUND_IR, pd.DataFrame(saved_evidence, columns=REBOUND_IR))
-    return prices, ranks, evidence, pd.Timestamp(target)
+    return prices, ranks, evidence, pd.Timestamp(target), ranking_diagnostics
 
 
 def render_rebound_research(data, buying_power):
     threshold = st.number_input("急落率の下限（%）", 3.0, 30.0, 7.0, .5, key="rebound_threshold")
     st.caption("東証の売買代金TOP50と確定日足を自動取得します。")
+    diagnostic = {"取得元": REBOUND_RANK_URL, "対象取引日": "", "基準日": "", "取得件数": 0,
+                  "状態": "確認済み", "失敗理由": ""}
     try:
         with st.spinner("急落反発を確認中…"):
-            prices, ranks, evidence, latest = rebound_auto_inputs(data, threshold/100)
+            prices, ranks, evidence, latest, ranking_diagnostics = rebound_auto_inputs(data, threshold/100, diagnostic)
             signals, trades, excluded = rebound_research(prices, ranks, evidence, threshold/100)
         review = evidence.loc[evidence["日付"].eq(latest)].copy()
         pending = review.loc[~review[REBOUND_IR[2:5]].eq("0").any(axis=1)
@@ -8680,11 +8751,16 @@ def render_rebound_research(data, buying_power):
                     daily_ranks = ranks.loc[ranks["日付"].eq(latest)].assign(日付=day)
                     daily_ir = evidence.loc[evidence["日付"].eq(latest)].assign(日付=day)
                     rebound_save_snapshot(day, daily_ranks[REBOUND_RANK].values.tolist(),
-                                          daily_ir[REBOUND_IR].values.tolist())
+                                          daily_ir[REBOUND_IR].values.tolist(), ranking_diagnostics)
                     signals, trades, excluded = rebound_research(prices, ranks, evidence, threshold/100)
     except (requests.RequestException, ValueError, KeyError, TypeError, OSError) as exc:
-        st.warning(f"急落反発の自動判定を保留しました（{exc}）")
+        diagnostic.update({"状態": "保留", "失敗理由": str(exc)})
+        register_result_table("diagnostics/rebound_status.csv", pd.DataFrame([diagnostic]))
+        export_notice("warning", f"急落反発の自動判定を保留しました（{exc}）")
         return
+    if prices.empty or latest in excluded or not ranks["日付"].eq(latest).any():
+        diagnostic.update({"状態": "保留", "失敗理由": "最新取引日のTOP50全銘柄の確定日足が揃っていません"})
+    register_result_table("diagnostics/rebound_status.csv", pd.DataFrame([diagnostic]))
     if excluded:
         st.warning(f"TOP50の日足が揃わない{len(excluded)}日は判定対象外です。")
     if prices.empty or ranks.empty:

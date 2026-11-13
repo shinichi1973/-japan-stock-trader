@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.25.12
-# BUILD: VER17-25-12-REBOUND-20261113
+# 日本株 AI投資アシスタント Ver.17.25.13
+# BUILD: VER17-25-13-REBOUND-AUTO-20261113
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.12",
+    page_title="日本株 AI投資アシスタント Ver.17.25.13",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.12 急落反発研究"
-BUILD = "VER17-25-12-REBOUND-20261113"
+VERSION = "17.25.13 急落反発研究"
+BUILD = "VER17-25-13-REBOUND-AUTO-20261113"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -1824,6 +1824,10 @@ def _parse_kabutan_finance(html, today):
         except ValueError: continue
         if record["published"] > today: continue
         records.append(record)
+    values["_rebound_operating"] = [
+        (r["period"], str(r["published"]), "予" in r["決算期"], _finance_number(r["営業益"]))
+        for r in records if "営業益" in r and np.isfinite(_finance_number(r["営業益"]))
+    ]
     forecasts = [r for r in records if "予" in r["決算期"]]
     actuals = sorted([r for r in records if "予" not in r["決算期"]], key=lambda r:r["period"])
     forecast = max(forecasts, key=lambda r:r["published"]) if forecasts else None
@@ -8485,49 +8489,207 @@ def rebound_research(prices, ranks, evidence, threshold):
     return pd.DataFrame(signals), pd.DataFrame(trades), excluded
 
 
+REBOUND_RANK_URL = "https://finance.yahoo.co.jp/stocks/ranking/tradingValueHigh?market=tokyoAll"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def rebound_market_rank(target):
+    response = requests.get(REBOUND_RANK_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+    response.raise_for_status()
+    plain = _finance_plain(response.text)
+    stamp = re.search(r"更新日時[：:](20\d{2}/\d{1,2}/\d{1,2})\s*(\d{1,2}:\d{2})", plain)
+    if not stamp:
+        raise ValueError("ランキングの更新日時を確認できません")
+    updated = pd.Timestamp(" ".join(stamp.groups()))
+    if updated.normalize() != pd.Timestamp(target) or updated.time() < datetime.strptime("15:30", "%H:%M").time():
+        raise ValueError("対象日大引け後の順位がまだ確認できません")
+    rows = {}
+    for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", response.text, re.S | re.I):
+        first = re.search(r"<td\b[^>]*>(.*?)</td>", row, re.S | re.I)
+        ticker = re.search(r'/quote/([0-9A-Z]{4})\.T(?:["\x27/?#])', row)
+        if first and ticker:
+            rank = _finance_plain(first.group(1)).strip()
+            if rank.isdecimal():
+                rows[int(rank)] = ticker.group(1)
+    if set(rows) != set(range(1, 51)) or len(set(rows.values())) != 50:
+        raise ValueError("東証の売買代金1〜50位を確認できません")
+    return [[target, rows[rank], rank] for rank in range(1, 51)]
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def rebound_auto_evidence(ticker, target):
+    day = pd.Timestamp(target).date()
+    finance_url = f"https://kabutan.jp/stock/?code={ticker}"
+    ir_url = f"https://finance.yahoo.co.jp/quote/{ticker}.T/disclosure"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    finance = requests.get(finance_url, headers=headers, timeout=8)
+    finance.raise_for_status()
+    values = _parse_kabutan_finance(finance.text, day)
+    annual = values.get("_rebound_operating", [])
+    actual = sorted((r for r in annual if not r[2]), key=lambda r:r[0])
+    estimates = sorted((r for r in annual if r[2]), key=lambda r:(r[0], r[1]))
+    growth, guidance = "", ""
+    if len(actual) >= 2:
+        old, last = actual[-2:]
+        if (pd.Period(last[0], "M") - pd.Period(old[0], "M")).n == 12:
+            growth = str(int(last[3] > 0 and last[3] > old[3]))
+    if len(estimates) >= 2:
+        prior, current = estimates[-2:]
+        if prior[0] == current[0] and prior[1] < current[1]:
+            guidance = str(int(current[3] >= prior[3]))
+    disclosure = requests.get(ir_url, headers=headers, timeout=8)
+    disclosure.raise_for_status()
+    visible = re.sub(r"<script\b[^>]*>.*?</script>", "", disclosure.text, flags=re.S | re.I)
+    visible = _finance_plain(visible)
+    if "適時開示情報一覧" not in visible or "TDnet" not in visible:
+        raise ValueError("適時開示一覧を確認できません")
+    bad = re.search(r"下方修正|下方に修正|減配|不適切会計|不正会計|調査委員会|決算発表の延期|上場廃止|継続企業の前提", visible)
+    return [target, ticker, growth, guidance, "0" if bad else "", finance_url + " / " + ir_url]
+
+
+def rebound_snapshot_path():
+    root = os.environ.get("DAILY_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "jp_stock_daily_cache_v21")
+    return os.path.join(root, "rebound_research")
+
+
+def rebound_save_snapshot(target, rows, evidence):
+    root = rebound_snapshot_path()
+    os.makedirs(root, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, delete=False) as handle:
+        temp = handle.name
+        try:
+            json.dump({"ranks": rows, "evidence": evidence}, handle, ensure_ascii=False)
+            handle.flush()
+            os.replace(temp, os.path.join(root, target + ".json"))
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
+
+def rebound_load_snapshots(target):
+    from pathlib import Path
+    ranks, evidence = [], []
+    for path in sorted(Path(rebound_snapshot_path()).glob("????-??-??.json")):
+        if path.stem > target:
+            continue
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            ranks.extend(saved["ranks"])
+            evidence.extend(saved["evidence"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return ranks, evidence
+
+
+def rebound_price_frame(data, target):
+    parts = []
+    for ticker, frame in data.items():
+        bars = frame.loc[frame.index <= pd.Timestamp(target)].copy()
+        if frame.attrs.get("daily_bar_status") != "🟢 当日確定":
+            bars = bars.loc[bars.index < pd.Timestamp(target)].copy()
+        if "Adj Close" in bars:
+            ratio = bars["Adj Close"] / bars["Close"]
+            for col in ("Open", "High", "Low", "Close"):
+                bars[col] = bars[col] * ratio.where(ratio.gt(0) & np.isfinite(ratio), 1.0)
+        if not bars.empty:
+            parts.append(bars.rename_axis("日付").reset_index().assign(コード=code(ticker)))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=REBOUND_BARS)
+
+
+def rebound_auto_inputs(data, threshold):
+    from concurrent.futures import ThreadPoolExecutor
+    now = tokyo_now()
+    status = latest_tse_session_status()
+    if not status.get("confirmed") or pd.isna(status.get("session_date")):
+        raise ValueError("直近取引日の確定待ちです")
+    target = str(pd.Timestamp(status["session_date"]).date())
+    session_key = (str(now.date()), now.hour >= 16)
+    saved_ranks, saved_evidence = rebound_load_snapshots(target)
+    ranks_today = [row for row in saved_ranks if row[0] == target]
+    if not ranks_today:
+        ranks_today = rebound_market_rank(target)
+        saved_ranks.extend(ranks_today)
+    tracked = tuple(sorted({row[1] + ".T" for row in saved_ranks if row[0] == target}))
+    usable = {t: f for t, f in data.items() if not f.empty and
+              pd.Timestamp(f.index.max()).normalize() == pd.Timestamp(target)
+              and f.attrs.get("daily_bar_status") == "🟢 当日確定"}
+    missing = tuple(t for t in tracked if t not in usable)
+    if missing:
+        fetched, _ = batch_domestic_stock_data(missing, session_key, 150)
+        usable.update(fetched)
+    frames = {**data, **usable}
+    for ticker in sorted({row[1] + ".T" for row in saved_ranks} - set(frames)):
+        for provider in ("traders", "yahoo", "sbi"):
+            cached = _daily_cache_read(ticker, provider)
+            if not cached.empty:
+                frames[ticker] = cached
+                break
+    prices = rebound_input(None, REBOUND_BARS, rebound_price_frame(frames, target))
+    ranks = rebound_input(None, REBOUND_RANK, pd.DataFrame(saved_ranks, columns=REBOUND_RANK))
+    blank = pd.DataFrame(columns=REBOUND_IR)
+    signals, _, _ = rebound_research(prices, ranks, blank, threshold)
+    recent_codes = set()
+    if not signals.empty:
+        recent_days = sorted(prices["日付"].unique())[-4:]
+        recent_codes = set(signals.loc[signals["日付"].isin(recent_days), "コード"])
+    auto_rows = []
+    if target == str(now.date()):
+        def check(ticker):
+            try:
+                return rebound_auto_evidence(ticker, target)
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                return [target, ticker, "", "", "", ""]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            auto_rows = list(pool.map(check, sorted(recent_codes & {row[1] for row in ranks_today})))
+    if auto_rows:
+        updates = {tuple(row[:2]):row for row in saved_evidence if row[0] == target}
+        for row in auto_rows:
+            key = tuple(row[:2])
+            if key not in updates or (row[-1] and not all(str(flag) == "1" for flag in updates[key][2:5])):
+                updates[key] = row
+        saved_evidence = [row for row in saved_evidence if row[0] != target] + list(updates.values())
+    rebound_save_snapshot(target, ranks_today, [row for row in saved_evidence if row[0] == target])
+    evidence = rebound_input(None, REBOUND_IR, pd.DataFrame(saved_evidence, columns=REBOUND_IR))
+    return prices, ranks, evidence, pd.Timestamp(target)
+
+
 def render_rebound_research(data, buying_power):
     threshold = st.number_input("急落率の下限（%）", 3.0, 30.0, 7.0, .5, key="rebound_threshold")
-    st.caption("前日終値比で急落を判定。翌営業日向けの研究用です。")
-    with st.expander("入力CSVの列と記録方法"):
-        for label, columns in (("日足", REBOUND_BARS), ("売買代金順位", REBOUND_RANK), ("業績・開示", REBOUND_IR)):
-            st.write(label)
-            st.code(",".join(columns), language=None)
-        st.write("日足は分割調整済みの四本値を使用し、対象銘柄の前日とその後5営業日も用意します。"
-                 "順位は東証の対象市場を統一し、各取引日の確定1〜50位を記録します。"
-                 "業績・開示は判定日の引けまでに公表された情報で確認し、各条件を満たせば1、満たさなければ0、未確認は空欄です。"
-                 "通期見通しが従来の中期計画を下回る場合は0にします。")
-    prices_file = st.file_uploader("日足CSV（未入力時は取得済みの日足）", type=["csv"], key="rebound_prices")
-    ranks_file = st.file_uploader("当時の売買代金TOP50 CSV", type=["csv"], key="rebound_ranks")
-    ir_file = st.file_uploader("当時の業績・開示確認CSV", type=["csv"], key="rebound_ir")
-    if ranks_file is None:
-        st.info("各取引日の確定TOP50を入力すると、買い判定と比較結果が表示されます。")
-        return
+    st.caption("東証の売買代金TOP50と確定日足を自動取得します。")
     try:
-        parts = []
-        if prices_file is None:
-            for ticker, frame in data.items():
-                bars = (frame if frame.attrs.get("daily_bar_status") == "🟢 当日確定"
-                        else frame.iloc[:-1]).copy()
-                if "Adj Close" in bars:
-                    ratio = bars["Adj Close"] / bars["Close"]
-                    for col in ("Open", "High", "Low", "Close"):
-                        bars[col] = bars[col] * ratio.where(ratio.gt(0) & np.isfinite(ratio), 1.0)
-                if not bars.empty:
-                    parts.append(bars.rename_axis("日付").reset_index().assign(コード=code(ticker)))
-        fallback = pd.concat(parts, ignore_index=True) if parts else None
-        prices = rebound_input(prices_file, REBOUND_BARS, fallback)
-        ranks = rebound_input(ranks_file, REBOUND_RANK)
-        evidence = rebound_input(ir_file, REBOUND_IR)
-        signals, trades, excluded = rebound_research(prices, ranks, evidence, threshold/100)
-    except (ValueError, KeyError, TypeError) as exc:
-        st.warning(f"研究データを確認してください（{exc}）")
+        with st.spinner("急落反発を確認中…"):
+            prices, ranks, evidence, latest = rebound_auto_inputs(data, threshold/100)
+            signals, trades, excluded = rebound_research(prices, ranks, evidence, threshold/100)
+        review = evidence.loc[evidence["日付"].eq(latest)].copy()
+        pending = review.loc[~review[REBOUND_IR[2:5]].eq("0").any(axis=1)
+                             & ~review[REBOUND_IR[2:5]].eq("1").all(axis=1)]
+        if not pending.empty and latest.date() == tokyo_now().date():
+            with st.expander("候補の決算・開示を画面で確認（任意）"):
+                ticker = st.selectbox("銘柄コード", pending["コード"].tolist(), key="rebound_review_ticker")
+                links = pending.loc[pending["コード"].eq(ticker), "出典"].iloc[0]
+                for url in links.split(" / "):
+                    if url.startswith("https://"):
+                        st.markdown(f"[確認資料を開く]({url})")
+                checked = st.checkbox("営業増益・通期見通し維持以上・重要悪材料なしを確認",
+                                      key=f"rebound_verified_{latest:%Y%m%d}_{ticker}")
+                if st.button("確認結果を反映", disabled=not checked, key="rebound_verify"):
+                    key = evidence["日付"].eq(latest) & evidence["コード"].eq(ticker)
+                    evidence.loc[key, REBOUND_IR[2:5]] = "1"
+                    evidence.loc[key, "出典"] = (links + " / 画面確認 " + tokyo_now().isoformat()).strip(" /")
+                    day = latest.strftime("%Y-%m-%d")
+                    daily_ranks = ranks.loc[ranks["日付"].eq(latest)].assign(日付=day)
+                    daily_ir = evidence.loc[evidence["日付"].eq(latest)].assign(日付=day)
+                    rebound_save_snapshot(day, daily_ranks[REBOUND_RANK].values.tolist(),
+                                          daily_ir[REBOUND_IR].values.tolist())
+                    signals, trades, excluded = rebound_research(prices, ranks, evidence, threshold/100)
+    except (requests.RequestException, ValueError, KeyError, TypeError, OSError) as exc:
+        st.warning(f"急落反発の自動判定を保留しました（{exc}）")
         return
     if excluded:
         st.warning(f"TOP50の日足が揃わない{len(excluded)}日は判定対象外です。")
     if prices.empty or ranks.empty:
         st.info("日足と確定順位を用意してください。")
         return
-    latest = max(prices["日付"].max(), ranks["日付"].max())
     st.subheader(f"買い判定（{latest:%Y-%m-%d} 入力データ）")
     if latest in excluded or not ranks["日付"].eq(latest).any():
         st.info("最新入力日の確定順位と全50銘柄の日足が揃っていません。")
@@ -8540,9 +8702,19 @@ def render_rebound_research(data, buying_power):
         if buying_power:
             recent["100株参考余力"] = buying_power - recent["100株参考額"]
         show_stock_table(recent, hide_index=True, use_container_width=True, export_name="rebound_buy_signals")
+    recent_ir = evidence.loc[evidence["日付"].eq(latest)].copy()
+    if not recent_ir.empty:
+        recent_ir = recent_ir.assign(
+            確認状況=np.select([recent_ir[REBOUND_IR[2:5]].eq("0").any(axis=1),
+                        recent_ir[REBOUND_IR[2:5]].eq("1").all(axis=1)],
+                       ["条件外", "確認済み"], default="確認待ち"))
+        show_stock_table(recent_ir.replace("", "未確認"), hide_index=True,
+                         use_container_width=True, export_name="rebound_ir_review")
     st.subheader("バックテスト")
+    st.caption(f"確定TOP50の保存日数 {ranks['日付'].nunique()}日。公開情報から確認できた項目を記録します。"
+               "開示の見出しだけでは重要悪材料なしと判定できないため、確認待ちになります。")
     if evidence.empty:
-        st.info("業績・開示の確認履歴を入れると、残りの2条件も比較できます。")
+        st.info("業績・開示の確認記録はまだありません。")
     else:
         st.caption("業績・開示の記録がない銘柄・日付は、その条件の集計から外れます。")
     st.caption("翌営業日始値で買い、3日目・5日目の終値で手仕舞い。往復コスト0.20%。"

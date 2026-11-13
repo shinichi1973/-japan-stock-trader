@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.25.15
-# BUILD: VER17-25-15-REBOUND-UI-20261114
+# 日本株 AI投資アシスタント Ver.17.25.16
+# BUILD: VER17-25-16-REBOUND-DETAIL-20261114
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.15",
+    page_title="日本株 AI投資アシスタント Ver.17.25.16",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.15 急落反発研究"
-BUILD = "VER17-25-15-REBOUND-UI-20261114"
+VERSION = "17.25.16 急落反発研究"
+BUILD = "VER17-25-16-REBOUND-DETAIL-20261114"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -8736,6 +8736,24 @@ def rebound_candidate_display(recent):
     return strongest[["判定", "銘柄名", "急落率%", "確認状況"]]
 
 
+def rebound_detail_display(recent):
+    detail = recent.copy()
+    detail["銘柄"] = detail["銘柄名"].where(
+        detail["銘柄名"].eq(detail["コード"]),
+        detail["銘柄名"] + "（" + detail["コード"] + "）")
+    columns = ["銘柄", "100株参考額"]
+    if "100株参考余力" in detail:
+        columns.append("100株参考余力")
+    columns += ["判定", "条件", "急落率%", "終値", "急落日安値", "順位"]
+    detail = detail.sort_values(["判定", "急落率%", "コード"], ascending=[False, True, True])
+    for column in ("100株参考額", "100株参考余力", "終値", "急落日安値"):
+        if column in detail:
+            detail[column] = detail[column].map(
+                lambda value: f"{value:,.2f}".rstrip("0").rstrip(".") + "円" if pd.notna(value) else "—")
+    detail["急落率%"] = detail["急落率%"].map(lambda value: f"{value:.2f}%")
+    return detail[columns].rename(columns={"急落率%": "急落率", "順位": "売買代金順位"})
+
+
 def render_rebound_research(data, buying_power):
     threshold = st.number_input("急落率の下限（%）", 3.0, 30.0, 7.0, .5, key="rebound_threshold")
     st.caption("東証の売買代金TOP50と確定日足を自動取得します。")
@@ -8797,8 +8815,8 @@ def render_rebound_research(data, buying_power):
         st.write(f"研究買い {ready}銘柄 ｜ 比較候補 {len(simple) - ready}銘柄")
         st.dataframe(simple, hide_index=True, use_container_width=True)
         with st.expander("判定の詳細・100株参考額"):
-            show_stock_table(recent, hide_index=True, use_container_width=True,
-                             export_name="rebound_buy_signals")
+            st.dataframe(rebound_detail_display(recent), hide_index=True, use_container_width=True)
+        register_result_table("tables/rebound_buy_signals.csv", prepare_stock_table(recent))
     recent_ir = evidence.loc[evidence["日付"].eq(latest)].copy()
     if not recent_ir.empty:
         recent_ir = recent_ir.assign(

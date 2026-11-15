@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.25.16
-# BUILD: VER17-25-16-REBOUND-DETAIL-20261114
+# 日本株 AI投資アシスタント Ver.17.25.17
+# BUILD: VER17-25-17-REBOUND-CALENDAR-20261115
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.16",
+    page_title="日本株 AI投資アシスタント Ver.17.25.17",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.16 急落反発研究"
-BUILD = "VER17-25-16-REBOUND-DETAIL-20261114"
+VERSION = "17.25.17 急落反発の営業日照合"
+BUILD = "VER17-25-17-REBOUND-CALENDAR-20261115"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -8432,7 +8432,23 @@ def rebound_input(upload, columns, fallback=None):
     return frame
 
 
-def rebound_research(prices, ranks, evidence, threshold):
+REBOUND_JPX_CALENDAR_URL = "https://www.jpx.co.jp/corporate/about-jpx/calendar/"
+# JPX現物市場の公表休業日。土日は bdate_range で除外する。
+REBOUND_JPX_CLOSED = {
+    2026: "0101 0102 0112 0211 0223 0320 0429 0504 0505 0506 0720 0811 0921 0922 0923 1012 1103 1123 1231",
+    2027: "0101 0111 0211 0223 0322 0429 0503 0504 0505 0719 0811 0920 0923 1011 1103 1123 1231",
+}
+
+
+def rebound_jpx_sessions():
+    years = sorted(REBOUND_JPX_CLOSED)
+    weekdays = pd.bdate_range(f"{years[0]}-01-01", f"{years[-1]}-12-31")
+    holidays = [pd.Timestamp(f"{year}-{day[:2]}-{day[2:]}")
+                for year in years for day in REBOUND_JPX_CLOSED[year].split()]
+    return weekdays.difference(holidays)
+
+
+def rebound_research(prices, ranks, evidence, threshold, *, include_trades=True):
     prices = prices.copy()
     for col in REBOUND_BARS[2:]:
         prices[col] = pd.to_numeric(prices[col], errors="raise")
@@ -8452,13 +8468,23 @@ def rebound_research(prices, ranks, evidence, threshold):
     verified = evidence[REBOUND_IR[2:5]].apply(lambda col: col.astype(str).str.strip().eq("1")).all(axis=1)
     verified &= evidence["出典"].fillna("").str.strip().ne("")
     approved = set(zip(evidence.loc[verified, "コード"], evidence.loc[verified, "日付"]))
-    sessions = pd.DatetimeIndex(sorted(set(prices["日付"]) | set(ranks["日付"])))
+    calendar = rebound_jpx_sessions()
+    if not ranks["日付"].isin(calendar).all():
+        raise ValueError("TOP50に東証休業日または営業日表の対応外の日付があります")
+    available_dates = prices.loc[prices["日付"].isin(calendar), "日付"]
+    if available_dates.empty:
+        return pd.DataFrame(), pd.DataFrame(), excluded
+    # 予定日を算出できるよう最終データ日より先の営業日も保持する。
+    last_observed = max(available_dates.max(), ranks["日付"].max()) if not ranks.empty else available_dates.max()
+    sessions = calendar[calendar >= available_dates.min()]
+    scan_count = sessions.searchsorted(last_observed, side="right")
+    sessions = sessions[:scan_count + 5]
     signals, trades = [], []
     for ticker, group in prices.groupby("コード"):
         bars = group.set_index("日付").reindex(sessions)
         returns = bars["Close"] / bars["Close"].shift() - 1
         shocks = []
-        for i, (day, bar) in enumerate(bars.iterrows()):
+        for i, (day, bar) in enumerate(bars.iloc[:scan_count].iterrows()):
             shocks = [j for j in shocks if i-j <= 3 and bar.Low >= bars["Low"].iloc[j] and bar.Volume > 0]
             rank = members.get((ticker, day))
             if rank is None or i == 0 or bar.Volume <= 0:
@@ -8478,14 +8504,30 @@ def rebound_research(prices, ranks, evidence, threshold):
                           "急落日": sessions[shock], "急落率%": round(returns.iloc[shock]*100, 2),
                           "終値": bar.Close, "急落日安値": bars["Low"].iloc[shock]}
                 signals.append(signal)
+                if not include_trades:
+                    continue
                 for hold in (3, 5):
-                    if i + hold >= len(bars):
-                        continue
-                    entry, sell = bars.iloc[i+1], bars.iloc[i+hold]
-                    valid = (entry.Volume > 0 and sell.Volume > 0
-                             and entry.High > entry.Low and sell.High > sell.Low)
-                    net = (sell.Close / entry.Open - 1 - .002) * 100 if valid else np.nan
-                    trades.append({**signal, "保有日数": hold, "損益率%": net})
+                    buy_day = sessions[i + 1] if i + 1 < len(sessions) else pd.NaT
+                    sell_day = sessions[i + hold] if i + hold < len(sessions) else pd.NaT
+                    issues, pending = [], []
+                    for label, expected in (("買付", buy_day), ("決済", sell_day)):
+                        if pd.isna(expected):
+                            issues.append(label + "予定日が営業日表の対応範囲外")
+                        elif expected > last_observed:
+                            pending.append(label + "予定日がデータ期間外")
+                        else:
+                            row = bars.loc[expected]
+                            if row.isna().any():
+                                issues.append(label + "予定日の日足欠損")
+                            elif row.Volume <= 0 or row.High <= row.Low:
+                                issues.append(label + "予定日に出来高または値幅なし")
+                    state = "除外" if issues else "追跡中" if pending else "集計"
+                    net = np.nan
+                    if state == "集計":
+                        net = (bars.at[sell_day, "Close"] / bars.at[buy_day, "Open"] - 1 - .002) * 100
+                    trades.append({**signal, "保有日数": hold, "買付予定日": buy_day,
+                                   "決済予定日": sell_day, "集計区分": state,
+                                   "理由": "／".join(issues + pending), "損益率%": net})
     return pd.DataFrame(signals), pd.DataFrame(trades), excluded
 
 
@@ -8694,7 +8736,7 @@ def rebound_auto_inputs(data, threshold, diagnostic):
     prices = rebound_input(None, REBOUND_BARS, rebound_price_frame(frames, target))
     ranks = rebound_input(None, REBOUND_RANK, pd.DataFrame(saved_ranks, columns=REBOUND_RANK))
     blank = pd.DataFrame(columns=REBOUND_IR)
-    signals, _, _ = rebound_research(prices, ranks, blank, threshold)
+    signals, _, _ = rebound_research(prices, ranks, blank, threshold, include_trades=False)
     recent_codes = set()
     if not signals.empty:
         recent_days = sorted(prices["日付"].unique())[-4:]
@@ -8835,21 +8877,26 @@ def render_rebound_research(data, buying_power):
         else:
             st.caption("業績・開示の記録がない銘柄・日付は、その条件の集計から外れます。")
         st.caption("翌営業日始値で買い、3日目・5日目の終値で手仕舞い。往復コスト0.20%。"
-                   "値動きのない売買日と欠損は除外。取引別集計で、板の約定可否・資金配分は未反映です。")
+                   "JPX公表の現物市場休業日（2026〜2027年）で予定日を計算します。翌営業日や決済予定日の日足欠損は除外します。"
+                   "取引別集計で、板の約定可否・資金配分は未反映です。")
+        st.markdown(f"[JPXの営業時間・休業日一覧]({REBOUND_JPX_CALENDAR_URL})")
         summary = []
         for days in (3, 5):
             for stage in REBOUND_STAGES:
-                sample = (trades.loc[trades["条件"].eq(stage) & trades["保有日数"].eq(days), "損益率%"]
-                          if not trades.empty else pd.Series(dtype=float))
-                valid = sample.dropna()
+                sample = (trades.loc[trades["条件"].eq(stage) & trades["保有日数"].eq(days)]
+                          if not trades.empty else pd.DataFrame(columns=["損益率%", "集計区分"]))
+                valid = sample["損益率%"].dropna()
                 summary.append({"条件": stage, "保有日数": days, "集計件数": len(valid),
-                                "除外件数": int(sample.isna().sum()), "平均損益率%": round(valid.mean(), 2),
+                                "除外件数": int(sample["集計区分"].eq("除外").sum()),
+                                "追跡中件数": int(sample["集計区分"].eq("追跡中").sum()), "平均損益率%": round(valid.mean(), 2),
                                 "勝率%": round(valid.gt(0).mean()*100, 2), "最悪損益率%": round(valid.min(), 2),
                                 "損益−7%以下の件数": int(valid.le(-7).sum())})
         show_stock_table(pd.DataFrame(summary), hide_index=True, use_container_width=True,
                          export_name="rebound_backtest_summary")
         if not trades.empty:
             register_result_table("results/rebound_backtest_trades.csv", trades)
+            register_result_table("diagnostics/rebound_backtest_exclusions.csv",
+                                  trades.loc[trades["集計区分"].eq("除外")].copy())
 
 
 with rebound_tab:

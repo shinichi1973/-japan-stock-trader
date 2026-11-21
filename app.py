@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.25.17
-# BUILD: VER17-25-17-REBOUND-CALENDAR-20261115
+# 日本株 AI投資アシスタント Ver.17.25.19
+# BUILD: VER17-25-19-DOW-TOP75-20261121
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -41,13 +41,13 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.17",
+    page_title="日本株 AI投資アシスタント Ver.17.25.19",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.17 急落反発の営業日照合"
-BUILD = "VER17-25-17-REBOUND-CALENDAR-20261115"
+VERSION = "17.25.19 ダウ理論・反転研究"
+BUILD = "VER17-25-19-DOW-TOP75-20261121"
 TOPIX_SCAN_LIMIT = 50
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -5814,7 +5814,8 @@ st.markdown(
 st.title("📈 日本株 AI投資アシスタント")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("今日の売買で通常売買とSBI買いシグナルを確認。監視リストでは短期反発と高配当の買い待ち条件を確認します。")
-main_tab, monitor_tab, rebound_tab, admin_tab = st.tabs(["今日の売買", "監視リスト", "急落反発研究", "設定・検証"])
+main_tab, monitor_tab, rebound_tab, dow_tab, admin_tab = st.tabs(
+    ["今日の売買", "監視リスト", "急落反発研究", "ダウ理論・反転研究", "設定・検証"])
 with monitor_tab:
     dividend_tab, bottom_tab = st.tabs(["高配当10銘柄", "短期反発・底打ち"])
 with admin_tab:
@@ -8411,6 +8412,8 @@ if show_legacy_research:
 with bottom_tab:
     render_bottom_research(valuation_master_df, short_confirmed, holdings_verified)
 
+REBOUND_RANK_LIMIT = 75
+REBOUND_LEGACY_RANK_LIMIT = 50
 REBOUND_STAGES = ("急落だけ", "急落＋業績・開示", "さらに下げ止まり確認")
 REBOUND_BARS = ["日付", "コード", "Open", "High", "Low", "Close", "Volume"]
 REBOUND_RANK = ["日付", "コード", "順位"]
@@ -8448,7 +8451,37 @@ def rebound_jpx_sessions():
     return weekdays.difference(holidays)
 
 
-def rebound_research(prices, ranks, evidence, threshold, *, include_trades=True):
+DOW_STAGE = "下げ止まり＋ダウ反転"
+DOW_WAIT = 5
+
+
+def dow_pivots(series, *, low):
+    # 左右2営業日の比較結果を、右側2日目の確定日に記録する。
+    compare = series.lt if low else series.gt
+    pivot = compare(series.shift(2)) & compare(series.shift(1))
+    pivot &= compare(series.shift(-1)) & compare(series.shift(-2))
+    return series.where(pivot).shift(2)
+
+
+def dow_confirmation(bars, i, shock, lows, highs):
+    if bars["Low"].iloc[i] < bars["Low"].iloc[shock]:
+        return "見送り", "急落日安値を割った", np.nan
+    if len(lows) < 2:
+        return "判定保留", "確定した谷が不足", np.nan
+    old, new = lows[-2:]
+    resistance = next((price for j, price in reversed(highs) if old[0] < j < new[0]), np.nan)
+    if pd.isna(resistance):
+        return "判定保留", "二つの谷の間に確定した戻り高値がない", resistance
+    if new[1] < old[1] and len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
+        return "見送り", "高値・安値ともに切り下げ", resistance
+    if new[0] < shock or new[1] <= old[1]:
+        return "判定保留", "急落日以降の安値切り上げを未確認", resistance
+    if bars["Close"].iloc[i] <= resistance:
+        return "反転待ち", "安値を切り上げ。終値での戻り高値突破待ち", resistance
+    return "研究買い", "安値の切り上げと戻り高値突破を確認", resistance
+
+
+def rebound_research(prices, ranks, evidence, threshold, *, include_trades=True, dow_rows=None):
     prices = prices.copy()
     for col in REBOUND_BARS[2:]:
         prices[col] = pd.to_numeric(prices[col], errors="raise")
@@ -8460,8 +8493,10 @@ def rebound_research(prices, ranks, evidence, threshold, *, include_trades=True)
     available = {day: set(rows["コード"]) for day, rows in prices.groupby("日付")}
     excluded = []
     for day, rows in ranks.groupby("日付"):
-        if sorted(rows["順位"]) != list(range(1, 51)):
-            raise ValueError("各取引日の順位には1〜50位を1件ずつ入れてください。")
+        count = len(rows)
+        if (count not in (REBOUND_LEGACY_RANK_LIMIT, REBOUND_RANK_LIMIT)
+                or sorted(rows["順位"]) != list(range(1, count + 1))):
+            raise ValueError("各取引日の順位には1〜75位、または旧記録の1〜50位を1件ずつ入れてください。")
         if not set(rows["コード"]).issubset(available.get(day, set())):
             excluded.append(day)
     members = ranks.loc[~ranks["日付"].isin(excluded)].set_index(["コード", "日付"])["順位"]
@@ -8470,7 +8505,7 @@ def rebound_research(prices, ranks, evidence, threshold, *, include_trades=True)
     approved = set(zip(evidence.loc[verified, "コード"], evidence.loc[verified, "日付"]))
     calendar = rebound_jpx_sessions()
     if not ranks["日付"].isin(calendar).all():
-        raise ValueError("TOP50に東証休業日または営業日表の対応外の日付があります")
+        raise ValueError("順位記録に東証休業日または営業日表の対応外の日付があります")
     available_dates = prices.loc[prices["日付"].isin(calendar), "日付"]
     if available_dates.empty:
         return pd.DataFrame(), pd.DataFrame(), excluded
@@ -8484,21 +8519,50 @@ def rebound_research(prices, ranks, evidence, threshold, *, include_trades=True)
         bars = group.set_index("日付").reindex(sessions)
         returns = bars["Close"] / bars["Close"].shift() - 1
         shocks = []
+        watches = []
+        lows, highs = [], []
+        if dow_rows is not None:
+            valid = bars["Volume"].gt(0)
+            confirmed_lows = dow_pivots(bars["Low"].where(valid), low=True)
+            confirmed_highs = dow_pivots(bars["High"].where(valid), low=False)
         for i, (day, bar) in enumerate(bars.iloc[:scan_count].iterrows()):
             shocks = [j for j in shocks if i-j <= 3 and bar.Low >= bars["Low"].iloc[j] and bar.Volume > 0]
             rank = members.get((ticker, day))
-            if rank is None or i == 0 or bar.Volume <= 0:
-                continue
             ir_ok = (ticker, day) in approved
             picks = []
-            if ir_ok and shocks and bar.Low > bars["Low"].iloc[i-1] and bar.Close > bars["High"].iloc[i-1]:
+            if rank is not None and bar.Volume > 0 and ir_ok and shocks and bar.Low > bars["Low"].iloc[i-1] and bar.Close > bars["High"].iloc[i-1]:
                 picks.append((REBOUND_STAGES[2], shocks[-1]))
                 shocks.clear()
-            if returns.iloc[i] <= -threshold and bars["Volume"].iloc[i-1] > 0:
+            if rank is not None and i > 0 and bar.Volume > 0 and returns.iloc[i] <= -threshold and bars["Volume"].iloc[i-1] > 0:
                 picks.append((REBOUND_STAGES[0], i))
                 if ir_ok:
                     picks.append((REBOUND_STAGES[1], i))
                     shocks.append(i)
+            if dow_rows is not None:
+                for points, series in ((lows, confirmed_lows), (highs, confirmed_highs)):
+                    if pd.notna(series.iloc[i]):
+                        points.append((i - 2, series.iloc[i]))
+                watches.extend((i, shock) for stage, shock in picks if stage == REBOUND_STAGES[2])
+                waiting = []
+                for base, shock in watches:
+                    state, reason, resistance = dow_confirmation(bars, i, shock, lows, highs)
+                    breached = bar.Low < bars["Low"].iloc[shock]
+                    if pd.isna(bar.Volume) or bar.Volume <= 0:
+                        state, reason = "判定保留", "有効な確定日足がないため追跡終了"
+                        breached = True
+                    elif rank is None and not breached:
+                        state, reason = "判定保留", "当日の確定順位の対象外または順位・日足不足"
+                    if state == "研究買い":
+                        picks.append((DOW_STAGE, shock))
+                    elif not breached and i - base < DOW_WAIT:
+                        waiting.append((base, shock))
+                    elif not breached:
+                        reason += "。確認期限終了"
+                    dow_rows.append({"日付": day, "コード": ticker, "判定": state,
+                                     "判定理由": reason, "戻り高値": resistance, "終値": bar.Close,
+                                     "急落日": sessions[shock], "下げ止まり判定日": sessions[base],
+                                     "経過営業日": i - base})
+                watches = waiting
             for stage, shock in picks:
                 signal = {"日付": day, "コード": ticker, "条件": stage, "順位": int(rank),
                           "急落日": sessions[shock], "急落率%": round(returns.iloc[shock]*100, 2),
@@ -8534,10 +8598,10 @@ def rebound_research(prices, ranks, evidence, threshold, *, include_trades=True)
 REBOUND_RANK_URL = "https://finance.yahoo.co.jp/stocks/ranking/tradingValueHigh"
 
 
-def rebound_rank_complete(rows, target):
-    return (len(rows) == 50 and all(row[0] == target for row in rows)
-            and {row[2] for row in rows} == set(range(1, 51))
-            and len({row[1] for row in rows if re.fullmatch(r"[0-9A-Z]{4}", row[1])}) == 50)
+def rebound_rank_complete(rows, target, limit=REBOUND_RANK_LIMIT):
+    return (len(rows) == limit and all(row[0] == target for row in rows)
+            and {row[2] for row in rows} == set(range(1, limit + 1))
+            and len({row[1] for row in rows if re.fullmatch(r"[0-9A-Z]{4}", row[1])}) == limit)
 
 
 def rebound_parse_rank_page(html):
@@ -8598,12 +8662,12 @@ def rebound_market_rank(target):
                     raise ValueError(f"銘柄コードが重複しています（{ticker}）")
                 seen_ranks.add(ticker)
                 rows.append([target, ticker, len(rows) + 1])
-                if len(rows) == 50:
+                if len(rows) == REBOUND_RANK_LIMIT:
                     return rows, diagnostics
         except (requests.RequestException, ValueError) as exc:
             attempt["失敗理由"] = str(exc)
             return [], diagnostics
-    diagnostics[-1]["失敗理由"] = f"東証銘柄50件に未達（{len(rows)}件）"
+    diagnostics[-1]["失敗理由"] = f"東証銘柄{REBOUND_RANK_LIMIT}件に未達（{len(rows)}件）"
     return [], diagnostics
 
 
@@ -8665,7 +8729,9 @@ def rebound_load_snapshots(target):
             continue
         try:
             saved = json.loads(path.read_text(encoding="utf-8"))
-            if rebound_rank_complete(saved["ranks"], path.stem):
+            stored_ranks = saved["ranks"]
+            if (rebound_rank_complete(stored_ranks, path.stem)
+                    or rebound_rank_complete(stored_ranks, path.stem, REBOUND_LEGACY_RANK_LIMIT)):
                 ranks.extend(saved["ranks"])
                 evidence.extend(saved["evidence"])
         except (OSError, ValueError, KeyError, TypeError):
@@ -8699,7 +8765,8 @@ def rebound_auto_inputs(data, threshold, diagnostic):
     saved_ranks, saved_evidence = rebound_load_snapshots(target)
     ranks_today = [row for row in saved_ranks if row[0] == target]
     diagnostic["対象取引日"] = target
-    if ranks_today:
+    cached_full = rebound_rank_complete(ranks_today, target)
+    if cached_full:
         snapshot_file = os.path.join(rebound_snapshot_path(), target + ".json")
         with open(snapshot_file, encoding="utf-8") as handle:
             ranking_diagnostics = json.load(handle).get("ranking_diagnostics", [])
@@ -8714,10 +8781,13 @@ def rebound_auto_inputs(data, threshold, diagnostic):
                           columns=["取得元", "対象取引日", "基準日", "取得元更新日時", "取得件数", "失敗理由"]))
     if not ranks_today:
         raise ValueError(ranking_diagnostics[-1]["失敗理由"])
-    register_result_table("results/rebound_tse_top50.csv", pd.DataFrame(ranks_today, columns=REBOUND_RANK))
-    if not any(row[0] == target for row in saved_ranks):
-        rebound_save_snapshot(target, ranks_today, [], ranking_diagnostics)
-        saved_ranks.extend(ranks_today)
+    register_result_table("results/rebound_tse_top75.csv", pd.DataFrame(ranks_today, columns=REBOUND_RANK))
+    if not cached_full:
+        today_codes = {row[1] for row in ranks_today}
+        saved_evidence = [row for row in saved_evidence if row[0] != target or row[1] in today_codes]
+        today_evidence = [row for row in saved_evidence if row[0] == target]
+        rebound_save_snapshot(target, ranks_today, today_evidence, ranking_diagnostics)
+        saved_ranks = [row for row in saved_ranks if row[0] != target] + ranks_today
     tracked = tuple(sorted({row[1] + ".T" for row in saved_ranks if row[0] == target}))
     usable = {t: f for t, f in data.items() if not f.empty and
               pd.Timestamp(f.index.max()).normalize() == pd.Timestamp(target)
@@ -8798,13 +8868,14 @@ def rebound_detail_display(recent):
 
 def render_rebound_research(data, buying_power):
     threshold = st.number_input("急落率の下限（%）", 3.0, 30.0, 7.0, .5, key="rebound_threshold")
-    st.caption("東証の売買代金TOP50と確定日足を自動取得します。")
+    st.caption("東証の売買代金TOP75と確定日足を自動取得します。")
     diagnostic = {"取得元": REBOUND_RANK_URL, "対象取引日": "", "基準日": "", "取得件数": 0,
                   "状態": "確認済み", "失敗理由": ""}
+    dow_rows = []
     try:
         with st.spinner("急落反発を確認中…"):
             prices, ranks, evidence, latest, ranking_diagnostics = rebound_auto_inputs(data, threshold/100, diagnostic)
-            signals, trades, excluded = rebound_research(prices, ranks, evidence, threshold/100)
+            signals, trades, excluded = rebound_research(prices, ranks, evidence, threshold/100, dow_rows=dow_rows)
         review = evidence.loc[evidence["日付"].eq(latest)].copy()
         pending = review.loc[~review[REBOUND_IR[2:5]].eq("0").any(axis=1)
                              & ~review[REBOUND_IR[2:5]].eq("1").all(axis=1)]
@@ -8826,23 +8897,29 @@ def render_rebound_research(data, buying_power):
                     daily_ir = evidence.loc[evidence["日付"].eq(latest)].assign(日付=day)
                     rebound_save_snapshot(day, daily_ranks[REBOUND_RANK].values.tolist(),
                                           daily_ir[REBOUND_IR].values.tolist(), ranking_diagnostics)
-                    signals, trades, excluded = rebound_research(prices, ranks, evidence, threshold/100)
+                    dow_rows.clear()
+                    signals, trades, excluded = rebound_research(prices, ranks, evidence, threshold/100, dow_rows=dow_rows)
     except (requests.RequestException, ValueError, KeyError, TypeError, OSError) as exc:
         diagnostic.update({"状態": "保留", "失敗理由": str(exc)})
         register_result_table("diagnostics/rebound_status.csv", pd.DataFrame([diagnostic]))
         export_notice("warning", f"急落反発の自動判定を保留しました（{exc}）")
         return
+    dow_trades = trades.loc[trades["条件"].isin((REBOUND_STAGES[2], DOW_STAGE))].copy() if not trades.empty else trades
+    if not signals.empty:
+        signals = signals.loc[signals["条件"].ne(DOW_STAGE)]
+    if not trades.empty:
+        trades = trades.loc[trades["条件"].ne(DOW_STAGE)]
     if prices.empty or latest in excluded or not ranks["日付"].eq(latest).any():
-        diagnostic.update({"状態": "保留", "失敗理由": "最新取引日のTOP50全銘柄の確定日足が揃っていません"})
+        diagnostic.update({"状態": "保留", "失敗理由": "最新取引日のTOP75全銘柄の確定日足が揃っていません"})
     register_result_table("diagnostics/rebound_status.csv", pd.DataFrame([diagnostic]))
     if excluded:
-        st.warning(f"TOP50の日足が揃わない{len(excluded)}日は判定対象外です。")
+        st.warning(f"順位対象銘柄の日足が揃わない{len(excluded)}日は判定対象外です。")
     if prices.empty or ranks.empty:
         st.info("日足と確定順位を用意してください。")
-        return
+        return diagnostic, latest, dow_rows, dow_trades
     st.subheader(f"急落反発の判定（{latest:%m/%d}）")
     if latest in excluded or not ranks["日付"].eq(latest).any():
-        st.info("東証TOP50の確定日足が揃うまで判定を保留します。")
+        st.info("東証TOP75の確定日足が揃うまで判定を保留します。")
     elif signals.empty or not signals["日付"].eq(latest).any():
         st.info("条件に該当する銘柄はありません。")
     else:
@@ -8870,7 +8947,10 @@ def render_rebound_research(data, buying_power):
             show_stock_table(recent_ir.replace("", "未確認"), hide_index=True,
                              use_container_width=True, export_name="rebound_ir_review")
     with st.expander("バックテスト"):
-        st.caption(f"確定TOP50の保存日数 {ranks['日付'].nunique()}日。公開情報から確認できた項目を記録します。"
+        rank_days = ranks.groupby("日付").size()
+        st.caption(f"保存日数 TOP75 {rank_days.eq(REBOUND_RANK_LIMIT).sum()}日 / "
+                   f"旧TOP50 {rank_days.eq(REBOUND_LEGACY_RANK_LIMIT).sum()}日。"
+                   "公開情報から確認できた項目を記録します。"
                    "開示の見出しだけでは重要悪材料なしと判定できないため、確認待ちになります。")
         if evidence.empty:
             st.info("業績・開示の確認記録はまだありません。")
@@ -8899,8 +8979,75 @@ def render_rebound_research(data, buying_power):
                                   trades.loc[trades["集計区分"].eq("除外")].copy())
 
 
+    return diagnostic, latest, dow_rows, dow_trades
+
+
+def render_dow_research(result):
+    st.caption("急落反発研究の下げ止まり候補を、当日から5営業日後まで追跡します。"
+               "左右2営業日で山・谷を確定し、安値切り上げと終値での戻り高値突破を確認します。"
+               "買い判定には当日の売買代金TOP75への採用も必要です。")
+    if result is None:
+        st.info("確定TOP75と日足の自動取得を待っています。急落反発研究タブで取得状況を確認できます。")
+        return
+    diagnostic, latest, rows, trades = result
+    st.subheader(f"反転判定（{latest:%m/%d}）")
+    if diagnostic["状態"] == "保留":
+        st.info(diagnostic["失敗理由"])
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame.insert(2, "銘柄名", frame["コード"].map(name))
+        register_result_table("results/dow_reversal_decisions.csv", frame)
+    today = frame.loc[frame["日付"].eq(latest)] if not frame.empty else frame
+    if diagnostic["状態"] != "保留":
+        if today.empty:
+            st.info("追跡対象の下げ止まり候補はありません。")
+        else:
+            st.dataframe(today[["判定", "銘柄名", "コード", "判定理由", "戻り高値", "終値", "経過営業日"]],
+                         hide_index=True, use_container_width=True,
+                         column_config={col: st.column_config.NumberColumn(format="%.2f")
+                                        for col in ("戻り高値", "終値")})
+    st.subheader("急落反発ロジックとの比較")
+    st.caption("当時の確定TOP75（旧記録はTOP50）と業績・開示記録を使用。翌営業日始値で買い、"
+               "3日目または5日目の終値で決済します。往復コスト0.20%。"
+               "最大DDは各取引に同額を投じる仮定で、決済日ごとの損益率累計から計算します。")
+    if trades.empty:
+        st.info("比較に使える下げ止まり候補の記録はまだありません。")
+        return
+    counts = trades.loc[trades["保有日数"].eq(3), "条件"].value_counts()
+    baseline_count = counts.get(REBOUND_STAGES[2], 0)
+    dow_count = counts.get(DOW_STAGE, 0)
+    st.write(f"累計候補 {baseline_count}件 → {dow_count}件（差 {dow_count - baseline_count:+d}件）")
+    if not frame.empty:
+        buys = frame.loc[frame["判定"].eq("研究買い")]
+        st.write(f"平均確認待ち {buys['経過営業日'].mean():.1f}営業日" if not buys.empty
+                 else "ダウ反転の買い判定はまだありません。")
+    summary = []
+    for hold in (3, 5):
+        for stage in (REBOUND_STAGES[2], DOW_STAGE):
+            sample = trades.loc[trades["保有日数"].eq(hold) & trades["条件"].eq(stage)]
+            valid = sample.dropna(subset=["損益率%"])
+            net = valid["損益率%"]
+            losses = -net[net.lt(0)].sum()
+            gains = net[net.gt(0)].sum()
+            curve = valid.groupby("決済予定日")["損益率%"].sum().cumsum()
+            drawdown = curve.cummax().clip(lower=0) - curve
+            summary.append({"条件": stage, "保有日数": hold, "候補件数": len(sample),
+                            "集計件数": len(net), "追跡中": int(sample["集計区分"].eq("追跡中").sum()),
+                            "除外": int(sample["集計区分"].eq("除外").sum()),
+                            "平均損益率%": round(net.mean(), 2),
+                            "勝率%": round(net.gt(0).mean() * 100, 2),
+                            "PF": f"{gains / losses:.2f}" if losses else ("∞" if gains else "—"),
+                            "最大DD（ポイント）": round(drawdown.max(), 2)})
+    summary = pd.DataFrame(summary)
+    st.dataframe(summary, hide_index=True, use_container_width=True)
+    register_result_table("results/dow_reversal_comparison.csv", summary)
+    register_result_table("results/dow_reversal_trades.csv", trades)
+
+
 with rebound_tab:
-    render_rebound_research(data, buying_power)
+    rebound_result = render_rebound_research(data, buying_power)
+with dow_tab:
+    render_dow_research(rebound_result)
 
 # 動画2本の文字起こしに基づく独立研究。実売買へは接続しない。
 VIDEO_RESEARCH_RULES = pd.DataFrame([

@@ -1,5 +1,5 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.25.19
+# 日本株 AI投資アシスタント Ver.17.25.20
 # BUILD: VER17-25-19-DOW-TOP75-20261121
 #
 # 目的:
@@ -41,12 +41,12 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.19",
+    page_title="日本株 AI投資アシスタント Ver.17.25.20",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.19 ダウ理論・反転研究"
+VERSION = "17.25.20 ダウ理論・未来データ検証"
 BUILD = "VER17-25-19-DOW-TOP75-20261121"
 TOPIX_SCAN_LIMIT = 50
 
@@ -8916,7 +8916,7 @@ def render_rebound_research(data, buying_power):
         st.warning(f"順位対象銘柄の日足が揃わない{len(excluded)}日は判定対象外です。")
     if prices.empty or ranks.empty:
         st.info("日足と確定順位を用意してください。")
-        return diagnostic, latest, dow_rows, dow_trades
+        return diagnostic, latest, dow_rows, dow_trades, (prices, ranks, evidence, threshold/100)
     st.subheader(f"急落反発の判定（{latest:%m/%d}）")
     if latest in excluded or not ranks["日付"].eq(latest).any():
         st.info("東証TOP75の確定日足が揃うまで判定を保留します。")
@@ -8979,7 +8979,58 @@ def render_rebound_research(data, buying_power):
                                   trades.loc[trades["集計区分"].eq("除外")].copy())
 
 
-    return diagnostic, latest, dow_rows, dow_trades
+    return diagnostic, latest, dow_rows, dow_trades, (prices, ranks, evidence, threshold/100)
+
+
+def verify_dow_future_data(prices, ranks, evidence, threshold, original_rows):
+    from collections import Counter
+
+    def replay(p, r, e):
+        rows = []
+        rebound_research(p, r, e, threshold, include_trades=False, dow_rows=rows)
+        return rows
+
+    def snapshot(rows, cutoff):
+        return Counter(json.dumps(row, default=str, ensure_ascii=False, sort_keys=True)
+                       for row in rows if row["日付"] <= cutoff)
+
+    differences = []
+    # Include candidate day and its next two exchange sessions, plus actual decision days.
+    sessions = rebound_jpx_sessions()
+    cutoffs = set()
+    for row in original_rows:
+        start = sessions.searchsorted(row["下げ止まり判定日"])
+        cutoffs.update(sessions[start:start+3])
+        cutoffs.add(row["日付"])
+    cutoffs = sorted(day for day in cutoffs if day < prices["日付"].max())[-10:]
+    for day in cutoffs:
+        expected = snapshot(original_rows, day)
+        variants = [("当日まで", prices.loc[prices["日付"].le(day)],
+                     ranks.loc[ranks["日付"].le(day)], evidence.loc[evidence["日付"].le(day)])]
+        for factor in (.5, 2.0):
+            altered = prices.copy()
+            cols = ["Open", "High", "Low", "Close"]
+            altered[cols] = altered[cols].astype(float)
+            mask = altered["日付"].gt(day)
+            altered.loc[mask, cols] *= factor
+            variants.append((f"翌日以降の価格×{factor:g}", altered, ranks, evidence))
+        for label, p, r, e in variants:
+            actual = snapshot(replay(p, r, e), day)
+            for side, delta in (("元の判定のみ", expected-actual), ("再計算のみ", actual-expected)):
+                for payload, count in delta.items():
+                    differences.append({"基準日": day, "検証": label, "差分": side,
+                                        "件数": count, **json.loads(payload)})
+
+    # Known five-bar peaks/troughs must appear on the fifth bar in both directions.
+    for low, values in ((True, [9, 8, 5, 7, 8]), (False, [5, 6, 9, 7, 6])):
+        series = pd.Series(values, dtype=float)
+        for bars in (3, 4, 5):
+            actual = dow_pivots(series.iloc[:bars], low=low).dropna()
+            valid = actual.empty if bars < 5 else list(actual.items()) == [(4, values[2])]
+            if not valid:
+                differences.append({"検証": "谷の確定" if low else "山の確定",
+                                    "差分": f"{bars}本時点で期待する確定日と不一致"})
+    return len(cutoffs), pd.DataFrame(differences)
 
 
 def render_dow_research(result):
@@ -8989,7 +9040,25 @@ def render_dow_research(result):
     if result is None:
         st.info("確定TOP75と日足の自動取得を待っています。急落反発研究タブで取得状況を確認できます。")
         return
-    diagnostic, latest, rows, trades = result
+    diagnostic, latest, rows, trades, inputs = result
+    with st.expander("未来データ追加テスト"):
+        st.caption("直近最大10基準日を再計算し、後日の日足が過去の判定を変えないか確認します。")
+        if st.button("未来データ追加テストを実行", key="dow_future_verify"):
+            try:
+                with st.spinner("ダウ理論の判定を照合中…"):
+                    count, differences = verify_dow_future_data(*inputs, rows)
+                if not differences.empty:
+                    st.error("✕ 不一致")
+                    st.dataframe(differences, hide_index=True)
+                    export_download_button("差分CSVをダウンロード",
+                                           differences.to_csv(index=False).encode("utf-8-sig"),
+                                           "dow_future_test_differences.csv", mime="text/csv")
+                elif count:
+                    st.success(f"◯ 一致（{count}基準日・山谷確定テスト合格）")
+                else:
+                    st.info("山谷確定テストは合格。過去判定と後続日足が揃わず、実データは検証不可です。")
+            except (ValueError, TypeError, KeyError, IndexError) as exc:
+                st.warning(f"検証不可（{exc}）")
     st.subheader(f"反転判定（{latest:%m/%d}）")
     if diagnostic["状態"] == "保留":
         st.info(diagnostic["失敗理由"])

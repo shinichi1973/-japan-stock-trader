@@ -1,6 +1,6 @@
 # ============================================================
-# 日本株 AI投資アシスタント Ver.17.25.20
-# BUILD: VER17-25-19-DOW-TOP75-20261121
+# 日本株 AI投資アシスタント Ver.17.25.21
+# BUILD: VER17-25-21-UNIVERSE75-20261122
 #
 # 目的:
 #   企業価値AI + テンバガーAI + テクニカルAI
@@ -41,14 +41,14 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="日本株 AI投資アシスタント Ver.17.25.20",
+    page_title="日本株 AI投資アシスタント Ver.17.25.21",
     page_icon="📈",
     layout="wide",
 )
 
-VERSION = "17.25.20 ダウ理論・未来データ検証"
-BUILD = "VER17-25-19-DOW-TOP75-20261121"
-TOPIX_SCAN_LIMIT = 50
+VERSION = "17.25.21 ダウ理論・未来データ検証"
+BUILD = "VER17-25-21-UNIVERSE75-20261122"
+TOPIX_SCAN_LIMIT = 75
 
 JST = ZoneInfo("Asia/Tokyo")
 TRADINGVIEW_QUOTES_CACHE = {}
@@ -3740,7 +3740,7 @@ def compare_ai_research_methods(history, initial_cash=600000, fee_bps=10):
 
 
 # ------------------------------------------------------------
-# Ver.17.4 企業価値AI TOP50 — 株式分割＋適正株価異常値ガード付き比較検証用
+# Ver.17.4 企業価値AI TOP75 — 株式分割＋適正株価異常値ガード付き比較検証用
 # ------------------------------------------------------------
 def _percentile_score(series, higher_better=True):
     s = pd.to_numeric(series, errors="coerce")
@@ -4207,7 +4207,7 @@ def valuation_at_price(symbol, price):
 
 
 def build_valuation_master(frames, holdings, price_data, display_frames):
-    """同一実行内の共通判定。TOP50外の保有・表示対象も一度だけ算定する。"""
+    """同一実行内の共通判定。TOP75外の保有・表示対象も一度だけ算定する。"""
     records = {}
     for frame in frames:
         if isinstance(frame, pd.DataFrame) and "コード" in frame.columns:
@@ -4225,7 +4225,7 @@ def build_valuation_master(frames, holdings, price_data, display_frames):
     return pd.DataFrame(records.values())
 
 
-def build_value_ai_top50(data, max_rows=50, fundamental_pool_size=90, churn_filter=True):
+def build_value_ai_top50(data, max_rows=TOPIX_SCAN_LIMIT, fundamental_pool_size=90, churn_filter=True):
     """取得済みの母集団を流動性・トレンド・値動きで一次選抜し、企業価値を評価する。"""
     tech_rows = []
     for t, df in (data or {}).items():
@@ -4616,7 +4616,7 @@ def discover_topix_nikkei225_stock_universe():
 @st.cache_data(ttl=21600, show_spinner=False)
 def discover_japan_stock_universe(limit=350):
     """TradingView日本株スキャナーから売買代金上位の普通株を取得する。
-    旧49銘柄へ黙ってフォールバックすると「本物のTOP50」ではなくなるため、失敗時は空を返す。
+    旧49銘柄へ黙ってフォールバックすると「本物のTOP75」ではなくなるため、失敗時は空を返す。
     """
     limit = int(np.clip(limit, TOPIX_SCAN_LIMIT, 500))
     columns = ["name", "description", "close", "volume", "Value.Traded", "market_cap_basic", "exchange"]
@@ -4917,7 +4917,7 @@ def bb_prepare_light(df, period=20, std_mult=2.0):
 
 
 def build_indicator_compare(data, top50_codes, held_codes=None):
-    """管理者研究用: 同一TOP50で Stoch / RSI5 / BB20 の現在シグナルを比較。
+    """管理者研究用: 同一TOP75で Stoch / RSI5 / BB20 の現在シグナルを比較。
     実売買のBUY/SELL判定には一切接続しない。
     """
     held_codes = set(map(str, held_codes or []))
@@ -4976,7 +4976,7 @@ def build_indicator_compare(data, top50_codes, held_codes=None):
 
 
 def build_top50_surge_radar(data, value_top50_df):
-    """旧Ver.5.5系の急騰予兆センサーを、現在の企業価値AI TOP50だけへ適用する。
+    """旧Ver.5.5系の急騰予兆センサーを、現在の企業価値AI TOP75だけへ適用する。
 
     管理者向けの観察センサーであり、正式なBUY/SELL判定には接続しない。
     旧版にあった「株価2,000円未満」の除外条件は復活させない。
@@ -4995,7 +4995,7 @@ def build_top50_surge_radar(data, value_top50_df):
 
     meta = value_top50_df.copy()
     meta["コード"] = meta["コード"].astype(str)
-    meta = meta.head(50).set_index("コード", drop=False)
+    meta = meta.head(TOPIX_SCAN_LIMIT).set_index("コード", drop=False)
     target_codes = set(meta.index.tolist())
     rows = []
 
@@ -5090,7 +5090,7 @@ def add_research_judgements_first(df, surge_df, value_df):
     """表示用の全銘柄表へ研究判定を付け、必ず左端へ並べる。
 
     急騰予兆は観察情報。割安判定は表示にも使い、割高だけは別工程で新規BUYから除外する。
-    TOP50外など算定値がない銘柄も、空欄にせず対象外/未算定と明示する。
+    TOP75外など算定値がない銘柄も、空欄にせず対象外/未算定と明示する。
     """
     if not isinstance(df, pd.DataFrame):
         return pd.DataFrame()
@@ -5881,7 +5881,7 @@ for _key, _fixed in {
     st.session_state[_key] = _fixed
 with admin_tab:
     with st.expander("⚙ 購入額・注文方式", expanded=False):
-        live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン", "TOPIX＋日経225＋グロースからAI選定TOP50", "固定45銘柄", "対象拡大（売買代金上位）"], index=0, key="v172440_universe")
+        live_universe_mode = st.selectbox("新規買いの監視対象", ["TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン", "TOPIX＋日経225＋グロースからAI選定TOP75", "東証全体の売買代金TOP75"], index=0, key="v172521_universe")
         signal_first = live_universe_mode == "TOPIX＋グロース売買代金上位・値動きが大きい＋買いサイン"
         live_trade_method = st.selectbox("売買ロジック", ["現行Stoch GC/DC", "55日高値更新＋MA200（試験採用）"], key="v17247_method")
         replacement_live = live_trade_method == "55日高値更新＋MA200（試験採用）"
@@ -5924,15 +5924,11 @@ with admin_tab:
         price_buffer_pct = b4.slider("価格上振れバッファ（%）", 0.0, 10.0, 5.0, .5, key="v177_buffer", disabled=True)
         c1, c2 = st.columns(2)
         universe_size = TOPIX_SCAN_LIMIT
-        if live_universe_mode == "対象拡大（売買代金上位）":
-            universe_size = c1.number_input("日本株母集団（売買代金上位）", TOPIX_SCAN_LIMIT, 500,
-                                            TOPIX_SCAN_LIMIT, 25, key="v172451_expanded_universe_n")
-        else:
-            export_metric(c1, "日足・財務を取得する新規監視対象", "45銘柄" if live_universe_mode == "固定45銘柄" else f"上位{TOPIX_SCAN_LIMIT}銘柄")
+        export_metric(c1, "日足・財務を取得する新規監視対象", f"上位{TOPIX_SCAN_LIMIT}銘柄")
         c2.caption("保有銘柄は監視対象外でも売り判定のため取得します。")
         st.caption(f"標準選定：TOPIX＋グロース → 国内売買代金上位{TOPIX_SCAN_LIMIT} → 値動き・買いサイン・流動性・国内財務を確認。AI選定モードも売買代金で先に絞り込みます。")
         st.caption("Stochの買い・売りと終値7%損切りは維持。対象拡大は未検証のため、比較結果を確認してから選択してください。")
-        churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP50から除外", value=False, key="v1716_churn_filter", disabled=True)
+        churn_filter = st.checkbox("短期クロス反転が多い銘柄を新規買いTOP75から除外", value=False, key="v1716_churn_filter", disabled=True)
         st.caption("今回の主ロジックでは短期反転除外を使用しません。")
         quality_mode = st.checkbox("トレンド＋振れ幅フィルターを実売買判定に使用（検証後に切替）",
                                    value=False, key="v1717_quality_mode", disabled=True)
@@ -5976,13 +5972,8 @@ if run_clicked:
     try:
         if signal_first:
             universe_df = discover_domestic_turnover_universe("topix_growth")
-        elif live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50":
+        elif live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP75":
             universe_df = discover_domestic_turnover_universe("ai")
-        elif live_universe_mode == "固定45銘柄":
-            universe_df = pd.DataFrame([
-                {"コード": c, "銘柄名": STOCK_NAMES[c], "ticker": c + ".T"}
-                for c in VERIFIED_45_CODES
-            ])
         else:
             universe_df = discover_japan_stock_universe(int(universe_size))
     except Exception as exc:
@@ -6043,8 +6034,8 @@ if run_clicked:
         st.session_state["v177_value_top50"] = value_top50_df
         st.session_state["v1716_churn_audit"] = pd.DataFrame()
         st.session_state["v177_generated_at"] = tokyo_now().strftime("%Y-%m-%d %H:%M:%S JST")
-        st.session_state["v177_run_error"] = ("TOPIX＋日経225＋グロースから50銘柄を選定できませんでした。新規買いを停止し、保有銘柄の売り判定のみ行います。"
-            if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" and value_top50_df.empty else "")
+        st.session_state["v177_run_error"] = ("TOPIX＋日経225＋グロースから75銘柄を選定できませんでした。新規買いを停止し、保有銘柄の売り判定のみ行います。"
+            if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP75" and value_top50_df.empty else "")
     _update_times["一次選抜・参考評価"] = round(time.perf_counter() - _stage_started, 2)
     _update_times["取得〜参考評価合計"] = round(time.perf_counter() - _update_started, 2)
     st.session_state["v172429_update_times"] = _update_times
@@ -6172,7 +6163,7 @@ sell_view = pd.DataFrame()
 buy_signal_rows, sell_signal_rows = [], []
 signal_audit_rows = []
 true_top50_codes = (set(value_top50_df["コード"].astype(str))
-                    if isinstance(value_top50_df, pd.DataFrame) and "コード" in value_top50_df else set()) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" else (
+                    if isinstance(value_top50_df, pd.DataFrame) and "コード" in value_top50_df else set()) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP75" else (
                     set(universe_df["コード"].astype(str))
                     if isinstance(universe_df, pd.DataFrame) and "コード" in universe_df else set())
 signal_first_audit_df = pd.DataFrame()
@@ -6192,7 +6183,7 @@ if signal_first:
         signal_value_df = signal_value_df.sort_values(["候補スコア", "コード"], ascending=[False, True]).reset_index(drop=True)
         signal_value_df["順位"] = np.arange(1, len(signal_value_df) + 1)
     true_top50_codes = mother_codes
-# BUYを確定する前に共通評価マスターを構築。TOP50外も同じ判定を使用。
+# BUYを確定する前に共通評価マスターを構築。TOP75外も同じ判定を使用。
 # 生の買いシグナルだけ追加評価し、描画時には再取得しない。
 _signal_frames = {}
 _raw_buy_targets = []
@@ -6388,7 +6379,7 @@ indicator_compare_df = build_indicator_compare(data, true_top50_codes, held_code
 if not isinstance(indicator_compare_df, pd.DataFrame):
     indicator_compare_df = pd.DataFrame()
 
-# 管理者研究用。旧Ver.5.5系の急騰予兆を企業価値AI TOP50だけへ適用。
+# 管理者研究用。旧Ver.5.5系の急騰予兆を企業価値AI TOP75だけへ適用。
 surge_top50_df = build_top50_surge_radar(data, value_top50_df) if data and true_top50_codes else pd.DataFrame()
 if not isinstance(surge_top50_df, pd.DataFrame):
     surge_top50_df = pd.DataFrame()
@@ -7436,7 +7427,7 @@ def render_multibagger_cards(frame, limit=3):
         st.caption("確認：" + r["確認するリスク"])
 
 
-# 一回の通常判定で得た財務全件を利用。TOP50の順位では絞らない。
+# 一回の通常判定で得た財務全件を利用。TOP75の順位では絞らない。
 mb_finance = finance_acquisition_df.copy()
 if "v172423_growth_extra" not in st.session_state:
     st.session_state["v172423_growth_extra"] = load_multibagger_growth()
@@ -7601,7 +7592,7 @@ def rank_bottom_research(universe, prices, target_day, valuations):
     audit = pd.DataFrame(rows).sort_values(['研究点', '売買代金順位'], ascending=[False, True]).reset_index(drop=True)
     ranking = audit[audit['研究判定'].eq('上昇転換確認')].copy().reset_index(drop=True)
     ranking.insert(0, '順位', np.arange(1, len(ranking) + 1))
-    scope = '事前選抜50銘柄の日足確認済' if complete else '暫定（事前選抜内に日足未確認あり）'
+    scope = '事前選抜75銘柄の日足確認済' if complete else '暫定（事前選抜内に日足未確認あり）'
     audit['母集団確認'] = scope
     ranking['母集団確認'] = scope
     return ranking, audit, cov, complete
@@ -7818,12 +7809,12 @@ def render_bottom_trade_decisions(result, valuations, holdings, verified):
 def render_bottom_research(valuations, holdings=None, verified=False):
     st.subheader('底打ち・上昇転換ランキング〈研究〉')
     st.caption('独立売買判定を追加。通常タブの売買・株数には反映しません。研究点は勝率ではありません。確定日足で判定します。')
-    st.write('TOPIX内の取得時点の売買代金上位50銘柄を先に選抜し、確定日足で底打ち・上昇転換を採点します。表の売買代金順位は選抜内の20日平均（終値×出来高の概算）です。')
+    st.write('TOPIX内の取得時点の売買代金上位75銘柄を先に選抜し、確定日足で底打ち・上昇転換を採点します。表の売買代金順位は選抜内の20日平均（終値×出来高の概算）です。')
     st.caption('基準日が同じ調整済み日足は保存分を再利用します。相対評価はTOPIX連動ETF（1306）の調整後20日騰落率と比較します。')
-    if st.button('TOPIX上位50銘柄の研究ランキングを更新', key='v172451_bottom_run'):
+    if st.button('TOPIX上位75銘柄の研究ランキングを更新', key='v172521_bottom_run'):
         st.session_state.pop('v172451_bottom_result', None)
         try:
-            with st.spinner('TOPIX売買代金上位50銘柄と比較用ETFの日足を確認中…'):
+            with st.spinner('TOPIX売買代金上位75銘柄と比較用ETFの日足を確認中…'):
                 session = latest_tse_session_status()
                 if not session.get('confirmed') or pd.isna(session.get('session_date')):
                     raise ValueError('直近東証日の確定を確認できません。朝または16時以降に再実行してください。')
@@ -7870,7 +7861,7 @@ def render_bottom_research(valuations, holdings=None, verified=False):
         show_stock_table(result['ranking'], use_container_width=True, hide_index=True, export_name='bottom_research_ranking')
     if not result['audit'].empty and '対TOPIX連動ETF20日超過率%' in result['audit'] and result['audit']['対TOPIX連動ETF20日超過率%'].isna().all():
         export_notice('warning', '比較用ETFの日足未確認のため、相対強さ10点は未算定です。')
-    with st.expander('TOP50全件・監視銘柄・見送り理由', expanded=False):
+    with st.expander('TOP75全件・監視銘柄・見送り理由', expanded=False):
         audit = result.get('audit')
         if not isinstance(audit, pd.DataFrame) or audit.empty:
             export_notice('info', '研究対象の一覧はありません。取得状況を確認して研究ランキングを更新してください。')
@@ -9821,7 +9812,7 @@ with admin_tab:
     export_metric(c3, "新規買い監視", f"{len(true_top50_codes)}銘柄")
     export_metric(c4, "保有", f"{len(held_codes)}銘柄")
 
-    with st.expander("🔎 TOP50選定前の短期反転チェック", expanded=False):
+    with st.expander("🔎 TOP75選定前の短期反転チェック", expanded=False):
         if isinstance(churn_audit_df, pd.DataFrame) and not churn_audit_df.empty:
             excluded = churn_audit_df[churn_audit_df["判定"].eq("新規買い除外")]
             st.caption(f"新規買い除外：{len(excluded)} / 検査対象：{len(churn_audit_df)}。閾値は試験設定で、成績改善は未検証です。")
@@ -9898,11 +9889,11 @@ with admin_tab:
                 "AI_TOP50スコア":"AI点"
             })
             admin_judgement_table(value_compact, "v7_value_compact", 520)
-            with st.expander("企業価値TOP50の詳細列", expanded=False):
+            with st.expander("企業価値TOP75の詳細列", expanded=False):
                 admin_judgement_table(value_full, "v7_value_full", 560)
 
         with st.expander("🧪 5年OOS検証メモ", expanded=False):
-            st.caption("TOPIX＋日経225＋グロースモードではAI上位50銘柄を新規買い監視対象に使用します。固定45・売買代金上位モードでは企業価値は参考表示です。現在の構成一覧を過去に流用した検証は、過去の選定を再現しません。")
+            st.caption("TOPIX＋日経225＋グロースモードではAI上位75銘柄を新規買い監視対象に使用します。その他の売買代金上位モードでは企業価値は参考表示です。現在の構成一覧を過去に流用した検証は、過去の選定を再現しません。")
             st.write("採用値：流動性45% / トレンド30% / 値動き安定性25%")
             st.write("学習期間：+54.27% / PF 2.10 / 最大DD -10.04% / 257決済")
             st.write("OOS期間：+16.10% / PF 1.89 / 最大DD -5.25% / 81決済")
@@ -9910,7 +9901,7 @@ with admin_tab:
 
         with st.expander("🧪 バックテスト用5年日足データ", expanded=False):
             st.caption("この出力は検証専用です。売買判定には使いません。現在の大規模母集団の5年OHLCVを取得します。")
-            export_notice('warning', "企業価値AIを過去時点で完全再現するには、当時のファンダメンタル/目標株価データが別途必要です。このデータだけでできるのは347銘柄ストキャス検証と、現TOP50を固定した参考検証です。")
+            export_notice('warning', "企業価値AIを過去時点で完全再現するには、当時のファンダメンタル/目標株価データが別途必要です。このデータだけでできるのは347銘柄ストキャス検証と、現TOP75を固定した参考検証です。")
             if isinstance(universe_df, pd.DataFrame) and not universe_df.empty:
                 bt_tickers = tuple(universe_df["ticker"].astype(str).tolist()) if "ticker" in universe_df.columns else tuple(tickers(",".join(universe_df["コード"].astype(str).tolist())))
                 if st.button("5年日足バックテストデータを作成", key="v178_make_btdata"):
@@ -9929,7 +9920,7 @@ with admin_tab:
                             "5年日足取得成功銘柄数": int(bt_hist["コード"].nunique()) if not bt_hist.empty and "コード" in bt_hist.columns else 0,
                             "総日足行数": len(bt_hist), "取得失敗件数": len(bt_failed),
                             "用途": "この場での347銘柄ストキャス5年バックテスト用",
-                            "注意": "過去時点の企業価値AI TOP50完全再現にはpoint-in-timeファンダメンタルが必要",
+                            "注意": "過去時点の企業価値AI TOP75完全再現にはpoint-in-timeファンダメンタルが必要",
                         }])
                         bzf.writestr("backtest_manifest.csv", manifest.to_csv(index=False, encoding="utf-8-sig"))
                     bbuf.seek(0)
@@ -9945,9 +9936,9 @@ with admin_tab:
 
         with st.expander("🧪 ストキャス振り回され対策の比較バックテスト", expanded=False):
             st.caption("上で作成した5年日足ZIP、または backtest_history_5y.csv をアップロード。現行GC/DCとトレンド＋振れ幅判定を同じ日足で比較します。")
-            export_notice('warning', "銘柄別に独立した1ポジションの検証です。TOP50を現在の銘柄で固定する選択は過去の選定を再現しません。企業価値、買付余力、実際の約定・手数料・税金は再現していません。")
+            export_notice('warning', "銘柄別に独立した1ポジションの検証です。TOP75を現在の銘柄で固定する選択は過去の選定を再現しません。企業価値、買付余力、実際の約定・手数料・税金は再現していません。")
             bt_input = st.file_uploader("5年日足ZIPまたはCSV", type=["zip", "csv"], key="v1717_bt_input")
-            bt_fixed_top = st.checkbox("現在のTOP50だけに限定（参考検証）", value=False, key="v1717_bt_top")
+            bt_fixed_top = st.checkbox("現在のTOP75だけに限定（参考検証）", value=False, key="v1717_bt_top")
             if st.button("現行版と改善版を比較", key="v1717_bt_run", disabled=bt_input is None):
                 try:
                     raw = bt_input.getvalue()
@@ -9966,7 +9957,7 @@ with admin_tab:
                         raise ValueError("75万行以内のデータを使用してください")
                     codes = true_top50_codes if bt_fixed_top else None
                     if bt_fixed_top and not codes:
-                        raise ValueError("先に『今日の判定を更新』でTOP50を作成してください")
+                        raise ValueError("先に『今日の判定を更新』でTOP75を作成してください")
                     summary, trades, unrealized = compare_stoch_backtest(hist, sl, codes)
                     st.session_state["v1717_bt_result"] = (summary, trades, unrealized)
                 except Exception as e:
@@ -9982,7 +9973,7 @@ with admin_tab:
 
         with st.expander("🧪 割高除外・保有買い増しの比較バックテスト", expanded=False):
             st.caption("過去の研究用比較です。主ロジックでは買い増しを行いません。判定日の終値で判断し、翌営業日の始値で約定します。")
-            export_notice('warning', "割高除外の過去検証には、各評価日当時に公表・取得できたAI参考価値が必要です。現在のTOP50や現在の参考価値を過去へ流用しません。過去評価CSVがない場合は買い増しだけを比較します。")
+            export_notice('warning', "割高除外の過去検証には、各評価日当時に公表・取得できたAI参考価値が必要です。現在のTOP75や現在の参考価値を過去へ流用しません。過去評価CSVがない場合は買い増しだけを比較します。")
             new_history_file = st.file_uploader("5年日足ZIPまたはCSV", type=["zip", "csv"], key="v1718_history")
             new_value_file = st.file_uploader("過去時点の企業価値CSV（任意）", type=["csv"], key="v1718_values")
             export_download_button("過去評価CSVの書式をダウンロード",
@@ -9990,7 +9981,7 @@ with admin_tab:
                                file_name="historical_value_template.csv", mime="text/csv",
                                key="v1718_template")
             st.caption("過去評価CSV：コード,評価日,AI参考価値。評価日は、その参考価値を実際に利用できた日。既定では120日を超えた評価は期限切れ。現在の評価を過去の日付に書き換えないでください。")
-            new_fixed_top = st.checkbox("現在のTOP50に限定（過去の選定再現ではない）",
+            new_fixed_top = st.checkbox("現在のTOP75に限定（過去の選定再現ではない）",
                                         value=False, key="v1718_fixed_top")
             addon_fraction = st.slider("買い増し量（初回買付を1とした比率）",
                                        min_value=0.25, max_value=1.0, value=0.5,
@@ -10020,7 +10011,7 @@ with admin_tab:
                                                  dtype={"コード": str})
                     codes = true_top50_codes if new_fixed_top else None
                     if new_fixed_top and not codes:
-                        raise ValueError("先に『今日の判定を更新』でTOP50を作成してください")
+                        raise ValueError("先に『今日の判定を更新』でTOP75を作成してください")
                     result = compare_value_addon_backtest(
                         hist, sl, codes, old_values, addon_fraction=addon_fraction)
                     st.session_state["v1718_result"] = result
@@ -10031,7 +10022,7 @@ with admin_tab:
                 summary, trades, unrealized, audit = st.session_state["v1718_result"]
                 show_stock_table(summary, use_container_width=True, hide_index=True, export_name='value_addon_backtest_summary')
                 st.caption("買い増しは初回の約定から2営業日以上経過し、売り・損切りがなく、%Kが%Dより上で上昇中・%K≤50・終値が平均取得額を上回る場合に1回だけ。追加量は初回の指定比率。損切りは追加後の平均取得額で判定します。")
-                st.caption("銘柄別の独立検証です。過去のTOP50、実際の買付余力、ポートフォリオ収益・最大DD、手数料、税金は再現しません。PFは決済した取引騰落率の単純合算比です。未決済は別表に分離します。")
+                st.caption("銘柄別の独立検証です。過去のTOP75、実際の買付余力、ポートフォリオ収益・最大DD、手数料、税金は再現しません。PFは決済した取引騰落率の単純合算比です。未決済は別表に分離します。")
                 for label, frame, filename in [
                     ("決済明細CSV", trades, "value_addon_trades.csv"),
                     ("未決済明細CSV", unrealized, "value_addon_open.csv"),
@@ -10044,7 +10035,7 @@ with admin_tab:
         st.caption("旧Ver.5.5系の観察センサーです。正式なBUY/SELLには影響しません。")
         st.write("70点以上＝強い予兆、55点以上＝急騰予兆、40点以上＝変化検知")
         if surge_top50_df.empty:
-            export_notice('info', "先に『今日の判定を更新』で企業価値AI TOP50を作成してください。")
+            export_notice('info', "先に『今日の判定を更新』で企業価値AI TOP75を作成してください。")
         else:
             surge_score = pd.to_numeric(surge_top50_df["急騰予兆スコア"], errors="coerce")
             strong_n = int((surge_score >= 70).sum())
@@ -10082,7 +10073,7 @@ with admin_tab:
         st.caption("この欄は研究専用。実売買方式は管理者設定で選択します。")
         st.write("RSI5＝15以下から15上抜け / BB20＝-2σ外から内側復帰")
         if indicator_compare_df.empty:
-            export_notice('info', "現在、TOP50内で3方式のいずれかがBUY点灯している銘柄はありません。")
+            export_notice('info', "現在、TOP75内で3方式のいずれかがBUY点灯している銘柄はありません。")
         else:
             raw_compare = indicator_compare_df.copy()
             c1,c2,c3,c4 = st.columns(4)
@@ -10412,7 +10403,7 @@ try:
             "Version":VERSION,"Build":BUILD,"買付余力":int(buying_power),"現在資産":int(current_assets),
             "買付余力（短期）":short_buying_power,"保有件数":len(held_codes),
             "日本株母集団設定":int(universe_size),"取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
-            "詳細企業価値評価件数設定":int(universe_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" else 0,
+            "詳細企業価値評価件数設定":int(universe_size),"TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP75" else 0,
             "固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "売買ロジック":live_trade_method, "Stoch不使用の試験採用":bool(replacement_live), "新規BUY対象":live_universe_mode + "の未保有株", "判定不能除外":bool(block_unrated), "流動性下限":int(min_turnover), "下降確認除外":bool(filter_downtrend), "クロス多発除外":bool(filter_churn), "購入予算方式":cap_mode,
@@ -10510,12 +10501,12 @@ try:
         compare_summary = pd.DataFrame([compare_summary_row])
         zf.writestr("indicator_compare_summary.csv", compare_summary.to_csv(index=False,encoding="utf-8-sig"))
         status_df=pd.DataFrame([{
-            "本物TOP50モード":live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50","母集団最低200銘柄ガード":False,
+            "本物TOP50モード":live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP75","母集団最低200銘柄ガード":False,
             "固定45銘柄モード":live_universe_mode == "固定45銘柄","固定45監視件数":len(VERIFIED_45_CODES) if live_universe_mode == "固定45銘柄" else 0, "新規監視件数":len(true_top50_codes),
             "取得母集団件数":len(universe_df) if isinstance(universe_df,pd.DataFrame) else 0,
             "日足取得成功件数":len(data) if isinstance(data,dict) else 0,
             "当日確定日足件数":int(daily_bar_status_df["状態"].eq("🟢 当日確定").sum()) if isinstance(daily_bar_status_df,pd.DataFrame) and not daily_bar_status_df.empty else 0,
-            "TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP50" else 0,
+            "TOP50件数":len(true_top50_codes) if live_universe_mode == "TOPIX＋日経225＋グロースからAI選定TOP75" else 0,
             "企業価値参考表示件数":len(value_top50_df) if isinstance(value_top50_df,pd.DataFrame) else 0,
             "一次選抜_流動性重み":np.nan,"一次選抜_トレンド重み":np.nan,"一次選抜_安定性重み":np.nan,
             "OOS検証済み":False,"OOS_PF参考":np.nan,"5年通算PF参考":np.nan,

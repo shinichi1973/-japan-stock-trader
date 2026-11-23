@@ -5959,6 +5959,7 @@ st.markdown(
 
 
 st.title("📈 日本株 AI投資アシスタント")
+st.markdown("**朝6:00以降（米国株終了以降）に実行して下さい**")
 st.caption(f"{VERSION} / BUILD: {BUILD}")
 st.caption("今日の売買で通常売買とSBI買いシグナルを確認。監視リストでは短期反発と高配当の買い待ち条件を確認します。")
 main_tab, monitor_tab, rebound_tab, dow_tab, admin_tab = st.tabs(
